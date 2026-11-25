@@ -1,0 +1,1 @@
+Requires @acme/ws-bridge and @acme/decl-only linked via @verule/test-hosts; typechecked after materialization via host.typecheck().

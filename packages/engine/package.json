@@ -1,0 +1,44 @@
+{
+  "name": "@verule/engine",
+  "version": "0.0.0",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    "./binary": {
+      "source": "./src/binary.ts",
+      "types": "./dist/binary.d.ts",
+      "default": "./dist/binary.js"
+    }
+  },
+  "publishConfig": {
+    "exports": {
+      "./binary": {
+        "types": "./dist/binary.d.ts",
+        "default": "./dist/binary.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json --pretty false && cargo install --locked --path . --root dist --no-track --force",
+    "format:check": "cargo fmt --all -- --check && oxfmt --list-different .",
+    "format:write": "cargo fmt --all && oxfmt --write .",
+    "lint": "cargo clippy --locked --workspace --all-targets -- -D warnings && oxlint --quiet --format=unix src scripts",
+    "test": "node --conditions=source scripts/run-cargo-tests.ts",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@verule/adapter-api": "workspace:*",
+    "@verule/test-hosts": "workspace:*",
+    "@verule/tooling-config": "workspace:*",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "typescript-7": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
+  }
+}

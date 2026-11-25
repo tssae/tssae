@@ -1,0 +1,13 @@
+{
+  "name": "cond-custom",
+  "version": "2.0.0",
+  "exports": {
+    ".": {
+      "fast-forward": "./dist/fast.mjs",
+      "safe-clone": "./dist/clone.mjs",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/fast.mjs",
+      "require": "./dist/clone.cjs"
+    }
+  }
+}

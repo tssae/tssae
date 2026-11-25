@@ -1,0 +1,6 @@
+{
+  "name": "verule-zod-drizzle-standalone-host",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,1 @@
+Requires @acme/lifecycle linked via @verule/test-hosts; typechecked after materialization via host.typecheck().

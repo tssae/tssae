@@ -1,0 +1,13 @@
+{
+  "name": "ambiguous-pkg",
+  "version": "1.0.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": [
+        "./dist/a.mjs",
+        "./dist/b.mjs"
+      ]
+    }
+  }
+}

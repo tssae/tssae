@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "customConditions": ["source"],
+    "skipLibCheck": true,
+    "paths": {
+      "@acme/data": ["./packages/pkg-data/src/index.ts"]
+    }
+  },
+  "include": ["packages/pkg-data/src/**/*.ts", "packages/app/src/**/*.ts"]
+}

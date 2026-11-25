@@ -1,0 +1,10 @@
+{
+  "name": "@acme/decl-only",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts"
+    }
+  }
+}

@@ -1,0 +1,81 @@
+name: Publish npm packages
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: npm-publication-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  pack:
+    name: Check and pack
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      pack-dir-artifact-id: ${{ steps.pack.outputs.pack-dir-artifact-id }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read Node version
+        id: node-runtime
+        run: echo "runtime=node@$(jq -er '.engines.node' package.json)" >> "$GITHUB_OUTPUT"
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+        with:
+          runtime: ${{ steps.node-runtime.outputs.runtime }}
+          install: false
+          cache: true
+      - name: Set up Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustup default "$channel"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check source
+        run: pnpm run check && pnpm run check:heavy
+      - name: Build packages in dependency order
+        run: pnpm exec turbo run build
+      - name: Pack unpublished versions
+        id: pack
+        uses: changesets/action/pack@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+
+  publish:
+    name: Publish npm packages and GitHub Release
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read Node version
+        id: node-runtime
+        run: echo "runtime=node@$(jq -er '.engines.node' package.json)" >> "$GITHUB_OUTPUT"
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+        with:
+          runtime: ${{ steps.node-runtime.outputs.runtime }}
+          install: false
+          cache: false
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Publish packed versions
+        uses: changesets/action/publish@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          pack-dir-artifact-id: ${{ needs.pack.outputs.pack-dir-artifact-id }}

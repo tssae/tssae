@@ -1,0 +1,47 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Root Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read Node version
+        id: node-runtime
+        run: echo "runtime=node@$(jq -er '.engines.node' package.json)" >> "$GITHUB_OUTPUT"
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+        with:
+          runtime: ${{ steps.node-runtime.outputs.runtime }}
+          install: false
+          cache: true
+      - name: Set up Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustup default "$channel"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run Light Check
+        run: node --conditions=source scripts/task-gates.ts check
+      - name: Run Heavy Check
+        id: run-heavy-check
+        run: node --conditions=source scripts/task-gates.ts check:heavy

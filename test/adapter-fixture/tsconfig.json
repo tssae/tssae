@@ -1,0 +1,7 @@
+{
+  "extends": "@verule/tooling-config/node.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

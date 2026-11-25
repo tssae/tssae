@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+dist/
+fixture-dist/
+target/
+.turbo/
+coverage/
+/.template
+.env
+.vitest/
+data/
+playwright-report/
+test-results/
+.changeset/packed/

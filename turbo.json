@@ -1,0 +1,89 @@
+{
+  "globalPassThroughEnv": ["CARGO_HOME", "RUSTUP_HOME"],
+  "globalDependencies": [
+    "oxfmt.config.ts",
+    "oxlint.config.ts",
+    "packages/tooling-config/oxfmt.config.ts",
+    "packages/tooling-config/oxlint.config.ts"
+  ],
+  "tasks": {
+    "//#boundaries": {
+      "tags": ["quality:light"]
+    },
+    "//#check": {
+      "tags": ["quality:entry"]
+    },
+    "//#check:full": {
+      "tags": ["quality:entry"]
+    },
+    "//#check:heavy": {
+      "tags": ["quality:entry"]
+    },
+    "//#fix": {
+      "tags": ["work:repair"]
+    },
+    "//#format:check": {
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "//#format:write": {
+      "cache": false,
+      "dependsOn": ["//#lint:fix"],
+      "tags": ["work:repair"]
+    },
+    "//#lint": {
+      "dependsOn": ["^lint"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "//#lint:fix": {
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "//#typecheck": {
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "//#toolchain:prepare": {
+      "cache": false,
+      "tags": ["work:preparation"]
+    },
+    "//#publication:pack": {
+      "tags": ["work:release"],
+      "cache": false
+    },
+    "//#publication:publish": {
+      "tags": ["work:release"],
+      "cache": false
+    }
+  },
+  "boundaries": {
+    "tags": {
+      "app": {
+        "dependencies": {
+          "allow": ["library", "native", "tooling"]
+        }
+      },
+      "library": {
+        "dependencies": {
+          "allow": ["library", "native", "tooling"]
+        }
+      },
+      "native": {
+        "dependencies": {
+          "allow": ["tooling"]
+        }
+      },
+      "tooling": {
+        "dependencies": {
+          "deny": ["app", "library", "native", "verification"]
+        }
+      },
+      "verification": {
+        "dependencies": {
+          "allow": ["app", "library", "native", "tooling", "verification"]
+        }
+      }
+    }
+  }
+}

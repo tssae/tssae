@@ -1,0 +1,16 @@
+{
+  "name": "dual-pkg",
+  "version": "1.2.3",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./sub": {
+      "types": "./dist/sub.d.ts",
+      "import": "./dist/sub.mjs",
+      "require": "./dist/sub.cjs"
+    }
+  }
+}

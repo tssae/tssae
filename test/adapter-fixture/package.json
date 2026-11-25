@@ -1,0 +1,60 @@
+{
+  "name": "@verule/adapter-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./verule-adapter": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./verule-native": "./dist/verule-native.json",
+    "./native/linux-x64": "./dist/native/libverule_test_adapter.so"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./verule-adapter": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./verule-native": "./dist/verule-native.json",
+      "./native/linux-x64": "./dist/native/libverule_test_adapter.so"
+    }
+  },
+  "scripts": {
+    "format:check": "oxfmt --list-different . && cargo fmt --manifest-path native/Cargo.toml --all -- --check",
+    "format:write": "oxfmt --write . && cargo fmt --manifest-path native/Cargo.toml --all",
+    "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules . && cargo clippy --locked --manifest-path native/Cargo.toml --all-targets --all-features -- -D warnings",
+    "lint:fix": "oxlint --format=unix . --fix",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && mkdir -p dist/native && cargo build --locked --release --manifest-path native/Cargo.toml && cp native/target/release/libverule_test_adapter.so dist/native/libverule_test_adapter.so && cp native/verule-native.json dist/verule-native.json && cargo build --locked --release --features wrong-abi --manifest-path native/Cargo.toml && cp native/target/release/libverule_test_adapter.so native/target/release/libverule_bad_abi.so",
+    "test": "node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@verule/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@verule/adapter-api": "workspace:*",
+    "@verule/test-hosts": "workspace:*",
+    "@verule/tooling-config": "workspace:*",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "typescript-7": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
+  }
+}

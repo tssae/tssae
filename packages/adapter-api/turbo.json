@@ -1,0 +1,38 @@
+{
+  "extends": ["//"],
+  "tags": ["tooling"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": [],
+      "outputs": ["target/**"],
+      "cache": false,
+      "tags": ["work:preparation"]
+    },
+    "format:check": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "format:write": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "lint": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "test": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    }
+  }
+}

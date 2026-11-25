@@ -1,0 +1,64 @@
+{
+  "name": "@verule/adapter-drizzle",
+  "version": "0.0.0",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./verule-adapter": {
+      "source": "./src/native-adapter.ts",
+      "types": "./dist/native-adapter.d.ts",
+      "default": "./dist/native-adapter.js"
+    },
+    "./verule-native": "./dist/verule-native.json",
+    "./native/linux-x64": "./dist/native/libverule_adapter_drizzle.so"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./verule-adapter": {
+        "types": "./dist/native-adapter.d.ts",
+        "default": "./dist/native-adapter.js"
+      },
+      "./verule-native": "./dist/verule-native.json",
+      "./native/linux-x64": "./dist/native/libverule_adapter_drizzle.so"
+    }
+  },
+  "scripts": {
+    "format:check": "oxfmt --list-different . && cargo fmt --manifest-path native/Cargo.toml --all -- --check",
+    "format:write": "oxfmt --write . && cargo fmt --manifest-path native/Cargo.toml --all",
+    "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules . && cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings",
+    "lint:fix": "oxlint --format=unix . --fix",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p dist/native && cp native/target/release/libverule_adapter_drizzle.so dist/native/libverule_adapter_drizzle.so && cp native/verule-native.json dist/verule-native.json",
+    "test": "node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@verule/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@verule/adapter-api": "workspace:*",
+    "@verule/test-hosts": "workspace:*",
+    "@verule/tooling-config": "workspace:*",
+    "drizzle-orm": "catalog:",
+    "drizzle-zod": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "typescript-7": "catalog:",
+    "zod": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
+  }
+}

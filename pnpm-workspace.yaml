@@ -1,0 +1,28 @@
+nodeLinker: isolated
+preferSymlinkedExecutables: true
+shellEmulator: true
+autoInstallPeers: false
+injectWorkspacePackages: false
+dedupeInjectedDeps: false
+syncInjectedDepsAfterScripts:
+  - build
+minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true
+allowBuilds:
+  esbuild: true
+overrides: {}
+packages:
+  - packages/*
+  - adapters/*
+  - test/*
+catalog:
+  "@changesets/cli": 3.0.3
+  "@types/node": ^26.0.0
+  drizzle-zod: 0.8.3
+  drizzle-orm: 0.45.3
+  oxfmt: ^0.79.0
+  oxlint: 1.94.0
+  tsrs: 7.1.0-beta.tsrs4
+  turbo: 2.11.13
+  typescript-7: npm:typescript@^7.0.2
+  zod: ^4.6.7

@@ -1,0 +1,35 @@
+{
+  "name": "tssae",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "NODE_VERSION": "26.13.1",
+      "RUST_TOOLCHAIN": "1.100.0"
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["oxc.oxc-vscode", "rust-lang.rust-analyzer"]
+    }
+  },
+  "mounts": [
+    {
+      "type": "volume",
+      "source": "${devcontainerId}-pnpm-store",
+      "target": "/pnpm/store"
+    },
+    {
+      "type": "volume",
+      "source": "${devcontainerId}-cargo-git",
+      "target": "/usr/local/cargo/git"
+    },
+    {
+      "type": "volume",
+      "source": "${devcontainerId}-cargo-registry",
+      "target": "/usr/local/cargo/registry"
+    }
+  ]
+}

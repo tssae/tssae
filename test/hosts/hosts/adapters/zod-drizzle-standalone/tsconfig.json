@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "paths": {
+      "@acme/db": ["./packages/db/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "packages/db/src/**/*.ts"]
+}

@@ -7,7 +7,8 @@
     "./base.json": "./base.json",
     "./node.json": "./node.json",
     "./oxfmt": "./oxfmt.config.ts",
-    "./oxlint": "./oxlint.config.ts"
+    "./oxlint": "./oxlint.config.ts",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "format:check": "oxfmt --list-different .",

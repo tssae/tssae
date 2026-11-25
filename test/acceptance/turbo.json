@@ -3,11 +3,7 @@
   "tags": ["verification"],
   "tasks": {
     "build": {
-      "dependsOn": [
-        "tssae#build",
-        "@tssae/adapters#build",
-        "@tssae/test-hosts#build"
-      ],
+      "dependsOn": ["^build", "//#toolchain:prepare"],
       "inputs": [],
       "outputs": ["dist/**"],
       "cache": false,
@@ -44,7 +40,7 @@
       "tags": ["quality:light"]
     },
     "test:e2e": {
-      "dependsOn": ["build"],
+      "dependsOn": ["build", "^build", "//#toolchain:prepare"],
       "passThroughEnv": [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -52,7 +48,10 @@
         "http_proxy",
         "https_proxy",
         "no_proxy",
-        "XDG_CACHE_HOME"
+        "XDG_CACHE_HOME",
+        "CARGO_NET_OFFLINE",
+        "TSSAE_ACCEPTANCE_PACK_DIR",
+        "TSSAE_ACCEPTANCE_CRATE_PATH"
       ],
       "inputs": ["$TURBO_DEFAULT$"],
       "outputs": [],

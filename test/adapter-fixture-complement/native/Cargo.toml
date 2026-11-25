@@ -2,6 +2,7 @@
 name = "tssae-adapter-third-party-fixture-complement"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [lib]
 name = "tssae_test_adapter_complement"

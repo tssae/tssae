@@ -5,7 +5,7 @@
     "build": {
       "dependsOn": ["//#toolchain:prepare"],
       "inputs": [],
-      "outputs": ["target/**"],
+      "outputs": ["target/**", "dist/**"],
       "cache": false,
       "tags": ["work:preparation"]
     },
@@ -16,7 +16,7 @@
       "tags": ["quality:light"]
     },
     "format:write": {
-      "dependsOn": ["//#toolchain:prepare"],
+      "dependsOn": ["lint:fix", "//#toolchain:prepare"],
       "inputs": [],
       "outputs": [],
       "cache": false,
@@ -28,8 +28,20 @@
       "outputs": [],
       "tags": ["quality:light"]
     },
+    "lint:fix": {
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
     "test": {
       "dependsOn": ["//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "typecheck": {
+      "dependsOn": ["@tssae/tooling-config#typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "!target/**"],
       "outputs": [],
       "tags": ["quality:light"]

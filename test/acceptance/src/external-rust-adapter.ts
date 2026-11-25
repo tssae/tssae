@@ -5,23 +5,21 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
+
+import { getAdapterApiCrateInfo } from "@tssae/adapter-api";
 
 import type { PackedArtifact } from "./artifacts.ts";
 
 const execFileAsync = promisify(execFile);
 const maxOutputBytes = 64 * 1024 * 1024;
-const defaultRepoRoot = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../../..",
-);
 
 export type PackedAdapterApiCrate = {
   readonly crateName: string;
@@ -32,9 +30,8 @@ export type PackedAdapterApiCrate = {
 };
 
 export type PackAdapterApiCrateOptions = {
-  readonly cwd?: string;
+  readonly cratePath?: string;
   readonly tempRoot?: string;
-  readonly allowDirty?: boolean;
 };
 
 export type ExternalRustAdapterVariant =
@@ -81,17 +78,41 @@ function sanitizeRustIdent(input: string): string {
   return /^[a-zA-Z_]/u.test(normalized) ? normalized : `ext_${normalized}`;
 }
 
-async function isAdapterApiDirty(repoRoot: string): Promise<boolean> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["status", "--porcelain", "--", "packages/adapter-api"],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
+function parseCargoPackageMetadata(cargoTomlPath: string): {
+  readonly crateName: string;
+  readonly version: string;
+} {
+  const content = readFileSync(cargoTomlPath, "utf8");
+  let inPackageSection = false;
+  let crateName: string | undefined;
+  let version: string | undefined;
+
+  for (const rawLine of content.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line.startsWith("[")) {
+      inPackageSection = line === "[package]";
+      continue;
+    }
+    if (!inPackageSection || line.length === 0 || line.startsWith("#")) {
+      continue;
+    }
+    const nameMatch = /^name\s*=\s*"([^"]+)"/u.exec(line);
+    if (nameMatch?.[1] !== undefined) {
+      crateName = nameMatch[1];
+      continue;
+    }
+    const versionMatch = /^version\s*=\s*"([^"]+)"/u.exec(line);
+    if (versionMatch?.[1] !== undefined) {
+      version = versionMatch[1];
+    }
   }
+
+  if (crateName === undefined || version === undefined) {
+    throw new Error(
+      `Failed to read [package] name and version from ${cargoTomlPath}`,
+    );
+  }
+  return { crateName, version };
 }
 
 async function readDynamicSymbols(libraryPath: string): Promise<string[]> {
@@ -112,65 +133,62 @@ async function readDynamicSymbols(libraryPath: string): Promise<string[]> {
 }
 
 /**
- * Packages `packages/adapter-api` into a `.crate` archive in a temporary directory
- * and extracts it outside the repository for independent Cargo consumption.
+ * Extracts a packaged `tssae-adapter-api` `.crate` archive (either from
+ * `options.cratePath` / `TSSAE_ACCEPTANCE_CRATE_PATH` or from `@tssae/adapter-api`
+ * build output) into a temporary directory outside the repository without
+ * modifying or deleting the source `.crate` file.
  */
 export async function packAdapterApiCrate(
   options: PackAdapterApiCrateOptions = {},
 ): Promise<PackedAdapterApiCrate> {
-  const repoRoot = resolve(options.cwd ?? defaultRepoRoot);
-  const manifestPath = join(repoRoot, "packages/adapter-api/Cargo.toml");
+  const envCratePath = process.env.TSSAE_ACCEPTANCE_CRATE_PATH?.trim();
+  const explicitCratePath =
+    options.cratePath ??
+    (envCratePath !== undefined && envCratePath.length > 0
+      ? envCratePath
+      : undefined);
+
+  const sourceCratePath =
+    explicitCratePath !== undefined
+      ? resolve(explicitCratePath)
+      : getAdapterApiCrateInfo().cratePath;
+
+  if (!existsSync(sourceCratePath)) {
+    throw new Error(`Expected packed crate at ${sourceCratePath}`);
+  }
+
   const tempParent = options.tempRoot ?? tmpdir();
   mkdirSync(tempParent, { recursive: true });
-  const workDir = mkdtempSync(join(tempParent, "tssae-crate-pack-"));
+  const workDir = mkdtempSync(join(tempParent, "tssae-crate-extract-"));
 
   try {
-    const targetDir = join(workDir, "target");
     const extractedRoot = join(workDir, "extracted");
-    mkdirSync(targetDir, { recursive: true });
     mkdirSync(extractedRoot, { recursive: true });
 
-    const allowDirty =
-      options.allowDirty ?? (await isAdapterApiDirty(repoRoot));
-    const cargoArgs = [
-      "package",
-      "--locked",
-      "--offline",
-      ...(allowDirty ? ["--allow-dirty"] : []),
-      "--manifest-path",
-      manifestPath,
-      "--target-dir",
-      targetDir,
-    ];
-    await execFileAsync("cargo", cargoArgs, {
-      cwd: repoRoot,
+    await execFileAsync("tar", ["-xzf", sourceCratePath, "-C", extractedRoot], {
       encoding: "utf8",
-      maxBuffer: maxOutputBytes,
     });
 
-    const crateName = "tssae-adapter-api";
-    const version = "0.1.0";
-    const cratePath = join(
-      targetDir,
-      "package",
-      `${crateName}-${version}.crate`,
+    const subdirs = readdirSync(extractedRoot, { withFileTypes: true }).filter(
+      (entry) => entry.isDirectory(),
     );
-    if (!existsSync(cratePath)) {
-      throw new Error(`Expected packed crate at ${cratePath}`);
+    if (subdirs.length !== 1) {
+      throw new Error(
+        `Expected single crate directory inside ${sourceCratePath}, found ${String(subdirs.length)}`,
+      );
     }
-
-    await execFileAsync("tar", ["-xzf", cratePath, "-C", extractedRoot], {
-      encoding: "utf8",
-    });
-    const extractedDir = join(extractedRoot, `${crateName}-${version}`);
-    if (!existsSync(join(extractedDir, "Cargo.toml"))) {
+    const extractedDir = join(extractedRoot, subdirs[0]!.name);
+    const manifestPath = join(extractedDir, "Cargo.toml");
+    if (!existsSync(manifestPath)) {
       throw new Error(`Extracted crate missing Cargo.toml at ${extractedDir}`);
     }
+
+    const { crateName, version } = parseCargoPackageMetadata(manifestPath);
 
     return {
       crateName,
       version,
-      cratePath,
+      cratePath: sourceCratePath,
       extractedDir,
       dispose(): void {
         rmSync(workDir, { recursive: true, force: true });
@@ -325,6 +343,9 @@ export async function buildExternalRustAdapter(
   );
   const variant = options.variant ?? "valid";
 
+  const { crateName: apiCrateName, version: apiCrateVersion } =
+    parseCargoPackageMetadata(join(options.extractedCrateDir, "Cargo.toml"));
+
   const tempParent = options.tempRoot ?? tmpdir();
   mkdirSync(tempParent, { recursive: true });
   const projectDir = mkdtempSync(join(tempParent, "tssae-ext-rust-"));
@@ -341,11 +362,11 @@ name = ${JSON.stringify(crateName)}
 crate-type = ["cdylib"]
 
 [dependencies]
-tssae-adapter-api = { version = "0.1.0", default-features = false }
+${apiCrateName} = { version = ${JSON.stringify(apiCrateVersion)}, default-features = false }
 serde_json = "1"
 
 [patch.crates-io]
-tssae-adapter-api = { path = ${JSON.stringify(options.extractedCrateDir)} }
+${apiCrateName} = { path = ${JSON.stringify(options.extractedCrateDir)} }
 
 [workspace]
 `;

@@ -2,11 +2,35 @@
   "name": "@tssae/adapter-api",
   "version": "0.1.0",
   "private": true,
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "scripts": {
-    "build": "cargo build --locked --release",
-    "format:check": "cargo fmt --all -- --check",
-    "format:write": "cargo fmt --all",
-    "lint": "cargo clippy --locked --all-targets -- -D warnings",
-    "test": "cargo test --locked"
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && cargo build --locked --release && node scripts/pack-crate.ts",
+    "format:check": "cargo fmt --all -- --check && oxfmt --list-different .",
+    "format:write": "cargo fmt --all && oxfmt --write .",
+    "lint": "cargo clippy --locked --all-targets -- -D warnings && oxlint --quiet --format=unix --ignore-pattern node_modules --ignore-pattern target .",
+    "lint:fix": "oxlint --format=unix --ignore-pattern node_modules --ignore-pattern target . --fix",
+    "test": "cargo test --locked",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "@tssae/tooling-config": "workspace:*",
+    "@types/node": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "typescript-7": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
   }
 }

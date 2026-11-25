@@ -791,7 +791,6 @@ export async function openProject(
     ): void => {
       if (!collector.isActive()) return;
       collector.recordQuery({
-        ruleId: "tssae-query",
         op,
         projectId: project.projectId,
         provider: "engine",
@@ -1002,7 +1001,6 @@ export async function openProject(
           : undefined;
         const kindsLabel = query.kinds ? query.kinds.join(", ") : "range";
         collector.recordQuery({
-          ruleId: "tssae-query",
           op: "findSyntax",
           projectId: project.projectId,
           provider: "engine",
@@ -1128,7 +1126,6 @@ export async function openProject(
           }
         }
         collector.recordQuery({
-          ruleId: "tssae-query",
           op: "typeAtLocation",
           projectId: project.projectId,
           provider: "engine",
@@ -1235,7 +1232,6 @@ export async function openProject(
 
       if (collector.isActive() && recordRuleQuery) {
         collector.recordQuery({
-          ruleId: "tssae-query",
           op: "listBranches",
           projectId: project.projectId,
           provider: "engine",
@@ -1340,7 +1336,6 @@ export async function openProject(
 
       if (collector.isActive() && recordRuleQuery) {
         collector.recordQuery({
-          ruleId: "tssae-query",
           op: "branchCoverage",
           projectId: project.projectId,
           provider: "engine",
@@ -1540,7 +1535,6 @@ export async function openProject(
           sessionToken,
           snapshotId: activeSnapshotId,
           projectId: project.projectId,
-          ruleId: "tssae-query",
           assertActiveSnapshot,
           createAdapterContext,
           replayAdapterAdditionalInput,

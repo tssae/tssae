@@ -38,8 +38,8 @@
   },
   "devDependencies": {
     "@tssae/adapter-api": "workspace:*",
+    "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/tooling-config": "workspace:*",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "typescript-7": "catalog:"

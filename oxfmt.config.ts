@@ -1,1 +1,1 @@
-export { default } from "@verule/tooling-config/oxfmt";
+export { default } from "@tssae/tooling-config/oxfmt";

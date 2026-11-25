@@ -6,7 +6,7 @@ import {
   linkNodeModulesPackage,
   resolveHostDir,
   withTempHost,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 import {
   TssaeError,
   openProject,

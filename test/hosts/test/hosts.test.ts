@@ -10,9 +10,9 @@ import {
   resolveHostDir,
   typecheckHostProjects,
   withTempHost,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 
-void describe("@verule/test-hosts", () => {
+void describe("@tssae/test-hosts", () => {
   void it("materializes a checked host into an isolated writable directory and cleans up on dispose", async () => {
     const sourceHandlers = readFileSync(
       `${resolveHostDir("sdk/check-basic")}/src/handlers.ts`,
@@ -266,12 +266,12 @@ void describe("@verule/test-hosts", () => {
   void it("installPackedWorkspacePackages packs and extracts workspace artifacts into node_modules", async () => {
     await withTempHost({}, async (consumerHost) => {
       await installPackedWorkspacePackages(consumerHost.rootDir, [
-        "@verule/test-hosts",
+        "@tssae/test-hosts",
       ]);
       assert.equal(
         existsSync(
           consumerHost.resolvePath(
-            "node_modules/@verule/test-hosts/dist/index.d.ts",
+            "node_modules/@tssae/test-hosts/dist/index.d.ts",
           ),
         ),
         true,

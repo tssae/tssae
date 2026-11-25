@@ -13,7 +13,6 @@ allowBuilds:
 overrides: {}
 packages:
   - packages/*
-  - adapters/*
   - test/*
 catalog:
   "@changesets/cli": 3.0.3

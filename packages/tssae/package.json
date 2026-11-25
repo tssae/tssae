@@ -36,9 +36,9 @@
   },
   "devDependencies": {
     "@tssae/adapter-api": "workspace:*",
+    "@tssae/test-hosts": "workspace:*",
+    "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/test-hosts": "workspace:*",
-    "@verule/tooling-config": "workspace:*",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "tsrs": "catalog:",

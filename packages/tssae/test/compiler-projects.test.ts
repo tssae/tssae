@@ -5,7 +5,7 @@ import {
   type PreparedTempHost,
   withTempHost,
   writeSyntheticPackage,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 import { TssaeError, openProject, type SyntaxRef } from "tssae";
 
 function materializeExtLib(host: PreparedTempHost): void {

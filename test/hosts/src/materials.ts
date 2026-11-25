@@ -92,7 +92,7 @@ export function resolveCheckedHostDir(
 }
 
 /**
- * Resolves the checked host directory under `@verule/test-hosts/hosts/`.
+ * Resolves the checked host directory under `@tssae/test-hosts/hosts/`.
  */
 export function resolveHostDir(hostName: string): string {
   return resolveCheckedHostDir(hostsRootDir, hostName);

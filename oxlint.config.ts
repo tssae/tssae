@@ -1,4 +1,4 @@
-import lintConfiguration from "@verule/tooling-config/oxlint";
+import lintConfiguration from "@tssae/tooling-config/oxlint";
 import { defineConfig } from "oxlint";
 
 export default defineConfig({

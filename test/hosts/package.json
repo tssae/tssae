@@ -1,5 +1,5 @@
 {
-  "name": "@verule/test-hosts",
+  "name": "@tssae/test-hosts",
   "version": "0.0.0",
   "private": true,
   "files": [
@@ -26,8 +26,8 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false && node --conditions=source scripts/typecheck-hosts.ts"
   },
   "devDependencies": {
+    "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/tooling-config": "workspace:*",
     "drizzle-orm": "catalog:",
     "drizzle-zod": "catalog:",
     "oxfmt": "catalog:",

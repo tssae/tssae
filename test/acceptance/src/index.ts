@@ -48,6 +48,9 @@ export {
 export type { PackageManager } from "./types.ts";
 export {
   verifyHostArtifactResolution,
+  verifyInstalledNativeLibrary,
   type HostResolutionAudit,
+  type VerifiedNativeLibrary,
   type VerifyHostResolutionOptions,
+  type VerifyInstalledNativeLibraryOptions,
 } from "./verify.ts";

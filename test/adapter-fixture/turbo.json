@@ -35,13 +35,13 @@
       "tags": ["work:repair"]
     },
     "test": {
-      "dependsOn": ["^build", "build", "@verule/test-hosts#typecheck"],
+      "dependsOn": ["^build", "build", "@tssae/test-hosts#typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "!native/target/**"],
       "outputs": [],
       "tags": ["quality:light"]
     },
     "typecheck": {
-      "dependsOn": ["tssae#typecheck", "@verule/test-hosts#typecheck"],
+      "dependsOn": ["tssae#typecheck", "@tssae/test-hosts#typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "!native/target/**"],
       "outputs": [],
       "tags": ["quality:light"]

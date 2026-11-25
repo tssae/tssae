@@ -15,8 +15,8 @@
   "rust-analyzer.linkedProjects": [
     "./packages/tssae/Cargo.toml",
     "./packages/adapter-api/Cargo.toml",
-    "./adapters/zod/native/Cargo.toml",
-    "./adapters/drizzle/native/Cargo.toml",
+    "./packages/adapters/native/zod/Cargo.toml",
+    "./packages/adapters/native/drizzle/Cargo.toml",
     "./test/adapter-fixture/native/Cargo.toml",
     "./test/adapter-fixture-complement/native/Cargo.toml"
   ],

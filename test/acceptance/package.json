@@ -24,11 +24,12 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "dependencies": {
-    "@verule/test-hosts": "workspace:*"
+    "@tssae/test-hosts": "workspace:*"
   },
   "devDependencies": {
+    "@tssae/adapters": "workspace:*",
+    "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/tooling-config": "workspace:*",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "tssae": "workspace:*",

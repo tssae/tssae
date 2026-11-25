@@ -3,7 +3,11 @@
   "tags": ["verification"],
   "tasks": {
     "build": {
-      "dependsOn": ["tssae#build", "@verule/test-hosts#build"],
+      "dependsOn": [
+        "tssae#build",
+        "@tssae/adapters#build",
+        "@tssae/test-hosts#build"
+      ],
       "inputs": [],
       "outputs": ["dist/**"],
       "cache": false,
@@ -34,7 +38,7 @@
       "tags": ["work:repair"]
     },
     "test": {
-      "dependsOn": ["@verule/test-hosts#build", "^typecheck"],
+      "dependsOn": ["@tssae/test-hosts#build", "^typecheck"],
       "inputs": ["$TURBO_DEFAULT$"],
       "outputs": [],
       "tags": ["quality:light"]

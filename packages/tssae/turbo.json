@@ -26,7 +26,7 @@
       "dependsOn": [
         "//#toolchain:prepare",
         "^lint",
-        "@verule/test-hosts#typecheck"
+        "@tssae/test-hosts#typecheck"
       ],
       "inputs": ["$TURBO_DEFAULT$", "!target/**"],
       "outputs": [],
@@ -43,7 +43,7 @@
         "^build",
         "build",
         "//#toolchain:prepare",
-        "@verule/test-hosts#typecheck"
+        "@tssae/test-hosts#typecheck"
       ],
       "inputs": ["$TURBO_DEFAULT$", "!target/**"],
       "outputs": [],
@@ -51,8 +51,8 @@
     },
     "typecheck": {
       "dependsOn": [
-        "@verule/tooling-config#typecheck",
-        "@verule/test-hosts#typecheck"
+        "@tssae/tooling-config#typecheck",
+        "@tssae/test-hosts#typecheck"
       ],
       "inputs": ["$TURBO_DEFAULT$", "!target/**"],
       "outputs": [],

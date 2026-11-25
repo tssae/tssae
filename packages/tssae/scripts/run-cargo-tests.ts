@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 
-import { resolveHostDir } from "@verule/test-hosts";
+import { resolveHostDir } from "@tssae/test-hosts";
 
 const hostsDir = resolveHostDir("engine");
 const result = spawnSync(

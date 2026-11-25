@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 
-import { withTempHost } from "@verule/test-hosts";
+import { withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   openProject,

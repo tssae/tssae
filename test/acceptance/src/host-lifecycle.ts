@@ -9,7 +9,7 @@ import {
   resolveHostDir,
   runCleanupsLifo,
   writeHostFiles,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 
 import {
   type PackedArtifact,
@@ -37,6 +37,7 @@ export type PrepareAcceptanceHostOptions = {
   readonly blockedPaths?: readonly string[];
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly tempRoot?: string;
+  readonly storeDir?: string;
   readonly cwd?: string;
 };
 
@@ -97,7 +98,7 @@ export async function prepareAcceptanceHost(
   });
 
   const hostDir = join(environmentDir, "host");
-  const storeDir = join(environmentDir, "store");
+  const storeDir = options.storeDir ?? join(environmentDir, "store");
   const runtimeDir = join(environmentDir, "runtime");
 
   try {

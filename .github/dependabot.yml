@@ -44,11 +44,11 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: cargo
-    directory: /adapters/zod/native
+    directory: /packages/adapters/native/zod
     schedule:
       interval: weekly
   - package-ecosystem: cargo
-    directory: /adapters/drizzle/native
+    directory: /packages/adapters/native/drizzle
     schedule:
       interval: weekly
   - package-ecosystem: rust-toolchain

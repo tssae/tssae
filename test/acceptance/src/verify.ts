@@ -278,3 +278,146 @@ export function verifyHostArtifactResolution(
     ...symlinkAudit,
   };
 }
+
+export type VerifiedNativeLibrary = {
+  readonly specifier: string;
+  readonly providerId: string;
+  readonly descriptorPath: string;
+  readonly path: string;
+  readonly sha256: string;
+};
+
+export type VerifyInstalledNativeLibraryOptions = {
+  readonly checkoutDir: string;
+  readonly specifier: string;
+  readonly artifact?: PackedArtifact;
+  readonly resolutionBaseDir?: string;
+  readonly expectedProviderId?: string;
+};
+
+function currentNativePlatformKey(): string {
+  return `${process.platform}-${process.arch}`;
+}
+
+function resolveArtifactExportSubpath(
+  specifier: string,
+  artifactName: string,
+  relativeExport: string,
+): string {
+  const normalizedRelative = relativeExport.replace(/^\.\//u, "");
+  if (specifier === artifactName) {
+    return `./${normalizedRelative}`;
+  }
+  if (!specifier.startsWith(`${artifactName}/`)) {
+    throw new Error(
+      `Adapter specifier ${specifier} does not belong to artifact ${artifactName}`,
+    );
+  }
+  const subpathPrefix = specifier.slice(artifactName.length + 1);
+  return `./${subpathPrefix}/${normalizedRelative}`;
+}
+
+/**
+ * Verifies that an installed native adapter (root or subpath specifier) resolves
+ * its `tssae-native` descriptor and native library inside `checkoutDir` with
+ * an optional digest check against its `.tgz`.
+ */
+export function verifyInstalledNativeLibrary(
+  options: VerifyInstalledNativeLibraryOptions,
+): VerifiedNativeLibrary {
+  const checkoutRealpath = realpathSync(options.checkoutDir);
+  const resolutionRoot = options.resolutionBaseDir ?? checkoutRealpath;
+  const hostRequire = createRequire(join(resolutionRoot, "package.json"));
+  const descriptorPath = realpathSync(
+    hostRequire.resolve(`${options.specifier}/tssae-native`),
+  );
+  if (!isInsideDirectory(descriptorPath, checkoutRealpath)) {
+    throw new Error(
+      `Resolved ${options.specifier}/tssae-native outside host checkout: ${descriptorPath}`,
+    );
+  }
+
+  const descriptorRaw: unknown = JSON.parse(
+    readFileSync(descriptorPath, "utf8"),
+  );
+  if (
+    typeof descriptorRaw !== "object" ||
+    descriptorRaw === null ||
+    !("id" in descriptorRaw) ||
+    typeof descriptorRaw.id !== "string"
+  ) {
+    throw new Error(`Invalid native descriptor in ${descriptorPath}`);
+  }
+  const providerId = descriptorRaw.id;
+  if (
+    options.expectedProviderId !== undefined &&
+    providerId !== options.expectedProviderId
+  ) {
+    throw new Error(
+      `Expected native adapter ${options.specifier} id "${options.expectedProviderId}", got "${providerId}"`,
+    );
+  }
+
+  const platformKey = currentNativePlatformKey();
+  const exportSubpath =
+    platformKey in descriptorRaw
+      ? (descriptorRaw as Record<string, unknown>)[platformKey]
+      : undefined;
+  if (typeof exportSubpath !== "string" || !exportSubpath.startsWith("./")) {
+    throw new Error(
+      `Missing ${platformKey} entry in native descriptor ${descriptorPath}`,
+    );
+  }
+
+  const targetSpecifier = `${options.specifier}/${exportSubpath.slice(2)}`;
+  const libraryPath = realpathSync(hostRequire.resolve(targetSpecifier));
+  if (!isInsideDirectory(libraryPath, checkoutRealpath)) {
+    throw new Error(
+      `Resolved native library for ${options.specifier} outside host checkout: ${libraryPath}`,
+    );
+  }
+
+  const installedSha256 = createHash("sha256")
+    .update(readFileSync(libraryPath))
+    .digest("hex");
+
+  if (options.artifact !== undefined) {
+    const artifactExports = options.artifact.manifest.exports as
+      | Record<string, unknown>
+      | undefined;
+    const exportKey = resolveArtifactExportSubpath(
+      options.specifier,
+      options.artifact.name,
+      exportSubpath,
+    );
+    const archiveLibraryPath = artifactExports?.[exportKey];
+    if (typeof archiveLibraryPath !== "string") {
+      throw new Error(
+        `Missing ${exportKey} export in packed artifact ${options.artifact.name}`,
+      );
+    }
+    const packedBytes = execFileSync(
+      "tar",
+      [
+        "-xOf",
+        options.artifact.filename,
+        `package/${archiveLibraryPath.replace(/^\.\//u, "")}`,
+      ],
+      { encoding: "buffer", maxBuffer: 32 * 1024 * 1024 },
+    );
+    const packedSha256 = createHash("sha256").update(packedBytes).digest("hex");
+    if (installedSha256 !== packedSha256) {
+      throw new Error(
+        `Installed native library SHA-256 ${installedSha256} for ${options.specifier} does not match packed artifact ${packedSha256}`,
+      );
+    }
+  }
+
+  return {
+    specifier: options.specifier,
+    providerId,
+    descriptorPath,
+    path: libraryPath,
+    sha256: installedSha256,
+  };
+}

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   installPackedWorkspacePackages,
   withTempHost,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 
 const sdkRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const tscBin = join(sdkRoot, "node_modules", ".bin", "tsc");

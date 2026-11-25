@@ -12,13 +12,8 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./verule-adapter": {
-      "source": "./src/verule-adapter.ts",
-      "types": "./dist/verule-adapter.d.ts",
-      "default": "./dist/verule-adapter.js"
-    },
-    "./verule-native": "./dist/verule-native.json",
-    "./native/linux-x64": "./dist/native/libverule_adapter_zod.so"
+    "./tssae-native": "./dist/tssae-native.json",
+    "./native/linux-x64": "./dist/native/libtssae_adapter_zod.so"
   },
   "publishConfig": {
     "exports": {
@@ -26,12 +21,8 @@
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
       },
-      "./verule-adapter": {
-        "types": "./dist/verule-adapter.d.ts",
-        "default": "./dist/verule-adapter.js"
-      },
-      "./verule-native": "./dist/verule-native.json",
-      "./native/linux-x64": "./dist/native/libverule_adapter_zod.so"
+      "./tssae-native": "./dist/tssae-native.json",
+      "./native/linux-x64": "./dist/native/libtssae_adapter_zod.so"
     }
   },
   "scripts": {
@@ -40,15 +31,15 @@
     "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules . && cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings",
     "lint:fix": "oxlint --format=unix . --fix",
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && mkdir -p dist/native && cargo build --locked --release --manifest-path native/Cargo.toml && cp native/target/release/libverule_adapter_zod.so dist/native/libverule_adapter_zod.so && cp native/verule-native.json dist/verule-native.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && mkdir -p dist/native && cargo build --locked --release --manifest-path native/Cargo.toml && cp native/target/release/libtssae_adapter_zod.so dist/native/libtssae_adapter_zod.so && cp native/tssae-native.json dist/tssae-native.json",
     "test": "cargo test --locked --manifest-path native/Cargo.toml && node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'"
   },
   "dependencies": {
     "tssae": "workspace:*"
   },
   "devDependencies": {
+    "@tssae/adapter-api": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/adapter-api": "workspace:*",
     "@verule/test-hosts": "workspace:*",
     "@verule/tooling-config": "workspace:*",
     "drizzle-orm": "catalog:",

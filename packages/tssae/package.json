@@ -35,8 +35,8 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "devDependencies": {
+    "@tssae/adapter-api": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/adapter-api": "workspace:*",
     "@verule/test-hosts": "workspace:*",
     "@verule/tooling-config": "workspace:*",
     "oxfmt": "catalog:",

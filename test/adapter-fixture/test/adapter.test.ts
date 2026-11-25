@@ -32,15 +32,15 @@ function syntheticAdapterPackage(
       name: packageName,
       type: "module",
       exports: {
-        "./verule-adapter": "./dist/bridge.js",
-        "./verule-native": "./dist/verule-native.json",
+        ".": "./dist/bridge.js",
+        "./tssae-native": "./dist/tssae-native.json",
         "./native/linux-x64": "./dist/native/adapter.so",
       },
     },
     files: {
       "dist/bridge.js": moduleSource,
       "dist/native/adapter.so": readFileSync(nativeFile),
-      "dist/verule-native.json": JSON.stringify({
+      "dist/tssae-native.json": JSON.stringify({
         id: adapterId,
         "linux-x64": "./native/linux-x64",
       }),
@@ -65,7 +65,7 @@ void describe("independent native adapter package", () => {
           cwd: host.rootDir,
           adapterResolutionRoot: fixtureRoot,
           tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-fixture"],
+          adapters: ["@tssae/adapter-fixture"],
         });
 
         try {
@@ -117,11 +117,11 @@ void describe("independent native adapter package", () => {
   void it("reports configured package names for invalid bridges and ABI mismatches", async () => {
     const goodLibrary = join(
       fixtureRoot,
-      "dist/native/libverule_test_adapter.so",
+      "dist/native/libtssae_test_adapter.so",
     );
     const badAbiLibrary = join(
       fixtureRoot,
-      "native/target/release/libverule_bad_abi.so",
+      "native/target/release/libtssae_bad_abi.so",
     );
     const invalidBridgeName = "fixture-invalid-bridge";
     const abiMismatchName = "fixture-abi-mismatch";
@@ -266,7 +266,7 @@ export default {
           cwd: host.rootDir,
           adapterResolutionRoot: fixtureRoot,
           tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-fixture"],
+          adapters: ["@tssae/adapter-fixture"],
         });
         try {
           const context = session.project();

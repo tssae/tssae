@@ -18,3 +18,5 @@ export {
 
 /** Package-name alias retained for configs migrating to native package loading. */
 export const zodAdapter = "@verule/adapter-zod";
+
+export { default } from "./native-adapter.ts";

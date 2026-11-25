@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rustc_hash::FxHashSet;
 use serde_json::{Map, Value, json};
-use verule_adapter_api::{
+use tssae_adapter_api::{
     AdapterError, Context, Evidence, ExplainGapResolutionStatus, ExplainLocalGap, FactContribution,
     FactExplainTrace, FactQuery, FactRequest, Gap, NodeKind, NodeRef, QueriedFact, SourceLocation,
 };

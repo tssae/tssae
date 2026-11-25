@@ -1,5 +1,5 @@
 {
-  "name": "@verule/adapter-api",
+  "name": "@tssae/adapter-api",
   "version": "0.1.0",
   "private": true,
   "scripts": {

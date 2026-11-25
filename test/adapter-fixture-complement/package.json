@@ -1,5 +1,5 @@
 {
-  "name": "@verule/adapter-fixture-complement",
+  "name": "@tssae/adapter-fixture-complement",
   "version": "0.1.0",
   "private": true,
   "files": [
@@ -12,12 +12,8 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./verule-adapter": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
-    "./verule-native": "./dist/verule-native.json",
-    "./native/linux-x64": "./dist/native/libverule_test_adapter_complement.so"
+    "./tssae-native": "./dist/tssae-native.json",
+    "./native/linux-x64": "./dist/native/libtssae_test_adapter_complement.so"
   },
   "publishConfig": {
     "exports": {
@@ -25,16 +21,12 @@
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
       },
-      "./verule-adapter": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "./verule-native": "./dist/verule-native.json",
-      "./native/linux-x64": "./dist/native/libverule_test_adapter_complement.so"
+      "./tssae-native": "./dist/tssae-native.json",
+      "./native/linux-x64": "./dist/native/libtssae_test_adapter_complement.so"
     }
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && mkdir -p dist/native && cargo build --locked --release --manifest-path native/Cargo.toml && cp native/target/release/libverule_test_adapter_complement.so dist/native/libverule_test_adapter_complement.so && cp native/verule-native.json dist/verule-native.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && mkdir -p dist/native && cargo build --locked --release --manifest-path native/Cargo.toml && cp native/target/release/libtssae_test_adapter_complement.so dist/native/libtssae_test_adapter_complement.so && cp native/tssae-native.json dist/tssae-native.json",
     "format:check": "oxfmt --list-different . && cargo fmt --manifest-path native/Cargo.toml --all -- --check",
     "format:write": "oxfmt --write . && cargo fmt --manifest-path native/Cargo.toml --all",
     "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules . && cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings",
@@ -45,8 +37,8 @@
     "tssae": "workspace:*"
   },
   "devDependencies": {
+    "@tssae/adapter-api": "workspace:*",
     "@types/node": "catalog:",
-    "@verule/adapter-api": "workspace:*",
     "@verule/tooling-config": "workspace:*",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",

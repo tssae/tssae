@@ -1,4 +1,4 @@
-use verule_adapter_api::{
+use tssae_adapter_api::{
     ADAPTER_ABI_VERSION, Adapter, AdapterError, AdapterManifest, Context, FactContribution,
     FactRequest,
 };
@@ -31,4 +31,4 @@ impl Adapter for ZodAdapter {
     }
 }
 
-verule_adapter_api::export_adapter!(ZodAdapter);
+tssae_adapter_api::export_adapter!(ZodAdapter);

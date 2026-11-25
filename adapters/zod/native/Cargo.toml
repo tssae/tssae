@@ -1,15 +1,15 @@
 [package]
-name = "verule-adapter-zod"
+name = "tssae-adapter-zod"
 version = "0.0.0"
 edition = "2024"
 
 [lib]
-name = "verule_adapter_zod"
+name = "tssae_adapter_zod"
 crate-type = ["cdylib"]
 
 [dependencies]
 serde_json = "1"
-verule-adapter-api = { version = "0.1.0", path = "../../../packages/adapter-api", default-features = false }
+tssae-adapter-api = { version = "0.1.0", path = "../../../packages/adapter-api", default-features = false }
 
 [workspace]
 

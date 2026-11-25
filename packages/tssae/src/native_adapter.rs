@@ -11,7 +11,7 @@ use tsrs_ast::{Kind, Node, SourceFile, Symbol, SymbolFlags, get_source_file_of_n
 use tsrs_checker::TypeFormatFlags;
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, tspath};
-use verule_adapter_api::{
+use tssae_adapter_api::{
     AdapterError, DeclarationInfo, Evidence, FactExplainTrace, Gap, HostAccess, HostFactQuery,
     HostQueriedFact, HostValue, NativeAdapterInputAttribution, NativeAdapterOutput,
     NativeContribution, NativeFactRequest, NativeLibrary, NodeKind, NodeOperation, SourceLocation,
@@ -1745,7 +1745,7 @@ mod tests {
     #[test]
     fn additional_inputs_unchanged_detects_disk_edits() {
         let dir =
-            std::env::temp_dir().join(format!("verule-native-cache-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tssae-native-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let file = dir.join("input.json");

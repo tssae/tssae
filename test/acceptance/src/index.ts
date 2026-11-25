@@ -1,4 +1,16 @@
 export {
+  buildExternalRustAdapter,
+  packAdapterApiCrate,
+  packExternalAdapterPackage,
+  type BuildExternalRustAdapterOptions,
+  type BuiltExternalRustAdapter,
+  type ExternalRustAdapterVariant,
+  type PackAdapterApiCrateOptions,
+  type PackExternalAdapterPackageOptions,
+  type PackedAdapterApiCrate,
+  type PackedExternalAdapterPackage,
+} from "./external-rust-adapter.ts";
+export {
   CORE_TSSAE_PACKAGES,
   packWorkspaceArtifacts,
   type PackedArtifact,

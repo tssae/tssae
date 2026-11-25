@@ -17,8 +17,8 @@ use crate::{
     NativeContribution, NodeKind, NodeOperation, SourceLocation,
 };
 
-pub const MANIFEST_SYMBOL: &[u8] = b"verule_adapter_manifest_v1\0";
-pub const ENTRY_SYMBOL: &[u8] = b"verule_adapter_v1\0";
+pub const MANIFEST_SYMBOL: &[u8] = b"tssae_adapter_manifest_v1\0";
+pub const ENTRY_SYMBOL: &[u8] = b"tssae_adapter_v1\0";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -497,7 +497,7 @@ macro_rules! export_adapter {
     ($adapter:ty) => {
         #[allow(unsafe_code)]
         #[unsafe(no_mangle)]
-        pub extern "C" fn verule_adapter_manifest_v1() -> $crate::ffi::FfiManifestSlice {
+        pub extern "C" fn tssae_adapter_manifest_v1() -> $crate::ffi::FfiManifestSlice {
             static MANIFEST: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
             $crate::ffi::manifest_slice::<$adapter>(&MANIFEST)
         }
@@ -507,7 +507,7 @@ macro_rules! export_adapter {
         /// # Safety
         /// The engine passes ABI-v1 structures and keeps their buffers and callback context
         /// alive until this synchronous entrypoint returns.
-        pub unsafe extern "C" fn verule_adapter_v1(
+        pub unsafe extern "C" fn tssae_adapter_v1(
             host: *const $crate::ffi::FfiHostApi,
             request: *const $crate::ffi::FfiRequest,
         ) -> i32 {

@@ -5,7 +5,7 @@
     "build": {
       "dependsOn": [
         "^build",
-        "@verule/adapter-api#build",
+        "@tssae/adapter-api#build",
         "//#toolchain:prepare"
       ],
       "inputs": [

@@ -4,7 +4,7 @@ import {
   type FactMergeOutcome,
   type FactProviderContribution,
   type Gap,
-} from "@verule/sdk";
+} from "tssae";
 
 export type QueryRowSubjectKind = "syntax" | "call" | "declaration";
 

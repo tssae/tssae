@@ -8,16 +8,15 @@ import {
   ValidatorOutputFieldsFact,
   type ValidatorInputFieldsFactValue,
 } from "@verule/adapter-zod";
-import {
-  VeruleExecutionError,
-  defineAdapter,
-  defineConfig,
-  defineFactProvider,
-  defineRule,
-  runCheck,
-  type FactResult,
-} from "@verule/sdk";
 import { withTempHost, type PreparedTempHost } from "@verule/test-hosts";
+import {
+  TssaeError,
+  defineAdapter,
+  defineFactProvider,
+  openProject,
+  type FactResult,
+  type ProjectContext,
+} from "tssae";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -106,47 +105,43 @@ const customValibotAdapter = defineAdapter({
 });
 
 void describe("@verule/adapter-zod provider replacement, complementation, and conflicts", () => {
-  void it("runs the same business rule with the package-loaded Zod adapter or a custom validator adapter", async () => {
-    // Shared business rule written once against ValidatorInputFieldsFact:
-    const requireAgeRule = defineRule({
-      id: "require-age-input",
-      run: async (ctx) => {
-        const inputs = await ctx.facts(ValidatorInputFieldsFact, {
-          condition: { scope: "calls" },
+  void it("runs the same query logic with the package-loaded Zod adapter or a custom validator adapter", async () => {
+    const queryAgeInputs = async (ctx: ProjectContext) => {
+      const inputs = await ctx.facts(ValidatorInputFieldsFact, {
+        condition: { scope: "calls" },
+      });
+      const hits = [];
+      for (const item of inputs) {
+        if (!item.value.requiredFields.includes("age")) continue;
+        const syntaxRows = await ctx.syntaxOf([item.subject], {
+          select: { location: true },
         });
-        for (const item of inputs) {
-          if (!item.value.requiredFields.includes("age")) continue;
-          const syntaxRows = await ctx.syntaxOf([item.subject], {
-            select: { location: true },
-          });
-          const at = syntaxRows[0]?.location ?? item.evidence[0]?.at;
-          if (!at) continue;
-          ctx.report({
-            at,
-            message: `Validator requires "age" via [${item.providers.join(", ")}]`,
-            findingKey: "requires-age",
-            basis: [item],
-          });
-        }
-      },
-    });
+        const at = syntaxRows[0]?.location ?? item.evidence[0]?.at;
+        if (!at) continue;
+        hits.push({ item, at });
+      }
+      return hits;
+    };
 
     await withZodProviderHost("adapters/zod-provider-stub", async (zodHost) => {
       await zodHost.typecheck();
 
-      const zodReport = await runCheck({
+      const session = await openProject({
         cwd: zodHost.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [requireAgeRule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(zodReport.status, "findings");
-      assert.equal(zodReport.diagnostics.length, 1);
-      assert.match(zodReport.diagnostics[0]!.message, /\[zod\]/u);
-      assert.equal(zodReport.diagnostics[0]!.at.file, "src/app.ts");
-      assert.equal(zodReport.diagnostics[0]!.at.line, 9);
+      const hits = await (async () => {
+        try {
+          return await queryAgeInputs(session.project());
+        } finally {
+          await session.close();
+        }
+      })();
+      assert.equal(hits.length, 1);
+      assert.deepEqual(hits[0]!.item.providers, ["zod"]);
+      assert.equal(hits[0]!.at.file, "src/app.ts");
+      assert.equal(hits[0]!.at.line, 9);
     });
 
     await withZodProviderHost(
@@ -154,26 +149,24 @@ void describe("@verule/adapter-zod provider replacement, complementation, and co
       async (valibotHost) => {
         await valibotHost.typecheck();
 
-        const valibotReport = await runCheck({
+        const session = await openProject({
           cwd: valibotHost.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: [customValibotAdapter],
-            rules: [requireAgeRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: [customValibotAdapter],
         });
-        assert.equal(valibotReport.status, "findings");
-        assert.equal(valibotReport.diagnostics.length, 1);
-        assert.match(
-          valibotReport.diagnostics[0]!.message,
-          /\[custom-valibot\]/u,
-        );
-        assert.equal(valibotReport.diagnostics[0]!.at.file, "src/app.ts");
-        assert.equal(valibotReport.diagnostics[0]!.at.line, 9);
+        const hits = await (async () => {
+          try {
+            return await queryAgeInputs(session.project());
+          } finally {
+            await session.close();
+          }
+        })();
+        assert.equal(hits.length, 1);
+        assert.deepEqual(hits[0]!.item.providers, ["custom-valibot"]);
+        assert.equal(hits[0]!.at.file, "src/app.ts");
+        assert.equal(hits[0]!.at.line, 9);
         assert.ok(
-          valibotReport.diagnostics[0]!.evidence.some((e) =>
-            e.message.includes("Valibot"),
-          ),
+          hits[0]!.item.evidence.some((e) => e.message.includes("Valibot")),
         );
       },
     );
@@ -355,45 +348,31 @@ void describe("@verule/adapter-zod provider replacement, complementation, and co
           ValidatorInputFieldsFactValue
         >[] = [];
 
-        const makeRule = (
-          capture: (
-            items: readonly FactResult<
-              "syntax" | "call" | "declaration",
-              ValidatorInputFieldsFactValue
-            >[],
-          ) => void,
-        ) =>
-          defineRule({
-            id: "inspect-merged",
-            run: async (ctx) => {
-              capture(await ctx.facts(ValidatorInputFieldsFact));
-            },
-          });
+        const forwardSession = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: [partialValidatorA, partialValidatorB],
+        });
+        try {
+          mergedForward = await forwardSession
+            .project()
+            .facts(ValidatorInputFieldsFact);
+        } finally {
+          await forwardSession.close();
+        }
 
-        const repForward = await runCheck({
+        const reverseSession = await openProject({
           cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: [partialValidatorA, partialValidatorB],
-            rules: [
-              makeRule((items) => {
-                mergedForward = items;
-              }),
-            ],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: [partialValidatorB, partialValidatorA],
         });
-        const repReverse = await runCheck({
-          cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: [partialValidatorB, partialValidatorA],
-            rules: [
-              makeRule((items) => {
-                mergedReverse = items;
-              }),
-            ],
-          }),
-        });
+        try {
+          mergedReverse = await reverseSession
+            .project()
+            .facts(ValidatorInputFieldsFact);
+        } finally {
+          await reverseSession.close();
+        }
 
         assert.equal(mergedForward.length, 1);
         assert.deepEqual(mergedForward[0]!.providers, [
@@ -408,46 +387,37 @@ void describe("@verule/adapter-zod provider replacement, complementation, and co
           mergedReverse[0]!.evidence,
         );
         assert.deepEqual(mergedForward[0]!.gaps, mergedReverse[0]!.gaps);
-        assert.deepEqual(repForward, repReverse);
-
-        // Conflict between validator-part-b (age=required) and validator-conflict-c (age=optional)
-        const conflictRule = defineRule({
-          id: "detect-conflict",
-          run: async (ctx) => {
-            await ctx.facts(ValidatorInputFieldsFact);
-          },
-        });
 
         let errForward: unknown;
+        const conflictFwd = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: [partialValidatorB, conflictingValidatorC],
+        });
         try {
-          await runCheck({
-            cwd: host.rootDir,
-            config: defineConfig({
-              tsconfig: "tsconfig.json",
-              adapters: [partialValidatorB, conflictingValidatorC],
-              rules: [conflictRule],
-            }),
-          });
+          await conflictFwd.project().facts(ValidatorInputFieldsFact);
         } catch (err) {
           errForward = err;
+        } finally {
+          await conflictFwd.close();
         }
 
         let errReverse: unknown;
+        const conflictRev = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: [conflictingValidatorC, partialValidatorB],
+        });
         try {
-          await runCheck({
-            cwd: host.rootDir,
-            config: defineConfig({
-              tsconfig: "tsconfig.json",
-              adapters: [conflictingValidatorC, partialValidatorB],
-              rules: [conflictRule],
-            }),
-          });
+          await conflictRev.project().facts(ValidatorInputFieldsFact);
         } catch (err) {
           errReverse = err;
+        } finally {
+          await conflictRev.close();
         }
 
-        assert.ok(errForward instanceof VeruleExecutionError);
-        assert.ok(errReverse instanceof VeruleExecutionError);
+        assert.ok(errForward instanceof TssaeError);
+        assert.ok(errReverse instanceof TssaeError);
         assert.equal(errForward.code, "FACT_CONFLICT");
         assert.equal(errForward.message, errReverse.message);
         assert.deepEqual(errForward.conflict, errReverse.conflict);

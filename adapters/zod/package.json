@@ -44,7 +44,7 @@
     "test": "cargo test --locked --manifest-path native/Cargo.toml && node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'"
   },
   "dependencies": {
-    "@verule/sdk": "workspace:*"
+    "tssae": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

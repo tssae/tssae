@@ -13,7 +13,7 @@
   "rust-analyzer.cargo.features": "all",
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.linkedProjects": [
-    "./packages/engine/Cargo.toml",
+    "./packages/tssae/Cargo.toml",
     "./packages/adapter-api/Cargo.toml",
     "./adapters/zod/native/Cargo.toml",
     "./adapters/drizzle/native/Cargo.toml",

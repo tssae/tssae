@@ -1,5 +1,5 @@
 use serde_json::json;
-use verule_adapter_api::{
+use tssae_adapter_api::{
     DeclarationInfo, Evidence, FactQuery, Gap, HostFactQuery, HostQueriedFact,
     NativeAdapterInputAttribution, NativeAdapterOutput, QueriedFact,
 };

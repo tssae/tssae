@@ -1,5 +1,5 @@
 [package]
-name = "verule-adapter-drizzle"
+name = "tssae-adapter-drizzle"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-verule-adapter-api = { path = "../../../packages/adapter-api", default-features = false }
+tssae-adapter-api = { path = "../../../packages/adapter-api", default-features = false }
 
 [profile.release]
 strip = "symbols"

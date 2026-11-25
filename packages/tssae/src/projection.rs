@@ -453,10 +453,10 @@ enum StepResult {
         items: Vec<InstanceCleanupScopeRow>,
     },
     NativeFacts {
-        items: Vec<verule_adapter_api::NativeContribution>,
+        items: Vec<tssae_adapter_api::NativeContribution>,
         additional_inputs: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        adapter_inputs: Vec<verule_adapter_api::NativeAdapterInputAttribution>,
+        adapter_inputs: Vec<tssae_adapter_api::NativeAdapterInputAttribution>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sub_queries: Vec<native_adapter::NativeSubQueryTrace>,
     },

@@ -239,12 +239,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/tssae
     devDependencies:
+      '@tssae/adapter-api':
+        specifier: workspace:*
+        version: link:../../packages/adapter-api
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
-      '@verule/adapter-api':
-        specifier: workspace:*
-        version: link:../../packages/adapter-api
       '@verule/test-hosts':
         specifier: workspace:*
         version: link:../../test/hosts
@@ -276,12 +276,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/tssae
     devDependencies:
+      '@tssae/adapter-api':
+        specifier: workspace:*
+        version: link:../../packages/adapter-api
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
-      '@verule/adapter-api':
-        specifier: workspace:*
-        version: link:../../packages/adapter-api
       '@verule/test-hosts':
         specifier: workspace:*
         version: link:../../test/hosts
@@ -329,12 +329,12 @@ importers:
 
   packages/tssae:
     devDependencies:
+      '@tssae/adapter-api':
+        specifier: workspace:*
+        version: link:../adapter-api
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
-      '@verule/adapter-api':
-        specifier: workspace:*
-        version: link:../adapter-api
       '@verule/test-hosts':
         specifier: workspace:*
         version: link:../../test/hosts
@@ -385,12 +385,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/tssae
     devDependencies:
+      '@tssae/adapter-api':
+        specifier: workspace:*
+        version: link:../../packages/adapter-api
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
-      '@verule/adapter-api':
-        specifier: workspace:*
-        version: link:../../packages/adapter-api
       '@verule/test-hosts':
         specifier: workspace:*
         version: link:../hosts
@@ -413,12 +413,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/tssae
     devDependencies:
+      '@tssae/adapter-api':
+        specifier: workspace:*
+        version: link:../../packages/adapter-api
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
-      '@verule/adapter-api':
-        specifier: workspace:*
-        version: link:../../packages/adapter-api
       '@verule/tooling-config':
         specifier: workspace:*
         version: link:../../packages/tooling-config

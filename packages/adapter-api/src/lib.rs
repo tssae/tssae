@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 #![allow(clippy::missing_errors_doc)] // Public fallible reads uniformly return AdapterError.
 
-//! Stable, compiler-independent interfaces for Verule native library adapters.
+//! Stable, compiler-independent interfaces for TSSAE native library adapters.
 //!
 //! Adapter authors implement [`Adapter`] over [`NodeRef`] values and compile a `cdylib`.
 //! The only cross-library data is a versioned C ABI carrying opaque node IDs, UTF-8 byte

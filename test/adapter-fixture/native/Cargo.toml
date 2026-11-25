@@ -1,17 +1,17 @@
 [package]
-name = "verule-adapter-third-party-fixture"
+name = "tssae-adapter-third-party-fixture"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "verule_test_adapter"
+name = "tssae_test_adapter"
 crate-type = ["cdylib"]
 
 [features]
 wrong-abi = []
 
 [dependencies]
-verule-adapter-api = { version = "0.1.0", path = "../../../packages/adapter-api", default-features = false }
+tssae-adapter-api = { version = "0.1.0", path = "../../../packages/adapter-api", default-features = false }
 serde_json = "1"
 
 [workspace]

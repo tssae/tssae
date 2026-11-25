@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde_json::json;
-use verule_adapter_api::{
+use tssae_adapter_api::{
     ADAPTER_ABI_VERSION, Adapter, AdapterError, AdapterManifest, Context, Evidence,
     ExplainGapResolutionStatus, ExplainLocalGap, FactContribution, FactExplainTrace, FactRequest,
     Gap, NodeKind, NodeRef, SourceLocation,
@@ -443,4 +443,4 @@ fn read_string_literal(node: NodeRef<'_>) -> Result<Option<String>, AdapterError
     }
 }
 
-verule_adapter_api::export_adapter!(ThirdPartyFixtureAdapter);
+tssae_adapter_api::export_adapter!(ThirdPartyFixtureAdapter);

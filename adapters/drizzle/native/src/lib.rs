@@ -8,7 +8,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use serde_json::Value;
-use verule_adapter_api::{
+use tssae_adapter_api::{
     ADAPTER_ABI_VERSION, Adapter, AdapterError, AdapterManifest, Context, Evidence,
     FactContribution, FactRequest, Gap, NodeKind, NodeRef as ApiNodeRef, SourceLocation,
 };
@@ -326,4 +326,4 @@ fn extract_table_columns<'a>(
         .collect()
 }
 
-verule_adapter_api::export_adapter!(DrizzleAdapter);
+tssae_adapter_api::export_adapter!(DrizzleAdapter);

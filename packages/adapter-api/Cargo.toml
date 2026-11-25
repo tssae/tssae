@@ -1,9 +1,10 @@
 [package]
-name = "verule-adapter-api"
+name = "tssae-adapter-api"
 version = "0.1.0"
 edition = "2024"
-description = "Stable Rust API and runtime protocol for Verule native adapters"
+description = "Stable Rust API and runtime protocol for TSSAE native adapters"
 license = "MIT"
+repository = "https://github.com/tssae/tssae"
 include = ["Cargo.toml", "Cargo.lock", "src/**/*.rs", "tests/**/*.rs"]
 
 [dependencies]

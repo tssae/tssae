@@ -48,7 +48,7 @@ impl NativeLibrary {
                 .get::<ManifestEntry>(ffi::MANIFEST_SYMBOL)
                 .map_err(|_| AdapterError::MissingSymbol {
                     package_name: package_name.clone(),
-                    symbol: "verule_adapter_manifest_v1".to_string(),
+                    symbol: "tssae_adapter_manifest_v1".to_string(),
                 })?
         };
         let manifest_slice = unsafe { manifest_fn() };
@@ -76,7 +76,7 @@ impl NativeLibrary {
                 .get::<AdapterEntry>(ffi::ENTRY_SYMBOL)
                 .map_err(|_| AdapterError::MissingSymbol {
                     package_name: package_name.clone(),
-                    symbol: "verule_adapter_v1".to_string(),
+                    symbol: "tssae_adapter_v1".to_string(),
                 })?
         };
         Ok(Self {

@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use verule_adapter_api::{
+use tssae_adapter_api::{
     ADAPTER_ABI_VERSION, Adapter, AdapterError, AdapterManifest, Context, Evidence,
     ExplainGapResolution, ExplainGapResolutionStatus, ExplainLocalGap, FactContribution,
     FactExplainTrace, FactQuery, FactRequest, Gap, NodeKind, NodeRef,
@@ -318,7 +318,7 @@ fn push_consumer_shape_gap(
     explain: bool,
     kind: &str,
     message: String,
-    at: Option<verule_adapter_api::SourceLocation>,
+    at: Option<tssae_adapter_api::SourceLocation>,
     impact: &str,
 ) {
     state.has_dynamic_fields = true;
@@ -343,7 +343,7 @@ fn push_consumer_shape_gap(
 }
 
 fn init_state_from_source_facts(
-    queried: &[verule_adapter_api::QueriedFact<'_>],
+    queried: &[tssae_adapter_api::QueriedFact<'_>],
     source_arg: NodeRef<'_>,
     explain: bool,
 ) -> Result<DerivedConsumerState, AdapterError> {
@@ -424,7 +424,7 @@ fn init_state_from_source_facts(
 }
 
 fn record_source_explain_origins(
-    fact: &verule_adapter_api::QueriedFact<'_>,
+    fact: &tssae_adapter_api::QueriedFact<'_>,
     state: &mut DerivedConsumerState,
 ) -> Result<(), AdapterError> {
     let origin_location = fact.subject.location()?;
@@ -646,4 +646,4 @@ fn read_string_literal(node: NodeRef<'_>) -> Result<Option<String>, AdapterError
     }
 }
 
-verule_adapter_api::export_adapter!(ComplementFixtureAdapter);
+tssae_adapter_api::export_adapter!(ComplementFixtureAdapter);

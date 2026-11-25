@@ -839,10 +839,10 @@ export function createCallEffectsQueries(deps: {
         cwd,
         sourceFiles,
       );
-      if (options.scopes.length === 0) return [];
       const targets = options.targets ?? [];
       validateProgramRefs(options.scopes, sessionToken, snapshotId, projectId);
       validateProgramRefs(targets, sessionToken, snapshotId, projectId);
+      if (options.scopes.length === 0) return [];
 
       const targetByHandle = new Map<string, InstanceRef>();
       for (const target of targets) {

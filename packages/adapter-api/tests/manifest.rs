@@ -1,4 +1,4 @@
-use verule_adapter_api::{ADAPTER_ABI_VERSION, AdapterError, AdapterManifest, NodeOperation};
+use tssae_adapter_api::{ADAPTER_ABI_VERSION, AdapterError, AdapterManifest, NodeOperation, ffi};
 
 #[test]
 fn resolves_the_appended_declaration_node_operation() {
@@ -52,4 +52,19 @@ fn rejects_duplicate_fact_types_in_a_manifest() {
         manifest.validate(),
         Err(AdapterError::DuplicateFactType { .. })
     ));
+}
+
+#[test]
+fn exposes_tssae_v1_abi_symbols_without_legacy_prefixes() {
+    assert_eq!(ffi::MANIFEST_SYMBOL, b"tssae_adapter_manifest_v1\0");
+    assert_eq!(ffi::ENTRY_SYMBOL, b"tssae_adapter_v1\0");
+
+    let missing = AdapterError::MissingSymbol {
+        package_name: "@acme/example".to_string(),
+        symbol: "tssae_adapter_v1".to_string(),
+    };
+    assert_eq!(
+        missing.to_string(),
+        "adapter package \"@acme/example\" does not export required symbol \"tssae_adapter_v1\""
+    );
 }

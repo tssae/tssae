@@ -25,3 +25,5 @@ export {
 
 /** Package-name alias retained for configs migrating to native package loading. */
 export const drizzleAdapter = "@verule/adapter-drizzle";
+
+export { default } from "./native-adapter.ts";

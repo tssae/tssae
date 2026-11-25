@@ -30,17 +30,17 @@ function invalidPackage(packageName: string, reason: string): TssaeError {
 }
 
 function readNativeAdapterDescriptor(
-  packageName: string,
+  specifier: string,
   requireFromConfig: NodeJS.Require,
 ): NativeAdapterDescriptor {
   let descriptorPath: string;
   try {
-    descriptorPath = requireFromConfig.resolve(`${packageName}/verule-native`);
+    descriptorPath = requireFromConfig.resolve(`${specifier}/tssae-native`);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw invalidPackage(
-      packageName,
-      `could not resolve its public "./verule-native" export: ${detail}`,
+      specifier,
+      `could not resolve its public "${specifier}/tssae-native" descriptor export: ${detail}`,
     );
   }
 
@@ -58,14 +58,14 @@ function readNativeAdapterDescriptor(
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw invalidPackage(
-      packageName,
+      specifier,
       `could not read its native adapter descriptor: ${detail}`,
     );
   }
 
   if (typeof descriptor.id !== "string" || descriptor.id.trim() === "") {
     throw invalidPackage(
-      packageName,
+      specifier,
       'its native adapter descriptor must define a non-empty "id"',
     );
   }
@@ -75,7 +75,7 @@ function readNativeAdapterDescriptor(
     descriptor["linux-x64"].includes("..")
   ) {
     throw invalidPackage(
-      packageName,
+      specifier,
       'its native adapter descriptor must define "linux-x64" as a package export path',
     );
   }
@@ -127,7 +127,8 @@ function isLibraryAdapter(value: unknown): value is LibraryAdapter {
 }
 
 /**
- * Resolves the package's public bridge, native descriptor, and Linux x64 resource exports.
+ * Resolves a package root or subpath specifier's ESM bridge, `tssae-native`
+ * descriptor, and Linux x64 native library export.
  */
 export async function resolveNativeAdapterPackages(
   packageNames: readonly string[],
@@ -144,16 +145,23 @@ export async function resolveNativeAdapterPackages(
   }
 
   const requireFromConfig = createRequire(
-    resolve(resolutionRoot, "__verule_adapter_loader__.cjs"),
+    resolve(resolutionRoot, "__tssae_adapter_loader__.cjs"),
   );
   const adapters: LibraryAdapter[] = [];
   const nativeAdapters: NativeAdapterPackage[] = [];
   const packageOwnersByAdapterId = new Map<string, string>();
 
   for (const packageName of packageNames) {
+    if (packageName.endsWith("/")) {
+      throw invalidPackage(
+        packageName,
+        'adapter specifier must not end with "/"',
+      );
+    }
+
     let entryPath: string;
     try {
-      entryPath = requireFromConfig.resolve(`${packageName}/verule-adapter`);
+      entryPath = requireFromConfig.resolve(packageName);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw invalidPackage(packageName, detail);

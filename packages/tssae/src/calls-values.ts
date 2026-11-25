@@ -649,6 +649,7 @@ export function createCallsValuesQueries(deps: {
         : [options.from];
       const toList = Array.isArray(options.to) ? options.to : [options.to];
       const allEndpoints = [...fromList, ...toList];
+      validateProgramRefs(allEndpoints, sessionToken, snapshotId, projectId);
       if (fromList.length === 0 || toList.length === 0) {
         return {
           propagation,
@@ -657,7 +658,6 @@ export function createCallsValuesQueries(deps: {
           gaps: [],
         };
       }
-      validateProgramRefs(allEndpoints, sessionToken, snapshotId, projectId);
 
       const endpointByHandle = new Map<string, ValueEndpoint>();
       for (const endpoint of allEndpoints) {

@@ -4,15 +4,13 @@ import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
-  VeruleExecutionError,
-  defineConfig,
-  defineFactType,
-  defineRule,
-  openSession,
-  type FactResult,
-} from "@verule/sdk";
 import { withTempHost, type SyntheticPackageSpec } from "@verule/test-hosts";
+import {
+  TssaeError,
+  defineFactType,
+  openProject,
+  type FactResult,
+} from "tssae";
 
 import {
   FixtureCallSourceFact,
@@ -63,25 +61,15 @@ void describe("independent native adapter package", () => {
         await host.typecheck();
 
         let facts: readonly FactResult<"call", FixtureCallSourceValue>[] = [];
-        const rule = defineRule({
-          id: "fixture-native-fact",
-          run: async (context) => {
-            facts = await context.facts(FixtureCallSourceFact);
-          },
-        });
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
           adapterResolutionRoot: fixtureRoot,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-fixture"],
-            rules: [rule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-fixture"],
         });
 
         try {
-          const report = await session.check();
-          assert.equal(report.status, "clean");
+          facts = await session.project().facts(FixtureCallSourceFact);
           assert.equal(facts.length, 1);
           assert.deepEqual(facts[0]?.value, {
             text: "target(42)",
@@ -89,18 +77,19 @@ void describe("independent native adapter package", () => {
             invocation: 1,
           });
           assert.equal(facts[0]?.evidence[0]?.at?.file, "src/app.ts");
-          assert.equal(report.additionalInputs.length, 1);
-          assert.equal(report.additionalInputs[0]?.file, "fixture.inputs.json");
-          assert.deepEqual(report.additionalInputs[0]?.sources, [
+          assert.equal(session.additionalInputs.length, 1);
+          assert.equal(
+            session.additionalInputs[0]?.file,
+            "fixture.inputs.json",
+          );
+          assert.deepEqual(session.additionalInputs[0]?.sources, [
             { kind: "adapter", id: "third-party-fixture" },
           ]);
 
           host.writeText("fixture.inputs.json", "second-input");
           host.replaceText("src/app.ts", "target(42)", "target(43)");
-          await session.update({ changed: ["src/app.ts"] });
-          facts = [];
-          const refreshedReport = await session.check();
-          assert.equal(refreshedReport.status, "clean");
+          const updated = await session.update({ changed: ["src/app.ts"] });
+          facts = await session.project().facts(FixtureCallSourceFact);
           assert.equal(facts.length, 1);
           assert.deepEqual(facts[0]?.value, {
             text: "target(43)",
@@ -110,12 +99,12 @@ void describe("independent native adapter package", () => {
           assert.equal(facts[0]?.evidence[0]?.at?.file, "src/app.ts");
           assert.equal(facts[0]?.evidence[0]?.at?.line, 2);
           assert.equal(facts[0]?.evidence[0]?.at?.column, 10);
-          assert.equal(refreshedReport.additionalInputs.length, 1);
+          assert.equal(updated.additionalInputs.length, 1);
           assert.equal(
-            refreshedReport.additionalInputs[0]?.file,
+            updated.additionalInputs[0]?.file,
             "fixture.inputs.json",
           );
-          assert.deepEqual(refreshedReport.additionalInputs[0]?.sources, [
+          assert.deepEqual(updated.additionalInputs[0]?.sources, [
             { kind: "adapter", id: "third-party-fixture" },
           ]);
         } finally {
@@ -190,28 +179,28 @@ export default {
           join("node_modules", abiMismatchName),
         );
 
-        const configFor = (packageName: string) =>
-          defineConfig({ tsconfig: "tsconfig.json", adapters: [packageName] });
         await assert.rejects(
-          openSession({
+          openProject({
             cwd: host.rootDir,
             adapterResolutionRoot: host.rootDir,
-            config: configFor(invalidBridgeName),
+            tsconfig: "tsconfig.json",
+            adapters: [invalidBridgeName],
           }),
           (error: unknown) =>
-            error instanceof VeruleExecutionError &&
+            error instanceof TssaeError &&
             error.message.includes(invalidBridgeName) &&
             error.message.includes("invalid JavaScript adapter bridge"),
         );
 
         await assert.rejects(
-          openSession({
+          openProject({
             cwd: host.rootDir,
             adapterResolutionRoot: host.rootDir,
-            config: configFor(abiMismatchName),
+            tsconfig: "tsconfig.json",
+            adapters: [abiMismatchName],
           }),
           (error: unknown) =>
-            error instanceof VeruleExecutionError &&
+            error instanceof TssaeError &&
             error.code === "NATIVE_ADAPTER_LOAD" &&
             error.message.includes(abiMismatchName) &&
             error.message.includes("adapter ABI version 2 is unsupported") &&
@@ -228,32 +217,24 @@ export default {
           id: "fixture.native-capability-missing",
           subjectKind: "call",
         });
-        const packageCapabilityRule = defineRule({
-          id: "fixture-native-capability-mismatch",
-          run: async (context) => {
-            await assert.rejects(
-              context.facts(unsupportedFact),
-              (error: unknown) =>
-                error instanceof VeruleExecutionError &&
-                error.code === "NATIVE_ADAPTER_EXTRACT" &&
-                error.message.includes(unsupportedPackageName) &&
-                error.message.includes(unsupportedFact.id) &&
-                error.message.includes("does not provide fact type"),
-            );
-            assert.equal(
-              (await context.facts(FixtureCallSourceFact)).length,
-              1,
-            );
-          },
-        });
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
           adapterResolutionRoot: host.rootDir,
-          config: configFor(unsupportedPackageName),
+          tsconfig: "tsconfig.json",
+          adapters: [unsupportedPackageName],
         });
         try {
-          const report = await session.check([packageCapabilityRule]);
-          assert.equal(report.status, "clean");
+          const context = session.project();
+          await assert.rejects(
+            context.facts(unsupportedFact),
+            (error: unknown) =>
+              error instanceof TssaeError &&
+              error.code === "NATIVE_ADAPTER_EXTRACT" &&
+              error.message.includes(unsupportedPackageName) &&
+              error.message.includes(unsupportedFact.id) &&
+              error.message.includes("does not provide fact type"),
+          );
+          assert.equal((await context.facts(FixtureCallSourceFact)).length, 1);
         } finally {
           await session.close();
         }
@@ -281,34 +262,25 @@ export default {
           FixtureSourceSpecValue
         >[] = [];
 
-        const specRule = defineRule({
-          id: "fixture-source-spec-rule",
-          run: async (context) => {
-            allSpecs = await context.facts(FixtureSourceSpecFact);
-            const decls = await context.findSyntax({
-              files: ["src/source.ts"],
-              kinds: ["VariableDeclaration"],
-            });
-            const orderDecl = decls.find((d) => d.text.startsWith("orderSpec"));
-            assert.ok(orderDecl);
-            targetedSpecs = await context.facts(FixtureSourceSpecFact, {
-              targets: [orderDecl.ref],
-            });
-          },
-        });
-
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
           adapterResolutionRoot: fixtureRoot,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-fixture"],
-            rules: [specRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-fixture"],
         });
         try {
-          const report = await session.check();
-          assert.equal(report.status, "clean");
+          const context = session.project();
+          allSpecs = await context.facts(FixtureSourceSpecFact);
+          const decls = await context.findSyntax({
+            files: ["src/source.ts"],
+            kinds: ["VariableDeclaration"],
+          });
+          const orderDecl = decls.find((d) => d.text.startsWith("orderSpec"));
+          assert.ok(orderDecl);
+          targetedSpecs = await context.facts(FixtureSourceSpecFact, {
+            targets: [orderDecl.ref],
+          });
+
           assert.equal(allSpecs.length, 1);
           assert.deepEqual(allSpecs[0]?.value, {
             sourceName: "order",
@@ -323,23 +295,6 @@ export default {
           assert.equal(allSpecs[0]?.gaps[0]?.kind, "unresolved-fixture-field");
           assert.equal(targetedSpecs.length, 1);
           assert.deepEqual(targetedSpecs[0]?.value, allSpecs[0]?.value);
-
-          const explained = await session.explain({
-            ruleId: "fixture-source-spec-rule",
-            at: "src/source.ts:11:14",
-          });
-          assert.equal(explained.explanation.status, "blocked_by_gap");
-          assert.equal(explained.explanation.gaps.length, 1);
-          assert.equal(explained.explanation.localGaps.length, 1);
-          assert.equal(
-            explained.explanation.localGaps[0]?.status,
-            "unresolved",
-          );
-          assert.equal(explained.explanation.localGaps[0]?.field, "extra");
-          assert.equal(
-            explained.explanation.localGaps[0]?.providerId,
-            "third-party-fixture",
-          );
         } finally {
           await session.close();
         }

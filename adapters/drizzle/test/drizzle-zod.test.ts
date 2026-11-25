@@ -10,16 +10,11 @@ import {
   type ValidatorSchemaSubjectKind,
 } from "@verule/adapter-drizzle";
 import {
-  defineConfig,
-  defineRule,
-  runCheck,
-  type FactResult,
-} from "@verule/sdk";
-import {
   linkNodeModulesPackage,
   withTempHost,
   type PreparedTempHost,
 } from "@verule/test-hosts";
+import { openProject, type FactResult } from "tssae";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const drizzleOrmRoot = join(packageRoot, "node_modules", "drizzle-orm");
@@ -58,24 +53,20 @@ void describe("@verule/adapter-drizzle drizzle-zod conversion", () => {
           ValidatorSchemaFieldsFactValue
         >[] = [];
 
-        const rule = defineRule({
-          id: "inspect-drizzle-zod-provenance",
-          run: async (ctx) => {
-            schemaFacts = await ctx.facts(ValidatorSchemaFieldsFact);
-          },
-        });
-
-        const report = await runCheck({
+        const session = await openProject({
           cwd: host.rootDir,
           adapterResolutionRoot: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-drizzle"],
-            rules: [rule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-drizzle"],
         });
+        try {
+          schemaFacts = await session
+            .project()
+            .facts(ValidatorSchemaFieldsFact);
+        } finally {
+          await session.close();
+        }
 
-        assert.equal(report.status, "clean");
         // Exactly 7 real drizzle-zod calls; neither fakeSelect nor fakeFactory.createSelectSchema emits ValidatorSchemaFieldsFact.
         assert.equal(schemaFacts.length, 7, JSON.stringify(schemaFacts));
         for (const fact of schemaFacts) {
@@ -118,24 +109,18 @@ void describe("@verule/adapter-drizzle drizzle-zod conversion", () => {
         ValidatorSchemaFieldsFactValue
       >[] = [];
 
-      const rule = defineRule({
-        id: "inspect-standalone-gaps",
-        run: async (ctx) => {
-          schemaFacts = await ctx.facts(ValidatorSchemaFieldsFact);
-        },
-      });
-
-      const report = await runCheck({
+      const session = await openProject({
         cwd: host.rootDir,
         adapterResolutionRoot: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-drizzle"],
-          rules: [rule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-drizzle"],
       });
+      try {
+        schemaFacts = await session.project().facts(ValidatorSchemaFieldsFact);
+      } finally {
+        await session.close();
+      }
 
-      assert.equal(report.status, "clean");
       assert.equal(schemaFacts.length, 2);
 
       const refined = schemaFacts.find((f) => "id" in f.value.fields);

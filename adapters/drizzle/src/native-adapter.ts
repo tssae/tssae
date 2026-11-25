@@ -1,8 +1,4 @@
-import {
-  defineAdapter,
-  defineFactProvider,
-  type LibraryAdapter,
-} from "@verule/sdk";
+import { defineAdapter, defineFactProvider, type LibraryAdapter } from "tssae";
 
 import {
   DrizzleTableColumnsFact,

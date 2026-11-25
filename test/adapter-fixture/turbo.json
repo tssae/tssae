@@ -41,7 +41,7 @@
       "tags": ["quality:light"]
     },
     "typecheck": {
-      "dependsOn": ["@verule/sdk#typecheck", "@verule/test-hosts#typecheck"],
+      "dependsOn": ["tssae#typecheck", "@verule/test-hosts#typecheck"],
       "inputs": ["$TURBO_DEFAULT$", "!native/target/**"],
       "outputs": [],
       "tags": ["quality:light"]

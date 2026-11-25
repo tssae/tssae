@@ -1,4 +1,4 @@
-import { defineFactType } from "@verule/sdk";
+import { defineFactType } from "tssae";
 
 export type FixtureComplementCondition = {
   readonly mode: "normal" | "conflict" | "targeted-conflict";

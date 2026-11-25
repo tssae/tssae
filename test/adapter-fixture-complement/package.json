@@ -42,7 +42,7 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "dependencies": {
-    "@verule/sdk": "workspace:*"
+    "tssae": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "catalog:",

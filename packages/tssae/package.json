@@ -1,0 +1,50 @@
+{
+  "name": "tssae",
+  "version": "0.1.0",
+  "description": "TypeScript and JavaScript static analysis engine with typed Node query API and bundled native binary.",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./package.json": "./package.json"
+    },
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false && cargo install --locked --path . --root dist --no-track --force",
+    "format:check": "cargo fmt --all -- --check && oxfmt --list-different .",
+    "format:write": "cargo fmt --all && oxfmt --write .",
+    "lint": "cargo clippy --locked --workspace --all-targets -- -D warnings && oxlint --quiet --format=unix --ignore-pattern node_modules --ignore-pattern target .",
+    "lint:fix": "oxlint --format=unix --ignore-pattern node_modules --ignore-pattern target . --fix",
+    "test": "node --conditions=source scripts/run-cargo-tests.ts && node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@verule/adapter-api": "workspace:*",
+    "@verule/test-hosts": "workspace:*",
+    "@verule/tooling-config": "workspace:*",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "tsrs": "catalog:",
+    "typescript-7": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
+  }
+}

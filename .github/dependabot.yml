@@ -36,7 +36,7 @@ updates:
         update-types:
           - version-update:semver-major
   - package-ecosystem: cargo
-    directory: /packages/engine
+    directory: /packages/tssae
     schedule:
       interval: weekly
   - package-ecosystem: cargo

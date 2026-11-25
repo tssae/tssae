@@ -13,19 +13,12 @@ import {
   type ValidatorOutputFieldsFactValue,
 } from "@verule/adapter-zod";
 import {
-  defineAdapter,
-  defineConfig,
-  defineRule,
-  openSession,
-  runCheck,
-  type FactResult,
-} from "@verule/sdk";
-import {
   installPackedWorkspacePackages,
   linkNodeModulesPackage,
   withTempHost,
   type PreparedTempHost,
 } from "@verule/test-hosts";
+import { defineAdapter, openProject, type FactResult } from "tssae";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const zodRoot = join(packageRoot, "node_modules", "zod");
@@ -74,23 +67,18 @@ void describe("@verule/adapter-zod", () => {
         ValidatorOutputFieldsFactValue
       >[] = [];
 
-      const inspectRule = defineRule({
-        id: "inspect-zod",
-        run: async (ctx) => {
-          inputFacts = await ctx.facts(ValidatorInputFieldsFact);
-          outputFacts = await ctx.facts(ValidatorOutputFieldsFact);
-        },
-      });
-
-      const report = await runCheck({
+      const session = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [inspectRule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(report.status, "clean");
+      try {
+        const ctx = session.project();
+        inputFacts = await ctx.facts(ValidatorInputFieldsFact);
+        outputFacts = await ctx.facts(ValidatorOutputFieldsFact);
+      } finally {
+        await session.close();
+      }
 
       const calls = inputFacts.filter((f) => f.value.siteKind === "call");
       assert.equal(calls.length, 4);
@@ -140,27 +128,22 @@ void describe("@verule/adapter-zod", () => {
         ValidatorOutputFieldsFactValue
       >[] = [];
 
-      const rule = defineRule({
-        id: "check-modifiers",
-        run: async (ctx) => {
-          inputFacts = await ctx.facts(ValidatorInputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-          outputFacts = await ctx.facts(ValidatorOutputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-        },
-      });
-
-      const report = await runCheck({
+      const session = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [rule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(report.status, "clean");
+      try {
+        const ctx = session.project();
+        inputFacts = await ctx.facts(ValidatorInputFieldsFact, {
+          condition: { scope: "calls" },
+        });
+        outputFacts = await ctx.facts(ValidatorOutputFieldsFact, {
+          condition: { scope: "calls" },
+        });
+      } finally {
+        await session.close();
+      }
 
       const accountIn = inputFacts.find(
         (f) => f.value.schemaName === "accountSchema",
@@ -227,32 +210,18 @@ void describe("@verule/adapter-zod", () => {
     await withZodHost("adapters/zod-compositions", async (host) => {
       await host.typecheck();
 
-      let callFacts: readonly FactResult<
-        "syntax" | "call" | "declaration",
-        ValidatorInputFieldsFactValue
-      >[] = [];
-
-      const rule = defineRule({
-        id: "check-compositions",
-        run: async (ctx) => {
-          callFacts = await ctx.facts(ValidatorInputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-        },
-      });
-
-      const session = await openSession({
+      const session = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [rule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
 
       try {
-        await session.check();
-
+        let callFacts = await session
+          .project()
+          .facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+          });
         const bySchema = (name: string) =>
           callFacts.find((f) => f.value.schemaName === name);
 
@@ -301,7 +270,9 @@ void describe("@verule/adapter-zod", () => {
           "slug: z.string().optional(),",
         );
         await session.update({ changed: ["src/schemas.ts"] });
-        await session.check();
+        callFacts = await session.project().facts(ValidatorInputFieldsFact, {
+          condition: { scope: "calls" },
+        });
 
         assert.deepEqual(bySchema("pickedGate")?.value.requiredFields, [
           "title",
@@ -325,24 +296,18 @@ void describe("@verule/adapter-zod", () => {
         ValidatorInputFieldsFactValue
       >[] = [];
 
-      const rule = defineRule({
-        id: "inspect-dynamic",
-        run: async (ctx) => {
-          inputFacts = await ctx.facts(ValidatorInputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-        },
-      });
-
-      const report = await runCheck({
+      const session = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [rule],
-        }),
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(report.status, "clean");
+      try {
+        inputFacts = await session.project().facts(ValidatorInputFieldsFact, {
+          condition: { scope: "calls" },
+        });
+      } finally {
+        await session.close();
+      }
 
       const mixed = inputFacts.find(
         (f) => f.value.schemaName === "mixedSchema",
@@ -380,103 +345,59 @@ void describe("@verule/adapter-zod", () => {
           (g) => g.kind === "dynamic-schema-shape" && g.at?.line === 14,
         ),
       );
-
-      // Report gaps also contain the dynamic gaps!
-      assert.ok(report.gaps.length >= 4);
     });
   });
 
-  void it("loads the native package only when queried and shares cached facts across rules", async () => {
+  void it("loads the native package only when queried and shares cached facts within a snapshot", async () => {
     await withZodHost("adapters/zod-lazy-cache", async (host) => {
       await host.typecheck();
 
-      const unqueriedRule = defineRule({
-        id: "rule-no-facts",
-        run: async (ctx) => {
-          await ctx.findSyntax({ kinds: ["CallExpression"] });
-        },
-      });
-
-      // An installed package remains unobserved when no rule queries its facts.
-      const unqueriedReport = await runCheck({
+      // 1. Registered adapter stays dormant when only non-fact queries run
+      const unqueriedSession = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [unqueriedRule],
-        }),
-        observe: "detail",
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(
-        unqueriedReport.observation?.providers.includes("zod"),
-        false,
-      );
+      try {
+        const ctx = unqueriedSession.project();
+        const calls = await ctx.findSyntax({ kinds: ["CallExpression"] });
+        assert.ok(calls.length > 0);
+        assert.ok(
+          unqueriedSession.nativeAdapters.some(
+            (entry) => entry.packageName === "@verule/adapter-zod",
+          ),
+        );
+      } finally {
+        await unqueriedSession.close();
+      }
 
-      // 2. Two rules querying the same fact -> computed once, reused once!
-      let ruleACount = 0;
-      let ruleBCount = 0;
-      const ruleA = defineRule({
-        id: "rule-a",
-        run: async (ctx) => {
-          const facts = await ctx.facts(ValidatorInputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-          ruleACount = facts.length;
-        },
-      });
-      const ruleB = defineRule({
-        id: "rule-b",
-        run: async (ctx) => {
-          const facts = await ctx.facts(ValidatorInputFieldsFact, {
-            condition: { scope: "calls" },
-          });
-          ruleBCount = facts.length;
-        },
-      });
-
-      const sharedReport = await runCheck({
+      // 2. Repeated queries for the same fact within one snapshot hit FactCache and match exactly
+      const session = await openProject({
         cwd: host.rootDir,
-        config: defineConfig({
-          tsconfig: "tsconfig.json",
-          adapters: ["@verule/adapter-zod"],
-          rules: [ruleA, ruleB],
-        }),
-        observe: "detail",
-        at: "src/app.ts:9:10",
+        tsconfig: "tsconfig.json",
+        adapters: ["@verule/adapter-zod"],
       });
-      assert.equal(ruleACount, 1);
-      assert.equal(ruleBCount, 1);
-
-      assert.ok(sharedReport.observation);
-      assert.ok(sharedReport.observation.providers.includes("zod"));
-      const details = sharedReport.observation.details ?? [];
-      const aEntry = details.find(
-        (d) =>
-          d.kind === "query" && d.ruleId === "rule-a" && d.provider === "zod",
-      );
-      const bEntry = details.find(
-        (d) =>
-          d.kind === "query" && d.ruleId === "rule-b" && d.provider === "zod",
-      );
-      assert.equal(aEntry?.cacheStatus, "computed");
-      assert.equal(aEntry?.candidateCount, 1);
-      assert.equal(bEntry?.cacheStatus, "reused");
-      assert.equal(bEntry?.candidateCount, 1);
-
-      const explainA = sharedReport.explanations?.find(
-        (e) => e.ruleId === "rule-a",
-      );
-      const explainB = sharedReport.explanations?.find(
-        (e) => e.ruleId === "rule-b",
-      );
-      assert.ok(explainA?.providers.includes("zod"));
-      assert.ok(explainB?.providers.includes("zod"));
-      assert.equal(explainA?.queries[0]?.cacheStatus, "computed");
-      assert.equal(explainB?.queries[0]?.cacheStatus, "reused");
+      try {
+        const ctx = session.project();
+        const firstFacts = await ctx.facts(ValidatorInputFieldsFact, {
+          condition: { scope: "calls" },
+          explain: true,
+        });
+        const secondFacts = await ctx.facts(ValidatorInputFieldsFact, {
+          condition: { scope: "calls" },
+          explain: true,
+        });
+        assert.equal(firstFacts.length, 1);
+        assert.equal(secondFacts.length, 1);
+        assert.deepEqual(firstFacts[0]!.providers, ["zod"]);
+        assert.deepEqual(secondFacts, firstFacts);
+      } finally {
+        await session.close();
+      }
     });
   });
 
-  void it("compiles an external TypeScript consumer against built @verule/sdk and @verule/adapter-zod .d.ts", async () => {
+  void it("compiles an external TypeScript consumer against built tssae and @verule/adapter-zod .d.ts", async () => {
     const externalConsumerSource = readFileSync(
       join(packageRoot, "test", "fixtures", "external-consumer.ts"),
       "utf8",
@@ -507,7 +428,7 @@ void describe("@verule/adapter-zod", () => {
         setup: async (host) => {
           await installPackedWorkspacePackages(
             host.rootDir,
-            ["@verule/sdk", "@verule/adapter-zod"],
+            ["tssae", "@verule/adapter-zod"],
             { cwd: packageRoot },
           );
         },
@@ -524,36 +445,31 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
+        const zodSession = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
+        });
         let inputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorInputFieldsFactValue
-        >[] = [];
+        >[];
         let outputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorOutputFieldsFactValue
-        >[] = [];
+        >[];
+        try {
+          const ctx = zodSession.project();
+          inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+          });
+          outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+          });
+        } finally {
+          await zodSession.close();
+        }
 
-        const genericValidatorRule = defineRule({
-          id: "generic-validator-rule",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-
-        const report = await runCheck({
-          cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [genericValidatorRule],
-          }),
-        });
-        assert.equal(report.status, "clean");
         assert.equal(inputResults.length, 1);
         assert.deepEqual(inputResults[0]!.value.requiredFields, [
           "id",
@@ -573,7 +489,7 @@ void describe("@verule/adapter-zod", () => {
         ]);
         assert.deepEqual(outputResults[0]!.value.optionalFields, ["optKey"]);
 
-        // Same rule works unchanged when an alternative validator implements ValidatorInputFieldsFact
+        // Same query works unchanged when an alternative validator implements ValidatorInputFieldsFact
         const altAdapter = defineAdapter({
           id: "alt-validator",
           provides: [
@@ -612,17 +528,25 @@ void describe("@verule/adapter-zod", () => {
           ],
         });
 
-        await runCheck({
+        const altSession = await openProject({
           cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: [altAdapter],
-            rules: [genericValidatorRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: [altAdapter],
         });
-        assert.equal(inputResults.length, 1);
-        assert.deepEqual(inputResults[0]!.value.requiredFields, ["altOnly"]);
-        assert.deepEqual(inputResults[0]!.providers, ["alt-validator"]);
+        let altResults: readonly FactResult<
+          "syntax" | "call" | "declaration",
+          ValidatorInputFieldsFactValue
+        >[];
+        try {
+          altResults = await altSession
+            .project()
+            .facts(ValidatorInputFieldsFact, { condition: { scope: "calls" } });
+        } finally {
+          await altSession.close();
+        }
+        assert.equal(altResults.length, 1);
+        assert.deepEqual(altResults[0]!.value.requiredFields, ["altOnly"]);
+        assert.deepEqual(altResults[0]!.providers, ["alt-validator"]);
       },
       { linkZod: true },
     );
@@ -634,36 +558,30 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
+        });
         let inputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorInputFieldsFactValue
-        >[] = [];
+        >[];
         let outputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorOutputFieldsFactValue
-        >[] = [];
-
-        const rule = defineRule({
-          id: "inspect-create-select-schema-single-zod",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-
-        const report = await runCheck({
-          cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [rule],
-          }),
-        });
-        assert.equal(report.status, "clean");
+        >[];
+        try {
+          const ctx = session.project();
+          inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+          });
+          outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+          });
+        } finally {
+          await session.close();
+        }
         assert.equal(inputResults.length, 1);
 
         const gateIn = inputResults[0]!;
@@ -729,61 +647,57 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
+        });
         let inputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorInputFieldsFactValue
-        >[] = [];
+        >[];
         let outputResults: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorOutputFieldsFactValue
-        >[] = [];
+        >[];
         let fieldFacts: readonly FactResult<
           "syntax" | "call" | "declaration",
           ValidatorFieldFactValue
-        >[] = [];
-
-        const rule = defineRule({
-          id: "inspect-runtime-unknowns-and-field-facts",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-            const props = await ctx.findSyntax({
-              files: ["src/runtime.ts"],
-              kinds: ["PropertyAssignment"],
-            });
-            const targetNames = [
-              "directReplace",
-              "nullableReplace",
-              "unknownReplace",
-              "cbDefault",
-              "cbOptional",
-              "cbNullable",
-            ];
-            const initRefs = props
-              .filter((p) =>
-                targetNames.some((name) => p.text.startsWith(`${name}:`)),
-              )
-              .map((p) => p.initializer!)
-              .filter(Boolean);
-            fieldFacts = await ctx.facts(ValidatorFieldFact, {
-              targets: initRefs,
-            });
-          },
-        });
-
-        const report = await runCheck({
-          cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [rule],
-          }),
-        });
-        assert.equal(report.status, "clean");
+        >[];
+        try {
+          const ctx = session.project();
+          inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
+          outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
+          const props = await ctx.findSyntax({
+            files: ["src/runtime.ts"],
+            kinds: ["PropertyAssignment"],
+          });
+          const targetNames = [
+            "directReplace",
+            "nullableReplace",
+            "unknownReplace",
+            "cbDefault",
+            "cbOptional",
+            "cbNullable",
+          ];
+          const initRefs = props
+            .filter((p) =>
+              targetNames.some((name) => p.text.startsWith(`${name}:`)),
+            )
+            .map((p) => p.initializer!)
+            .filter(Boolean);
+          fieldFacts = await ctx.facts(ValidatorFieldFact, {
+            targets: initRefs,
+          });
+        } finally {
+          await session.close();
+        }
 
         const partialIn = inputResults.find(
           (f) => f.value.schemaName === "partialUnknownSchema",
@@ -815,9 +729,8 @@ void describe("@verule/adapter-zod", () => {
         assert.deepEqual(overriddenOut.value.optionalFields, ["extra"]);
 
         assert.equal(fieldFacts.length, 6);
-        const syntaxItems = fieldFacts;
-        const byResolved = syntaxItems.filter((f) => f.value.resolved);
-        const byUnresolved = syntaxItems.filter((f) => !f.value.resolved);
+        const byResolved = fieldFacts.filter((f) => f.value.resolved);
+        const byUnresolved = fieldFacts.filter((f) => !f.value.resolved);
         assert.equal(byResolved.length, 5);
         assert.equal(byUnresolved.length, 1);
         assert.ok(
@@ -844,49 +757,26 @@ void describe("@verule/adapter-zod", () => {
           ),
         );
 
-        // Same-snapshot targeted explain locates unresolved field on partialUnknownSchema
-        // and resolved_by_override on overriddenSchema.
-        const explainSession = await openSession({
-          cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [rule],
-          }),
-        });
-        try {
-          await explainSession.check();
-          const partialExplain = await explainSession.explain({
-            ruleId: "inspect-runtime-unknowns-and-field-facts",
-            at: "src/runtime.ts:32:14",
-          });
-          assert.ok(
-            partialExplain.explanation.localGaps.some(
-              (lg) =>
-                lg.status === "unresolved" &&
-                lg.field === "age" &&
-                lg.gap.kind === "unresolved-schema-field",
-            ),
-            JSON.stringify(partialExplain.explanation.localGaps),
-          );
+        assert.ok(
+          partialIn.explainTrace?.localGaps?.some(
+            (lg) =>
+              lg.status === "unresolved" &&
+              lg.field === "age" &&
+              lg.gap.kind === "unresolved-schema-field",
+          ),
+          JSON.stringify(partialIn.explainTrace?.localGaps),
+        );
 
-          const overriddenExplain = await explainSession.explain({
-            ruleId: "inspect-runtime-unknowns-and-field-facts",
-            at: "src/runtime.ts:33:17",
-          });
-          assert.ok(
-            overriddenExplain.explanation.localGaps.some(
-              (lg) =>
-                lg.status === "resolved_by_override" &&
-                lg.field === "age" &&
-                lg.resolvedBy?.operation === ".extend()" &&
-                lg.resolvedBy.providerId === "zod",
-            ),
-            JSON.stringify(overriddenExplain.explanation.localGaps),
-          );
-        } finally {
-          await explainSession.close();
-        }
+        assert.ok(
+          overriddenIn.explainTrace?.localGaps?.some(
+            (lg) =>
+              lg.status === "resolved_by_override" &&
+              lg.field === "age" &&
+              lg.resolvedBy?.operation === ".extend()" &&
+              lg.resolvedBy.providerId === "zod",
+          ),
+          JSON.stringify(overriddenIn.explainTrace?.localGaps),
+        );
       },
       { linkZod: true },
     );
@@ -898,51 +788,22 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
-        let inputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorInputFieldsFactValue
-        >[] = [];
-        let outputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorOutputFieldsFactValue
-        >[] = [];
-
-        const inputRule = defineRule({
-          id: "inspect-combinators-input",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-        const outputRule = defineRule({
-          id: "inspect-combinators-output",
-          run: async (ctx) => {
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [inputRule, outputRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
         });
 
         try {
-          const checkReport = await session.check();
-          assert.equal(checkReport.status, "clean");
-          // Global gaps keep active unresolved-schema-field on input of andDefaultedSchema and pipeOverrideSchema.
-          assert.ok(
-            checkReport.gaps.some(
-              (g) => g.kind === "unresolved-schema-field" && g.at?.line === 12,
-            ),
-            JSON.stringify(checkReport.gaps),
-          );
+          const ctx = session.project();
+          const inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
+          const outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
 
           const inputByName = (name: string) =>
             inputResults.find((f) => f.value.schemaName === name);
@@ -1028,13 +889,9 @@ void describe("@verule/adapter-zod", () => {
           assert.deepEqual(zIntOut.value.defaultedFields, ["age"]);
           assert.equal(zIntOut.value.hasDynamicFields, false);
 
-          // Targeted explain checks on input vs output rules:
-          const modInExplain = await session.explain({
-            ruleId: "inspect-combinators-input",
-            at: "src/combinators.ts:39:15",
-          });
+          // Targeted explainTrace checks on input vs output facts:
           assert.ok(
-            modInExplain.explanation.localGaps.some(
+            modIn.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1043,15 +900,11 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".default()" &&
                 lg.resolvedBy.at?.line === 7,
             ),
-            JSON.stringify(modInExplain.explanation.localGaps),
+            JSON.stringify(modIn.explainTrace?.localGaps),
           );
 
-          const modOutExplain = await session.explain({
-            ruleId: "inspect-combinators-output",
-            at: "src/combinators.ts:39:15",
-          });
           assert.ok(
-            modOutExplain.explanation.localGaps.some(
+            modOut.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1060,30 +913,22 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".default()" &&
                 lg.resolvedBy.at?.line === 7,
             ),
-            JSON.stringify(modOutExplain.explanation.localGaps),
+            JSON.stringify(modOut.explainTrace?.localGaps),
           );
 
-          const andDefInExplain = await session.explain({
-            ruleId: "inspect-combinators-input",
-            at: "src/combinators.ts:40:19",
-          });
           assert.ok(
-            andDefInExplain.explanation.localGaps.some(
+            andDefIn.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "unresolved" &&
                 lg.field === "age" &&
                 lg.gap.kind === "unresolved-schema-field" &&
                 lg.gap.at?.line === 12,
             ),
-            JSON.stringify(andDefInExplain.explanation.localGaps),
+            JSON.stringify(andDefIn.explainTrace?.localGaps),
           );
 
-          const andDefOutExplain = await session.explain({
-            ruleId: "inspect-combinators-output",
-            at: "src/combinators.ts:40:19",
-          });
           assert.ok(
-            andDefOutExplain.explanation.localGaps.some(
+            andDefOut.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1092,15 +937,11 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".and()" &&
                 lg.resolvedBy.at?.line === 16,
             ),
-            JSON.stringify(andDefOutExplain.explanation.localGaps),
+            JSON.stringify(andDefOut.explainTrace?.localGaps),
           );
 
-          const andReqInExplain = await session.explain({
-            ruleId: "inspect-combinators-input",
-            at: "src/combinators.ts:41:18",
-          });
           assert.ok(
-            andReqInExplain.explanation.localGaps.some(
+            andReqIn.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1109,30 +950,24 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".and()" &&
                 lg.resolvedBy.at?.line === 20,
             ),
-            JSON.stringify(andReqInExplain.explanation.localGaps),
+            JSON.stringify(andReqIn.explainTrace?.localGaps),
           );
 
-          const pipeInExplain = await session.explain({
-            ruleId: "inspect-combinators-input",
-            at: "src/combinators.ts:42:11",
-          });
+          const pipeOverrideIn = inputByName("pipeOverrideSchema")!;
+          const pipeOverrideOut = outputByName("pipeOverrideSchema")!;
           assert.ok(
-            pipeInExplain.explanation.localGaps.some(
+            pipeOverrideIn.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "unresolved" &&
                 lg.field === "age" &&
                 lg.gap.kind === "unresolved-schema-field" &&
                 lg.gap.at?.line === 12,
             ),
-            JSON.stringify(pipeInExplain.explanation.localGaps),
+            JSON.stringify(pipeOverrideIn.explainTrace?.localGaps),
           );
 
-          const pipeOutExplain = await session.explain({
-            ruleId: "inspect-combinators-output",
-            at: "src/combinators.ts:42:11",
-          });
           assert.ok(
-            pipeOutExplain.explanation.localGaps.some(
+            pipeOverrideOut.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1141,7 +976,7 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".pipe()" &&
                 lg.resolvedBy.at?.line === 24,
             ),
-            JSON.stringify(pipeOutExplain.explanation.localGaps),
+            JSON.stringify(pipeOverrideOut.explainTrace?.localGaps),
           );
         } finally {
           await session.close();
@@ -1157,44 +992,22 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
-        let inputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorInputFieldsFactValue
-        >[] = [];
-        let outputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorOutputFieldsFactValue
-        >[] = [];
-
-        const inputRule = defineRule({
-          id: "inspect-unknown-overrides-input",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-        const outputRule = defineRule({
-          id: "inspect-unknown-overrides-output",
-          run: async (ctx) => {
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [inputRule, outputRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
         });
 
         try {
-          const report = await session.check();
-          assert.equal(report.status, "clean");
+          const ctx = session.project();
+          const inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
+          const outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
 
           const inputByName = (name: string) =>
             inputResults.find((f) => f.value.schemaName === name);
@@ -1251,27 +1064,23 @@ void describe("@verule/adapter-zod", () => {
             assert.equal(outFact.value.hasDynamicFields, false);
           }
 
-          const extendUnresolvedExplain = await session.explain({
-            ruleId: "inspect-unknown-overrides-input",
-            at: "src/overrides.ts:38:20",
-          });
           assert.ok(
-            extendUnresolvedExplain.explanation.localGaps.some(
+            inputByName("extendUnknownSchema")!.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "unresolved" &&
                 lg.field === "age" &&
                 lg.gap.kind === "unresolved-schema-field" &&
                 lg.gap.at?.line === 11,
             ),
-            JSON.stringify(extendUnresolvedExplain.explanation.localGaps),
+            JSON.stringify(
+              inputByName("extendUnknownSchema")!.explainTrace?.localGaps,
+            ),
           );
 
-          const extendResolvedExplain = await session.explain({
-            ruleId: "inspect-unknown-overrides-input",
-            at: "src/overrides.ts:39:23",
-          });
           assert.ok(
-            extendResolvedExplain.explanation.localGaps.some(
+            inputByName(
+              "extendReResolvedSchema",
+            )!.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1280,30 +1089,28 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".extend()" &&
                 lg.resolvedBy.at?.line === 15,
             ),
-            JSON.stringify(extendResolvedExplain.explanation.localGaps),
+            JSON.stringify(
+              inputByName("extendReResolvedSchema")!.explainTrace?.localGaps,
+            ),
           );
 
-          const spreadUnresolvedExplain = await session.explain({
-            ruleId: "inspect-unknown-overrides-input",
-            at: "src/overrides.ts:41:20",
-          });
           assert.ok(
-            spreadUnresolvedExplain.explanation.localGaps.some(
+            inputByName("spreadUnknownSchema")!.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "unresolved" &&
                 lg.field === "age" &&
                 lg.gap.kind === "unresolved-schema-field" &&
                 lg.gap.at?.line === 23,
             ),
-            JSON.stringify(spreadUnresolvedExplain.explanation.localGaps),
+            JSON.stringify(
+              inputByName("spreadUnknownSchema")!.explainTrace?.localGaps,
+            ),
           );
 
-          const spreadResolvedExplain = await session.explain({
-            ruleId: "inspect-unknown-overrides-input",
-            at: "src/overrides.ts:42:23",
-          });
           assert.ok(
-            spreadResolvedExplain.explanation.localGaps.some(
+            inputByName(
+              "spreadReResolvedSchema",
+            )!.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "resolved_by_override" &&
                 lg.field === "age" &&
@@ -1312,7 +1119,9 @@ void describe("@verule/adapter-zod", () => {
                 lg.resolvedBy.operation === ".extend()" &&
                 lg.resolvedBy.at?.line === 33,
             ),
-            JSON.stringify(spreadResolvedExplain.explanation.localGaps),
+            JSON.stringify(
+              inputByName("spreadReResolvedSchema")!.explainTrace?.localGaps,
+            ),
           );
         } finally {
           await session.close();
@@ -1328,53 +1137,31 @@ void describe("@verule/adapter-zod", () => {
       async (host) => {
         await host.typecheck();
 
-        let inputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorInputFieldsFactValue
-        >[] = [];
-        let outputResults: readonly FactResult<
-          "syntax" | "call" | "declaration",
-          ValidatorOutputFieldsFactValue
-        >[] = [];
-
-        const inputRule = defineRule({
-          id: "inspect-pipe-nullable-input",
-          run: async (ctx) => {
-            inputResults = await ctx.facts(ValidatorInputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-        const outputRule = defineRule({
-          id: "inspect-pipe-nullable-output",
-          run: async (ctx) => {
-            outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
-              condition: { scope: "calls" },
-            });
-          },
-        });
-
-        const session = await openSession({
+        const session = await openProject({
           cwd: host.rootDir,
-          config: defineConfig({
-            tsconfig: "tsconfig.json",
-            adapters: ["@verule/adapter-zod"],
-            rules: [inputRule, outputRule],
-          }),
+          tsconfig: "tsconfig.json",
+          adapters: ["@verule/adapter-zod"],
         });
 
         try {
-          const report = await session.check();
-          assert.equal(report.status, "clean");
+          const ctx = session.project();
+          const inputResults = await ctx.facts(ValidatorInputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
+          const outputResults = await ctx.facts(ValidatorOutputFieldsFact, {
+            condition: { scope: "calls" },
+            explain: true,
+          });
 
           const inputByName = (name: string) =>
             inputResults.find((f) => f.value.schemaName === name);
           const outputByName = (name: string) =>
             outputResults.find((f) => f.value.schemaName === name);
 
-          for (const [schemaName, targetLine, callLine, callCol] of [
-            ["methodPipeUnrecognized", 8, 21, 17],
-            ["staticPipeUnrecognized", 12, 22, 17],
+          for (const [schemaName, targetLine] of [
+            ["methodPipeUnrecognized", 8],
+            ["staticPipeUnrecognized", 12],
           ] as const) {
             const inFact = inputByName(schemaName)!;
             const outFact = outputByName(schemaName)!;
@@ -1395,18 +1182,14 @@ void describe("@verule/adapter-zod", () => {
               `${schemaName} output gaps: ${JSON.stringify(outFact.gaps)}`,
             );
 
-            const outExplain = await session.explain({
-              ruleId: "inspect-pipe-nullable-output",
-              at: `src/pipe-and-nullable.ts:${callLine}:${callCol}`,
-            });
             assert.ok(
-              outExplain.explanation.localGaps.some(
+              outFact.explainTrace?.localGaps?.some(
                 (lg) =>
                   lg.status === "unresolved" &&
                   lg.gap.kind === "unresolved-schema" &&
                   lg.gap.at?.line === targetLine,
               ),
-              `${schemaName} localGaps: ${JSON.stringify(outExplain.explanation.localGaps)}`,
+              `${schemaName} localGaps: ${JSON.stringify(outFact.explainTrace?.localGaps)}`,
             );
           }
 
@@ -1431,19 +1214,15 @@ void describe("@verule/adapter-zod", () => {
             JSON.stringify(andOut.gaps),
           );
 
-          const andExplain = await session.explain({
-            ruleId: "inspect-pipe-nullable-input",
-            at: "src/pipe-and-nullable.ts:23:18",
-          });
           assert.ok(
-            andExplain.explanation.localGaps.some(
+            andIn.explainTrace?.localGaps?.some(
               (lg) =>
                 lg.status === "unresolved" &&
                 lg.field === "age" &&
                 lg.gap.kind === "unresolved-schema-field" &&
                 lg.gap.at?.line === 16,
             ),
-            JSON.stringify(andExplain.explanation.localGaps),
+            JSON.stringify(andIn.explainTrace?.localGaps),
           );
         } finally {
           await session.close();

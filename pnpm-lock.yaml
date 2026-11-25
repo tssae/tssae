@@ -235,9 +235,9 @@ importers:
 
   adapters/drizzle:
     dependencies:
-      '@verule/sdk':
+      tssae:
         specifier: workspace:*
-        version: link:../../packages/sdk
+        version: link:../../packages/tssae
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -272,9 +272,9 @@ importers:
 
   adapters/zod:
     dependencies:
-      '@verule/sdk':
+      tssae:
         specifier: workspace:*
-        version: link:../../packages/sdk
+        version: link:../../packages/tssae
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -309,7 +309,25 @@ importers:
 
   packages/adapter-api: {}
 
-  packages/engine:
+  packages/tooling-config:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 26.6.6
+      oxfmt:
+        specifier: 'catalog:'
+        version: 0.79.0
+      oxlint:
+        specifier: 'catalog:'
+        version: 1.94.0
+      tsrs:
+        specifier: 'catalog:'
+        version: 7.1.0-beta.tsrs4
+      typescript-7:
+        specifier: 'catalog:'
+        version: typescript@7.0.2
+
+  packages/tssae:
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -329,61 +347,43 @@ importers:
       oxlint:
         specifier: 'catalog:'
         version: 1.94.0
+      tsrs:
+        specifier: 'catalog:'
+        version: 7.1.0-beta.tsrs4
       typescript-7:
         specifier: 'catalog:'
         version: typescript@7.0.2
 
-  packages/sdk:
+  test/acceptance:
     dependencies:
-      '@verule/engine':
-        specifier: workspace:*
-        version: link:../engine
-    devDependencies:
-      '@types/node':
-        specifier: 'catalog:'
-        version: 26.6.6
       '@verule/test-hosts':
         specifier: workspace:*
-        version: link:../../test/hosts
-      '@verule/tooling-config':
-        specifier: workspace:*
-        version: link:../tooling-config
-      oxfmt:
-        specifier: 'catalog:'
-        version: 0.79.0
-      oxlint:
-        specifier: 'catalog:'
-        version: 1.94.0
-      tsrs:
-        specifier: 'catalog:'
-        version: 7.1.0-beta.tsrs4
-      typescript-7:
-        specifier: 'catalog:'
-        version: typescript@7.0.2
-
-  packages/tooling-config:
+        version: link:../hosts
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.6
+      '@verule/tooling-config':
+        specifier: workspace:*
+        version: link:../../packages/tooling-config
       oxfmt:
         specifier: 'catalog:'
         version: 0.79.0
       oxlint:
         specifier: 'catalog:'
         version: 1.94.0
-      tsrs:
-        specifier: 'catalog:'
-        version: 7.1.0-beta.tsrs4
+      tssae:
+        specifier: workspace:*
+        version: link:../../packages/tssae
       typescript-7:
         specifier: 'catalog:'
         version: typescript@7.0.2
 
   test/adapter-fixture:
     dependencies:
-      '@verule/sdk':
+      tssae:
         specifier: workspace:*
-        version: link:../../packages/sdk
+        version: link:../../packages/tssae
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
@@ -409,9 +409,9 @@ importers:
 
   test/adapter-fixture-complement:
     dependencies:
-      '@verule/sdk':
+      tssae:
         specifier: workspace:*
-        version: link:../../packages/sdk
+        version: link:../../packages/tssae
     devDependencies:
       '@types/node':
         specifier: 'catalog:'

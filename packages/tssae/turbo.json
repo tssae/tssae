@@ -1,0 +1,62 @@
+{
+  "extends": ["//"],
+  "tags": ["library"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build", "//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "Cargo.toml", "Cargo.lock", "src/**/*.rs"],
+      "outputs": ["dist/**"],
+      "cache": false,
+      "tags": ["work:preparation"]
+    },
+    "format:check": {
+      "dependsOn": ["//#toolchain:prepare"],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "format:write": {
+      "dependsOn": ["lint:fix", "//#toolchain:prepare"],
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "lint": {
+      "dependsOn": [
+        "//#toolchain:prepare",
+        "^lint",
+        "@verule/test-hosts#typecheck"
+      ],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "lint:fix": {
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "test": {
+      "dependsOn": [
+        "^build",
+        "build",
+        "//#toolchain:prepare",
+        "@verule/test-hosts#typecheck"
+      ],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "typecheck": {
+      "dependsOn": [
+        "@verule/tooling-config#typecheck",
+        "@verule/test-hosts#typecheck"
+      ],
+      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    }
+  }
+}

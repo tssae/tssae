@@ -1,5 +1,5 @@
 {
-  "name": "tssae",
+  "name": "tssae-monorepo",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +14,7 @@
     "fix": "node --conditions=source scripts/task-gates.ts fix",
     "boundaries": "turbo boundaries",
     "toolchain:prepare": "cargo --version",
-    "publication:pack": "turbo run build && changeset pack --out-dir .changeset/packed",
+    "publication:pack": "node --conditions=source scripts/publication-pack.ts",
     "publication:publish": "changeset publish --from-pack-dir .changeset/packed"
   },
   "devDependencies": {

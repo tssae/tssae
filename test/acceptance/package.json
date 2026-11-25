@@ -11,7 +11,8 @@
       "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false",
@@ -27,6 +28,9 @@
     "@tssae/test-hosts": "workspace:*"
   },
   "devDependencies": {
+    "@tssae/adapter-api": "workspace:*",
+    "@tssae/adapter-fixture": "workspace:*",
+    "@tssae/adapter-fixture-complement": "workspace:*",
     "@tssae/adapters": "workspace:*",
     "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",

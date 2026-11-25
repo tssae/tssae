@@ -1,5 +1,6 @@
-import { defineAdapter, defineFactProvider } from "tssae";
+import { defineAdapter } from "tssae";
 
+import { defineNativeFactProvider } from "../native-provider.ts";
 import {
   ValidatorFieldFact,
   ValidatorInputFieldsFact,
@@ -12,39 +13,18 @@ const zodAdapter = defineAdapter({
   version: "0.1.0",
   description: "Static Zod schema and validator field extractor.",
   provides: [
-    defineFactProvider(ValidatorInputFieldsFact, (ctx, request) =>
-      ctx.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "zod",
-        reportProviderId: "zod",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.condition !== undefined
-          ? { condition: request.condition }
-          : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
-    defineFactProvider(ValidatorOutputFieldsFact, (ctx, request) =>
-      ctx.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "zod",
-        reportProviderId: "zod",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.condition !== undefined
-          ? { condition: request.condition }
-          : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
-    defineFactProvider(ValidatorFieldFact, (ctx, request) =>
-      ctx.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "zod",
-        reportProviderId: "zod",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
+    defineNativeFactProvider(ValidatorInputFieldsFact, {
+      providerId: "zod",
+      reportProviderId: "zod",
+    }),
+    defineNativeFactProvider(ValidatorOutputFieldsFact, {
+      providerId: "zod",
+      reportProviderId: "zod",
+    }),
+    defineNativeFactProvider(ValidatorFieldFact, {
+      providerId: "zod",
+      reportProviderId: "zod",
+    }),
   ],
 });
 

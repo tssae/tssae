@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 
 import {
   packWorkspaceArtifacts,
@@ -18,7 +18,18 @@ import {
   withAcceptanceHost,
 } from "@tssae/acceptance";
 
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
+const acceptanceRequire = createRequire(import.meta.url);
+
+const WORKSPACE_PACKAGE_SPECIFIERS = [
+  "tssae",
+  "@tssae/adapters",
+  "@tssae/adapter-api",
+  "@tssae/adapter-fixture",
+  "@tssae/adapter-fixture-complement",
+  "@tssae/test-hosts",
+  "@tssae/tooling-config",
+  "@tssae/acceptance",
+] as const;
 
 const consumerTsconfig = JSON.stringify(
   {
@@ -48,37 +59,21 @@ function prepareMultiPackageHost(hostDir: string): void {
   rmSync(join(hostDir, "tsconfig.json"), { force: true });
 }
 
-function readWorkspaceManifests(): readonly {
-  readonly dir: string;
+function readDeclaredWorkspaceManifests(): readonly {
   readonly name: string;
   readonly private?: boolean;
 }[] {
-  const out: {
-    readonly dir: string;
-    readonly name: string;
-    readonly private?: boolean;
-  }[] = [];
-  for (const parent of ["packages", "test"]) {
-    const parentDir = join(repoRoot, parent);
-    for (const entry of readdirSync(parentDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const manifestPath = join(parentDir, entry.name, "package.json");
-      try {
-        const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-          readonly name: string;
-          readonly private?: boolean;
-        };
-        out.push({
-          dir: `${parent}/${entry.name}`,
-          name: parsed.name,
-          ...(parsed.private !== undefined ? { private: parsed.private } : {}),
-        });
-      } catch {
-        // Ignore directories without package.json.
-      }
-    }
-  }
-  return out;
+  return WORKSPACE_PACKAGE_SPECIFIERS.map((pkgName) => {
+    const manifestPath = acceptanceRequire.resolve(`${pkgName}/package.json`);
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      readonly name: string;
+      readonly private?: boolean;
+    };
+    return {
+      name: parsed.name,
+      ...(parsed.private !== undefined ? { private: parsed.private } : {}),
+    };
+  });
 }
 
 const singleZodConsumer = `import assert from "node:assert/strict";
@@ -816,7 +811,7 @@ try {
 `;
 
 void test("installs one candidate @tssae/adapters tarball alongside tssae, enables Zod and Drizzle independently or together, and keeps test fixtures private", async (t) => {
-  const manifests = readWorkspaceManifests();
+  const manifests = readDeclaredWorkspaceManifests();
   const fixtureManifest = manifests.find(
     (m) => m.name === "@tssae/adapter-fixture",
   );
@@ -839,6 +834,22 @@ void test("installs one candidate @tssae/adapters tarball alongside tssae, enabl
   });
 
   try {
+    const publishPlanPath = join(bundle.packDir, "publish-plan.json");
+    if (existsSync(publishPlanPath)) {
+      const planJson = JSON.parse(readFileSync(publishPlanPath, "utf8")) as {
+        readonly plan: readonly (readonly {
+          readonly kind: string;
+          readonly name?: string;
+        }[])[];
+      };
+      const plannedPublishNames = planJson.plan
+        .flat()
+        .filter((entry) => entry.kind === "publish" && entry.name !== undefined)
+        .map((entry) => entry.name!)
+        .toSorted();
+      assert.deepEqual(plannedPublishNames, ["@tssae/adapters", "tssae"]);
+    }
+
     const tssaeArtifact = bundle.artifacts.find((a) => a.name === "tssae");
     const adaptersArtifact = bundle.artifacts.find(
       (a) => a.name === "@tssae/adapters",

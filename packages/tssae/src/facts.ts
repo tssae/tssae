@@ -856,7 +856,6 @@ export async function executeFactQuery<
   readonly sessionToken: symbol;
   readonly snapshotId: number;
   readonly projectId: string;
-  readonly ruleId: string;
   readonly assertActiveSnapshot: () => void;
   readonly createAdapterContext: (
     adapterId: string,
@@ -886,7 +885,6 @@ export async function executeFactQuery<
     sessionToken,
     snapshotId,
     projectId,
-    ruleId,
     assertActiveSnapshot,
     createAdapterContext,
     replayAdapterAdditionalInput,
@@ -1092,7 +1090,6 @@ export async function executeFactQuery<
           sessionToken,
           snapshotId,
           projectId,
-          ruleId,
           assertActiveSnapshot,
           createAdapterContext,
           replayAdapterAdditionalInput,
@@ -1313,20 +1310,16 @@ export async function executeFactQuery<
       if (explainEnabled) {
         for (const pid of sub.providers) {
           collector.recordProviderEvaluation({
-            ruleId,
-            evaluation: {
-              providerId: pid,
-              factTypeId: sub.factTypeId,
-              status: sub.cacheStatus === "reused" ? "reused" : "evaluated",
-              ...(sub.subjectLocations[0] !== undefined
-                ? { subjectLocation: sub.subjectLocations[0] }
-                : {}),
-            },
+            providerId: pid,
+            factTypeId: sub.factTypeId,
+            status: sub.cacheStatus === "reused" ? "reused" : "evaluated",
+            ...(sub.subjectLocations[0] !== undefined
+              ? { subjectLocation: sub.subjectLocations[0] }
+              : {}),
           });
         }
       }
       collector.recordQuery({
-        ruleId,
         op: `facts:${sub.factTypeId}`,
         projectId,
         provider: subProviderLabel,
@@ -1354,12 +1347,9 @@ export async function executeFactQuery<
       for (const sub of replayedSubProviders) {
         onTransitiveSubProvider?.(sub);
         collector.recordProviderEvaluation({
-          ruleId,
-          evaluation: {
-            providerId: sub.providerId,
-            factTypeId: sub.factTypeId,
-            status: "reused",
-          },
+          providerId: sub.providerId,
+          factTypeId: sub.factTypeId,
+          status: "reused",
         });
       }
       for (const entry of matchedProviders) {
@@ -1368,12 +1358,9 @@ export async function executeFactQuery<
           factTypeId: factType.id,
         });
         collector.recordProviderEvaluation({
-          ruleId,
-          evaluation: {
-            providerId: entry.adapterId,
-            factTypeId: factType.id,
-            status: cacheStatus === "reused" ? "reused" : "evaluated",
-          },
+          providerId: entry.adapterId,
+          factTypeId: factType.id,
+          status: cacheStatus === "reused" ? "reused" : "evaluated",
         });
       }
       if (options?.providerId !== undefined) {
@@ -1383,13 +1370,10 @@ export async function executeFactQuery<
             adapter.provides.some((p) => p.factType.id === factType.id)
           ) {
             collector.recordProviderEvaluation({
-              ruleId,
-              evaluation: {
-                providerId: adapter.id,
-                factTypeId: factType.id,
-                status: "skipped",
-                reason: `Skipped due to providerId filter ("${options.providerId}").`,
-              },
+              providerId: adapter.id,
+              factTypeId: factType.id,
+              status: "skipped",
+              reason: `Skipped due to providerId filter ("${options.providerId}").`,
             });
           }
         }
@@ -1402,7 +1386,6 @@ export async function executeFactQuery<
           const localGaps = factExplainLocalGaps.get(item) ?? [];
           if (item.gaps.length > 0 || localGaps.length > 0) {
             collector.recordFactExplain({
-              ruleId,
               ...(subjectLocation !== undefined ? { subjectLocation } : {}),
               gaps: item.gaps,
               localGaps,
@@ -1424,7 +1407,6 @@ export async function executeFactQuery<
           : "";
 
     collector.recordQuery({
-      ruleId,
       op: `facts:${factType.id}`,
       projectId,
       provider: providerLabel,

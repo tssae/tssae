@@ -13,7 +13,8 @@
       "default": "./dist/index.js"
     },
     "./tssae-native": "./dist/tssae-native.json",
-    "./native/linux-x64": "./dist/native/libtssae_test_adapter.so"
+    "./native/linux-x64": "./dist/native/libtssae_test_adapter.so",
+    "./package.json": "./package.json"
   },
   "publishConfig": {
     "exports": {
@@ -22,7 +23,8 @@
         "default": "./dist/index.js"
       },
       "./tssae-native": "./dist/tssae-native.json",
-      "./native/linux-x64": "./dist/native/libtssae_test_adapter.so"
+      "./native/linux-x64": "./dist/native/libtssae_test_adapter.so",
+      "./package.json": "./package.json"
     }
   },
   "scripts": {

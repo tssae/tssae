@@ -1,5 +1,6 @@
-import { defineAdapter, defineFactProvider, type LibraryAdapter } from "tssae";
+import { defineAdapter, type LibraryAdapter } from "tssae";
 
+import { defineNativeFactProvider } from "../native-provider.ts";
 import {
   DrizzleTableColumnsFact,
   QueryRowProjectionFact,
@@ -13,36 +14,15 @@ export const drizzleAdapter: LibraryAdapter = defineAdapter({
   description:
     "Rust Drizzle ORM table column, query row projection, and drizzle-zod schema extractor.",
   provides: [
-    defineFactProvider(QueryRowProjectionFact, (context, request) =>
-      context.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "drizzle",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.condition !== undefined
-          ? { condition: request.condition }
-          : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
-    defineFactProvider(DrizzleTableColumnsFact, (context, request) =>
-      context.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "drizzle",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.condition !== undefined
-          ? { condition: request.condition }
-          : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
-    defineFactProvider(ValidatorSchemaFieldsFact, (context, request) =>
-      context.extractEngineFacts({
-        factTypeId: request.factType.id,
-        providerId: "drizzle",
-        ...(request.targets !== undefined ? { targets: request.targets } : {}),
-        ...(request.explain !== undefined ? { explain: request.explain } : {}),
-      }),
-    ),
+    defineNativeFactProvider(QueryRowProjectionFact, {
+      providerId: "drizzle",
+    }),
+    defineNativeFactProvider(DrizzleTableColumnsFact, {
+      providerId: "drizzle",
+    }),
+    defineNativeFactProvider(ValidatorSchemaFieldsFact, {
+      providerId: "drizzle",
+    }),
   ],
 });
 

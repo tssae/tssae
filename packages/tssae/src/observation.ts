@@ -255,7 +255,6 @@ export class ObservationCollector {
   }
 
   recordQuery(params: {
-    readonly ruleId: string;
     readonly op: string;
     readonly projectId: string;
     readonly provider: string;
@@ -286,7 +285,6 @@ export class ObservationCollector {
   }
 
   recordFactExplain(params: {
-    readonly ruleId: string;
     readonly subjectLocation?: DiagnosticLocation;
     readonly gaps: readonly Gap[];
     readonly localGaps: readonly ExplainLocalGap[];
@@ -300,10 +298,7 @@ export class ObservationCollector {
     });
   }
 
-  recordProviderEvaluation(params: {
-    readonly ruleId: string;
-    readonly evaluation: ExplainProviderEvaluation;
-  }): void {
-    this.#onProviderEvaluation?.(params.evaluation);
+  recordProviderEvaluation(evaluation: ExplainProviderEvaluation): void {
+    this.#onProviderEvaluation?.(evaluation);
   }
 }

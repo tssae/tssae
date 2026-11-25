@@ -34,6 +34,7 @@ import type {
   InstanceTargetRef,
   ProjectedInstanceRow,
 } from "./instance-identity.ts";
+import type { EngineCallIoMetrics, QueryObserver } from "./observation.ts";
 import type {
   ImplementationResolutionResult,
   ImplementationTargetRef,
@@ -497,6 +498,8 @@ export type OpenProjectOptions = {
   readonly additionalInputs?: readonly string[];
   /** Directory used to resolve adapter package names; defaults to `cwd`. */
   readonly adapterResolutionRoot?: string;
+  readonly observe?: ObserveMode | ObserveOptions;
+  readonly onRpcMetrics?: (metrics: EngineCallIoMetrics) => void;
 };
 
 export type RecomputationScope = {
@@ -522,6 +525,8 @@ export type SessionUpdateOptions = {
   readonly adapters?: readonly ConfiguredAdapter[];
   readonly entries?: readonly string[];
   readonly additionalInputs?: readonly string[];
+  readonly observe?: ObserveMode | ObserveOptions;
+  readonly onRpcMetrics?: (metrics: EngineCallIoMetrics) => void;
 };
 
 export type SessionUpdateResult = {
@@ -529,9 +534,39 @@ export type SessionUpdateResult = {
   readonly snapshotId: number;
   readonly projects: readonly ProjectSummary[];
   readonly fileOrigins: readonly SourceFileOrigin[];
+  readonly workspaceSourceFiles: readonly string[];
   readonly additionalInputs: readonly AdditionalInputEntry[];
   readonly recomputation: RecomputationScope;
   readonly memory: MemoryStats;
+};
+
+/** Comment syntax kind reported by `ProjectSession.scanComments`. */
+export type CommentKind = "line" | "block";
+
+/** Options passed to `ProjectSession.scanComments`. */
+export type ScanCommentsOptions = {
+  /** Optional relative or absolute file paths to restrict scanning to. */
+  readonly files?: readonly string[];
+  readonly observe?: ObserveMode | ObserveOptions;
+  readonly onRpcMetrics?: (metrics: EngineCallIoMetrics) => void;
+};
+
+/** Options passed to `ProjectSession.project`. */
+export type ProjectContextOptions = {
+  readonly observer?: QueryObserver;
+};
+
+/** Standalone comment and immediately following code line returned by `ProjectSession.scanComments`. */
+export type ScannedComment = {
+  readonly kind: CommentKind;
+  /** Normalized comment body text with delimiters and multiline `*` prefixes stripped. */
+  readonly text: string;
+  /** Exact source range of the standalone comment (or JSX empty-expression comment wrapper). */
+  readonly at: DiagnosticLocation;
+  /** 1-based line number of the first code line after this comment block, or `null` when interrupted by a blank line or EOF. */
+  readonly nextCodeLine: number | null;
+  /** Whether the comment appeared inside a JSX empty expression wrapper. */
+  readonly isJsx: boolean;
 };
 
 /**
@@ -543,11 +578,18 @@ export type ProjectSession = {
   readonly snapshotDigest: string;
   readonly projects: readonly ProjectSummary[];
   readonly fileOrigins: readonly SourceFileOrigin[];
+  readonly workspaceSourceFiles: readonly string[];
   readonly additionalInputs: readonly AdditionalInputEntry[];
   readonly nativeAdapters: readonly NativeAdapterObservation[];
   readonly memory: MemoryStats;
   readonly projectContexts: readonly ProjectContext[];
-  project: (target?: string | ProjectSummary) => ProjectContext;
+  project: (
+    target?: string | ProjectSummary,
+    options?: ProjectContextOptions,
+  ) => ProjectContext;
+  scanComments: (
+    options?: ScanCommentsOptions,
+  ) => Promise<readonly ScannedComment[]>;
   registerAdditionalInput: (
     filePath: string,
     source: AdditionalInputSource,

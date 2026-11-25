@@ -762,8 +762,8 @@ fn truncates_observation_details_by_items_and_bytes() {
 }
 
 #[test]
-fn scans_inline_ignore_directives_across_comments_jsx_crlf_and_excludes_jsdoc_and_strings() {
-    let temp = TempDirGuard::from_host("verule-engine-serve-directives", "inline-ignore");
+fn scans_standalone_comments_across_blocks_jsx_crlf_and_excludes_jsdoc_and_strings() {
+    let temp = TempDirGuard::from_host("verule-engine-serve-comments", "inline-ignore");
     convert_file_to_crlf(&temp.path().join("src/app.ts"));
 
     let tsconfig_str = normalized(&temp.path().join("tsconfig.json"));
@@ -776,32 +776,66 @@ fn scans_inline_ignore_directives_across_comments_jsx_crlf_and_excludes_jsdoc_an
         &mut reader,
         &json!({
             "id": 2,
-            "method": "directives.scan",
+            "method": "comments.scan",
             "params": { "snapshotId": snapshot_id }
         }),
     );
-    assert_eq!(resp["ok"], json!(true), "directives.scan failed: {resp}");
-    let directives = resp["result"]["directives"]
+    assert_eq!(resp["ok"], json!(true), "comments.scan failed: {resp}");
+    let comments = resp["result"]["comments"]
         .as_array()
-        .expect("directives array");
+        .expect("comments array");
 
-    assert_eq!(directives.len(), 5, "unexpected directives: {resp}");
-    assert_eq!(directives[0]["kind"], json!("valid"));
-    assert_eq!(directives[0]["ruleId"], json!("r1"));
-    assert_eq!(directives[0]["targetLine"], json!(5));
-    assert_eq!(directives[1]["kind"], json!("valid"));
-    assert_eq!(directives[1]["ruleId"], json!("r2"));
-    assert_eq!(directives[1]["reason"], json!("Block reason"));
-    assert_eq!(directives[1]["targetLine"], json!(10));
-    assert_eq!(directives[2]["kind"], json!("valid"));
-    assert_eq!(directives[2]["ruleId"], json!("r3"));
-    assert_eq!(directives[2]["targetLine"], Value::Null);
-    assert_eq!(directives[3]["kind"], json!("malformed"));
-    assert_eq!(directives[3]["at"]["line"], json!(14));
-    assert_eq!(directives[4]["kind"], json!("valid"));
-    assert_eq!(directives[4]["ruleId"], json!("r-jsx"));
-    assert_eq!(directives[4]["at"]["file"], json!("src/view.tsx"));
-    assert_eq!(directives[4]["targetLine"], json!(7));
+    assert_eq!(comments.len(), 6, "unexpected comments: {resp}");
+    assert_eq!(comments[0]["kind"], json!("line"));
+    assert_eq!(
+        comments[0]["text"],
+        json!("verule-ignore-next-code-line r1 -- Line reason")
+    );
+    assert_eq!(comments[0]["nextCodeLine"], json!(5));
+    assert_eq!(comments[0]["isJsx"], json!(false));
+
+    assert_eq!(comments[1]["kind"], json!("block"));
+    assert_eq!(
+        comments[1]["text"],
+        json!("verule-ignore-next-code-line r2 -- Block reason")
+    );
+    assert_eq!(comments[1]["nextCodeLine"], json!(10));
+    assert_eq!(comments[1]["isJsx"], json!(false));
+
+    assert_eq!(comments[2]["kind"], json!("line"));
+    assert_eq!(comments[2]["text"], json!("leading note"));
+    assert_eq!(comments[2]["nextCodeLine"], json!(10));
+
+    assert_eq!(comments[3]["kind"], json!("line"));
+    assert_eq!(
+        comments[3]["text"],
+        json!("verule-ignore-next-code-line r3 -- Blank line truncates")
+    );
+    assert_eq!(comments[3]["nextCodeLine"], Value::Null);
+
+    assert_eq!(comments[4]["kind"], json!("line"));
+    assert_eq!(comments[4]["at"]["line"], json!(14));
+    assert_eq!(comments[4]["nextCodeLine"], json!(15));
+
+    assert_eq!(comments[5]["kind"], json!("block"));
+    assert_eq!(comments[5]["at"]["file"], json!("src/view.tsx"));
+    assert_eq!(comments[5]["nextCodeLine"], json!(7));
+    assert_eq!(comments[5]["isJsx"], json!(true));
+
+    let filtered_resp = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 3,
+            "method": "comments.scan",
+            "params": { "snapshotId": snapshot_id, "files": ["src/view.tsx"] }
+        }),
+    );
+    assert_eq!(filtered_resp["ok"], json!(true));
+    assert_eq!(
+        filtered_resp["result"]["comments"].as_array().map(Vec::len),
+        Some(1)
+    );
 
     finish_engine(child, stdin);
 }

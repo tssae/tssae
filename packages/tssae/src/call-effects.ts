@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
-import { registerProvenance } from "./evidence.ts";
+import { recordSyntaxLocation, registerProvenance } from "./evidence.ts";
 import type { InstanceModelMatch } from "./instance-identity.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
 import { validateProgramRefs } from "./projection.ts";
@@ -509,6 +509,7 @@ function mapCleanupSite(
     raw.syntax,
   );
   syntaxLocations?.set(syntax, raw.location);
+  recordSyntaxLocation(syntax, raw.location);
   return registerProvenance(
     {
       instance: makeProgramRef(
@@ -568,6 +569,7 @@ function mapFieldEffect(
     raw.syntax,
   );
   syntaxLocations?.set(syntax, raw.location);
+  recordSyntaxLocation(syntax, raw.location);
   const guards = raw.guards.map((g) => {
     const condition = makeProgramRef(
       "syntax",
@@ -577,6 +579,7 @@ function mapFieldEffect(
       g.condition,
     );
     syntaxLocations?.set(condition, g.location);
+    recordSyntaxLocation(condition, g.location);
     return {
       branchSyntax: makeProgramRef(
         "syntax",

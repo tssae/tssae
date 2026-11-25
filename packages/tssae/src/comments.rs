@@ -11,20 +11,21 @@ use crate::projection::SourceLocation;
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::SnapshotState;
 
-const DIRECTIVE_PREFIX: &str = "verule-ignore-next-code-line";
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommentKind {
+    Line,
+    Block,
+}
 
 #[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum ScannedDirective {
-    #[serde(rename_all = "camelCase")]
-    Valid {
-        rule_id: String,
-        reason: String,
-        at: SourceLocation,
-        target_line: Option<u32>,
-    },
-    #[serde(rename_all = "camelCase")]
-    Malformed { message: String, at: SourceLocation },
+#[serde(rename_all = "camelCase")]
+pub struct ScannedComment {
+    pub kind: CommentKind,
+    pub text: String,
+    pub at: SourceLocation,
+    pub next_code_line: Option<u32>,
+    pub is_jsx: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,16 +43,26 @@ struct RawComment {
     is_jsdoc: bool,
 }
 
-enum ParsedDirective {
-    Valid { rule_id: String, reason: String },
-    Malformed { message: String },
-}
+/// Scans project source files in the active snapshot for standalone line and block comments,
+/// returning each comment's normalized text, exact span, and immediately following code line.
+pub fn scan_snapshot_comments(
+    snapshot: &SnapshotState,
+    files: Option<&[String]>,
+) -> Vec<ScannedComment> {
+    let filter_set = files.map(|list| {
+        list.iter()
+            .map(|f| {
+                let norm = f.replace('\\', "/");
+                norm.trim_start_matches("./").to_string()
+            })
+            .collect::<BTreeSet<String>>()
+    });
+    if filter_set.as_ref().is_some_and(BTreeSet::is_empty) {
+        return Vec::new();
+    }
 
-/// Scans all project source files in the active snapshot for `verule-ignore-next-code-line`
-/// directives and malformed directive attempts.
-pub fn scan_snapshot_directives(snapshot: &SnapshotState) -> Vec<ScannedDirective> {
     let mut seen_files = BTreeSet::new();
-    let mut directives = Vec::new();
+    let mut comments = Vec::new();
 
     for project_id in snapshot.project_ids.values() {
         let Ok(program) = snapshot.snapshot_data.get_program(project_id) else {
@@ -62,32 +73,28 @@ pub fn scan_snapshot_directives(snapshot: &SnapshotState) -> Vec<ScannedDirectiv
                 continue;
             }
             let rel_file = relative_to_cwd(&snapshot.cwd, sf.file_name());
+            if let Some(allowed) = &filter_set
+                && !allowed.contains(&rel_file)
+            {
+                continue;
+            }
             if !seen_files.insert(rel_file.clone()) {
                 continue;
             }
-            directives.extend(scan_source_file_directives(sf, &rel_file));
+            comments.extend(scan_source_file_comments(sf, &rel_file));
         }
     }
 
-    directives.sort_by(|a, b| {
-        let loc_a = directive_location(a);
-        let loc_b = directive_location(b);
-        loc_a
-            .file
-            .cmp(&loc_b.file)
-            .then_with(|| loc_a.start.cmp(&loc_b.start))
-            .then_with(|| loc_a.end.cmp(&loc_b.end))
+    comments.sort_by(|a, b| {
+        a.at.file
+            .cmp(&b.at.file)
+            .then_with(|| a.at.start.cmp(&b.at.start))
+            .then_with(|| a.at.end.cmp(&b.at.end))
     });
-    directives
+    comments
 }
 
-const fn directive_location(directive: &ScannedDirective) -> &SourceLocation {
-    match directive {
-        ScannedDirective::Valid { at, .. } | ScannedDirective::Malformed { at, .. } => at,
-    }
-}
-
-pub fn scan_source_file_directives(sf: P<SourceFile>, rel_file: &str) -> Vec<ScannedDirective> {
+pub fn scan_source_file_comments(sf: P<SourceFile>, rel_file: &str) -> Vec<ScannedComment> {
     let text = sf.text();
     let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
     let line_starts = get_ecma_line_starts(sf.get());
@@ -115,7 +122,7 @@ pub fn scan_source_file_directives(sf: P<SourceFile>, rel_file: &str) -> Vec<Sca
         if comment.is_jsdoc {
             continue;
         }
-        let Some((eff_start, eff_end)) =
+        let Some((eff_start, eff_end, is_jsx)) =
             standalone_span(text, line_starts, &comment, &jsx_wrappers)
         else {
             continue;
@@ -123,27 +130,23 @@ pub fn scan_source_file_directives(sf: P<SourceFile>, rel_file: &str) -> Vec<Sca
         let Some(body) = extract_comment_body(text, &comment) else {
             continue;
         };
-        let Some(parsed) = parse_directive_body(&body) else {
-            continue;
-        };
 
         let at = span_location(sf, rel_file, eff_start, eff_end);
-        match parsed {
-            ParsedDirective::Malformed { message } => {
-                results.push(ScannedDirective::Malformed { message, at });
-            }
-            ParsedDirective::Valid { rule_id, reason } => {
-                let end_pos = eff_end.saturating_sub(1).max(eff_start);
-                let end_line = byte_to_line1(line_starts, end_pos);
-                let target_line = find_next_code_line(end_line, &line_has_code, &line_has_comment);
-                results.push(ScannedDirective::Valid {
-                    rule_id,
-                    reason,
-                    at,
-                    target_line,
-                });
-            }
-        }
+        let end_pos = eff_end.saturating_sub(1).max(eff_start);
+        let end_line = byte_to_line1(line_starts, end_pos);
+        let next_code_line = find_next_code_line(end_line, &line_has_code, &line_has_comment);
+
+        results.push(ScannedComment {
+            kind: if comment.is_line {
+                CommentKind::Line
+            } else {
+                CommentKind::Block
+            },
+            text: body,
+            at,
+            next_code_line,
+            is_jsx,
+        });
     }
 
     results
@@ -358,8 +361,8 @@ fn standalone_span(
     line_starts: &[u32],
     comment: &RawComment,
     jsx_wrappers: &[(u32, u32)],
-) -> Option<(u32, u32)> {
-    let (eff_start, eff_end) = if let Some(&(j_start, j_end)) = jsx_wrappers
+) -> Option<(u32, u32, bool)> {
+    let (eff_start, eff_end, is_jsx) = if let Some(&(j_start, j_end)) = jsx_wrappers
         .iter()
         .find(|&&(js, je)| comment.start > js && comment.end < je)
     {
@@ -375,9 +378,9 @@ fn standalone_span(
         if !before.chars().all(char::is_whitespace) || !after.chars().all(char::is_whitespace) {
             return None;
         }
-        (j_start, j_end)
+        (j_start, j_end, true)
     } else {
-        (comment.start, comment.end)
+        (comment.start, comment.end, false)
     };
 
     let start_line_idx = usize::try_from(byte_to_line1(line_starts, eff_start) - 1).unwrap_or(0);
@@ -405,7 +408,7 @@ fn standalone_span(
         return None;
     }
 
-    Some((eff_start, eff_end))
+    Some((eff_start, eff_end, is_jsx))
 }
 
 fn extract_comment_body(text: &str, comment: &RawComment) -> Option<String> {
@@ -434,71 +437,6 @@ fn extract_comment_body(text: &str, comment: &RawComment) -> Option<String> {
         }
     }
     Some(lines.join(" "))
-}
-
-fn parse_directive_body(body: &str) -> Option<ParsedDirective> {
-    let trimmed = body.trim();
-    let rest = trimmed.strip_prefix(DIRECTIVE_PREFIX)?;
-    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
-        return None;
-    }
-
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return Some(ParsedDirective::Malformed {
-            message: "Missing rule ID and reason; expected \"verule-ignore-next-code-line <ruleId> -- <reason>\".".to_string(),
-        });
-    }
-
-    let Some((raw_id_part, raw_reason_part)) = split_reason_separator(rest) else {
-        return Some(ParsedDirective::Malformed {
-            message: "Missing \"-- <reason>\" separator; expected \"verule-ignore-next-code-line <ruleId> -- <reason>\".".to_string(),
-        });
-    };
-
-    let id_tokens: Vec<&str> = raw_id_part.split_whitespace().collect();
-    if id_tokens.is_empty() {
-        return Some(ParsedDirective::Malformed {
-            message: "Missing rule ID before \"--\"; expected \"verule-ignore-next-code-line <ruleId> -- <reason>\".".to_string(),
-        });
-    }
-    if id_tokens.len() > 1 || id_tokens[0].contains(',') {
-        return Some(ParsedDirective::Malformed {
-            message: "Expected a single rule ID before \"--\".".to_string(),
-        });
-    }
-
-    let reason = raw_reason_part.trim();
-    if reason.is_empty() {
-        return Some(ParsedDirective::Malformed {
-            message: "Missing non-empty reason after \"--\".".to_string(),
-        });
-    }
-
-    Some(ParsedDirective::Valid {
-        rule_id: id_tokens[0].to_string(),
-        reason: reason.to_string(),
-    })
-}
-
-fn split_reason_separator(rest: &str) -> Option<(&str, &str)> {
-    if let Some(after) = rest.strip_prefix("--") {
-        if after.is_empty() || after.chars().next().is_some_and(char::is_whitespace) {
-            return Some(("", after));
-        }
-        return None;
-    }
-
-    for (idx, _) in rest.match_indices("--") {
-        let before = &rest[..idx];
-        let after = &rest[idx + 2..];
-        let left_ok = before.chars().next_back().is_some_and(char::is_whitespace);
-        let right_ok = after.is_empty() || after.chars().next().is_some_and(char::is_whitespace);
-        if left_ok && right_ok {
-            return Some((before, after));
-        }
-    }
-    None
 }
 
 fn find_next_code_line(

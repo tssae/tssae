@@ -34,6 +34,7 @@ import type {
   Evidence,
   Model,
   SyntaxNodeResult,
+  SyntaxRef,
 } from "./types.ts";
 
 /** Any individual query result, model, or fact item that carries per-item provenance. */
@@ -69,6 +70,22 @@ type ProvenanceRecord = {
 };
 
 const provenanceRegistry = new WeakMap<object, ProvenanceRecord>();
+const syntaxLocationRegistry = new WeakMap<SyntaxRef, DiagnosticLocation>();
+
+/** Records the source location of a `SyntaxRef` for synchronous lookup. */
+export function recordSyntaxLocation(
+  ref: SyntaxRef,
+  location: DiagnosticLocation,
+): void {
+  syntaxLocationRegistry.set(ref, location);
+}
+
+/** Returns the cached source location for a materialized `SyntaxRef`, if known. */
+export function syntaxLocationOf(
+  ref: SyntaxRef,
+): DiagnosticLocation | undefined {
+  return syntaxLocationRegistry.get(ref);
+}
 
 /** Normalizes file separators on a source location. */
 export function normalizeLocation(loc: DiagnosticLocation): DiagnosticLocation {

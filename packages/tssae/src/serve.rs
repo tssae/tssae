@@ -20,7 +20,7 @@ use crate::cfg::{
     EvidenceItem, FunctionCfg, GapItem, normalize_cfg_scope_node, normalize_function_node,
     resolve_enclosing_function,
 };
-use crate::directives::{ScannedDirective, scan_snapshot_directives};
+use crate::comments::{ScannedComment, scan_snapshot_comments};
 use crate::instance_identity::{FieldWriteIndex, InstanceHandleData};
 use crate::native_adapter::{
     NativeAdapterObservation, NativeAdapterPackageInput, NativeAdapterRegistry, NativeAdapterStatus,
@@ -117,13 +117,15 @@ struct QueryBatchParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DirectivesScanParams {
+struct CommentsScanParams {
     snapshot_id: u64,
+    #[serde(default)]
+    files: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
-struct DirectivesScanResult {
-    directives: Vec<ScannedDirective>,
+struct CommentsScanResult {
+    comments: Vec<ScannedComment>,
 }
 
 #[derive(Serialize)]
@@ -645,10 +647,10 @@ impl EngineServer {
                     .map_err(|err| RpcErr::new("INVALID_PARAMS", err.to_string()))?;
                 self.query_batch(parsed, observer)
             }
-            "directives.scan" => {
-                let parsed: DirectivesScanParams = serde_json::from_value(params)
+            "comments.scan" => {
+                let parsed: CommentsScanParams = serde_json::from_value(params)
                     .map_err(|err| RpcErr::new("INVALID_PARAMS", err.to_string()))?;
-                self.scan_directives(parsed.snapshot_id)
+                self.scan_comments(&parsed)
             }
             _ => Err(RpcErr::new(
                 "METHOD_NOT_FOUND",
@@ -866,15 +868,15 @@ impl EngineServer {
             .map_err(|err| RpcErr::new("SERIALIZATION_ERROR", err.to_string()))
     }
 
-    fn scan_directives(&self, snapshot_id: u64) -> Result<Value, RpcErr> {
-        let Some(snapshot) = self.snapshots.get(&snapshot_id) else {
+    fn scan_comments(&self, params: &CommentsScanParams) -> Result<Value, RpcErr> {
+        let Some(snapshot) = self.snapshots.get(&params.snapshot_id) else {
             return Err(RpcErr::new(
                 "STALE_SNAPSHOT",
-                format!("Snapshot {snapshot_id} is expired or unknown."),
+                format!("Snapshot {} is expired or unknown.", params.snapshot_id),
             ));
         };
-        let directives = scan_snapshot_directives(snapshot);
-        serde_json::to_value(DirectivesScanResult { directives })
+        let comments = scan_snapshot_comments(snapshot, params.files.as_deref());
+        serde_json::to_value(CommentsScanResult { comments })
             .map_err(|err| RpcErr::new("SERIALIZATION_ERROR", err.to_string()))
     }
 

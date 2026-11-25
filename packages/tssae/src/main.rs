@@ -1,7 +1,7 @@
 mod call_effects;
 mod calls_values;
 mod cfg;
-mod directives;
+mod comments;
 mod instance_identity;
 mod native_adapter;
 mod observe;

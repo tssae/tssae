@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import {
   createAdditionalInputRegistry,
@@ -28,7 +29,11 @@ import {
   createCallsValuesQueries,
 } from "./calls-values.ts";
 import { EngineClient } from "./engine-client.ts";
-import { registerProvenance, summarizeSyntaxSnippet } from "./evidence.ts";
+import {
+  recordSyntaxLocation,
+  registerProvenance,
+  summarizeSyntaxSnippet,
+} from "./evidence.ts";
 import {
   FactCache,
   executeFactQuery,
@@ -48,7 +53,12 @@ import {
   validateInstanceBehaviors,
 } from "./instance-identity.ts";
 import { resolveNativeAdapterPackages } from "./native-adapters.ts";
-import { ObservationCollector } from "./observation.ts";
+import {
+  ObservationCollector,
+  buildRpcRequestOptions,
+  locationMatchesTarget,
+  normalizeObserveConfig,
+} from "./observation.ts";
 import {
   createPackageImplCache,
   createPackageImplQueries,
@@ -58,6 +68,7 @@ import { buildFileOrigins, resolveProjectEntries } from "./projects.ts";
 import {
   TssaeError,
   makeProgramRef,
+  type CommentKind,
   type DiagnosticLocation,
   type Evidence,
   type FindSyntaxOptions,
@@ -69,9 +80,12 @@ import {
   type ProgramObjectKind,
   type ProgramRef,
   type ProjectContext,
+  type ProjectContextOptions,
   type ProjectSession,
   type ProjectSummary,
   type RecomputationScope,
+  type ScanCommentsOptions,
+  type ScannedComment,
   type SessionUpdateOptions,
   type SyntaxKind,
   type SyntaxNodeResult,
@@ -326,6 +340,7 @@ function toSyntaxNodeResult(
     item.ref,
   );
   syntaxLocations.set(ref, item.location);
+  recordSyntaxLocation(ref, item.location);
 
   return registerProvenance(
     {
@@ -550,6 +565,40 @@ function collectInvalidatedBy(
   return reasons;
 }
 
+type EngineCommentsScanResult = {
+  readonly comments: readonly {
+    readonly kind: CommentKind;
+    readonly text: string;
+    readonly at: DiagnosticLocation;
+    readonly nextCodeLine: number | null;
+    readonly isJsx: boolean;
+  }[];
+};
+
+function normalizeScanFilePaths(
+  cwd: string,
+  files: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (files === undefined) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const rawFile of files) {
+    const slashed = rawFile.replaceAll("\\", "/").trim();
+    let rel =
+      isAbsolute(slashed) || /^[A-Za-z]:\//u.test(slashed)
+        ? relative(cwd, slashed).replaceAll("\\", "/")
+        : slashed;
+    while (rel.startsWith("./")) {
+      rel = rel.slice(2);
+    }
+    if (rel !== "" && !seen.has(rel)) {
+      seen.add(rel);
+      out.push(rel);
+    }
+  }
+  return out.toSorted();
+}
+
 function readMemoryStats(engineRssBytes?: number): MemoryStats {
   return {
     hostRssBytes: process.memoryUsage().rss,
@@ -583,11 +632,15 @@ export async function openProject(
   const client = new EngineClient();
   let openResult: EngineOpenResult;
   try {
-    openResult = await client.request<EngineOpenResult>("snapshot.open", {
-      cwd: absCwd,
-      entries: initialEntries,
-      nativeAdapters: packageResolution.nativeAdapters,
-    });
+    openResult = await client.request<EngineOpenResult>(
+      "snapshot.open",
+      {
+        cwd: absCwd,
+        entries: initialEntries,
+        nativeAdapters: packageResolution.nativeAdapters,
+      },
+      buildRpcRequestOptions(options.observe, options.onRpcMetrics),
+    );
   } catch (err) {
     await client.close();
     throw err;
@@ -597,21 +650,28 @@ export async function openProject(
   let currentSnapshotId = openResult.snapshotId;
   let currentSnapshotDigest = openResult.snapshotDigest;
   let currentProjects = openResult.projects;
+  let currentWorkspaceSourceFiles = openResult.workspaceSourceFiles;
   let currentNativeAdapters = openResult.nativeAdapters;
   let currentFileOrigins = buildFileOrigins(openResult.projects);
   let lastEngineRssBytes = openResult.engineRssBytes;
   let closed = false;
 
   const syntaxCache = new Map<string, Promise<readonly SyntaxNodeResult[]>>();
-  const typeCache = new Map<string, Promise<TypeAtResult>>();
+  const typeCache = new Map<
+    string,
+    Promise<{ readonly result: TypeAtResult; readonly gaps: readonly Gap[] }>
+  >();
   const branchListCache = new Map<string, Promise<FunctionBranchesResult>>();
   const callsValuesCache = createCallsValuesCache();
   const callEffectsCache = createCallEffectsCache();
   const instanceCache = createInstanceIdentityCache();
   const packageImplCache = createPackageImplCache();
   const factCache = new FactCache();
+  const commentScanCache = new Map<
+    string,
+    Promise<readonly ScannedComment[]>
+  >();
   const syntaxLocations = new WeakMap<SyntaxRef, DiagnosticLocation>();
-  const collector = new ObservationCollector();
 
   const explicitRegistrations: {
     readonly filePath: string;
@@ -679,6 +739,7 @@ export async function openProject(
     project: ProjectSummary,
     activeSnapshotId: number,
     models: readonly Model[],
+    contextOptions?: ProjectContextOptions,
   ): ProjectContext {
     const assertActiveSnapshot = (): void => {
       assertOpen();
@@ -690,11 +751,56 @@ export async function openProject(
       }
     };
 
-    const noopRecordGaps = (_gaps: readonly Gap[]): void => {};
+    const observer = contextOptions?.observer;
+    const normalizedObserve = normalizeObserveConfig(observer?.observe);
+    const collector = new ObservationCollector({
+      mode: normalizedObserve.mode,
+      ...(normalizedObserve.limit !== undefined
+        ? { limit: normalizedObserve.limit }
+        : {}),
+      ...(observer?.explainTarget !== undefined
+        ? { explainTarget: observer.explainTarget }
+        : {}),
+      ...(observer?.onQueryCompleted !== undefined
+        ? { onQueryCompleted: observer.onQueryCompleted }
+        : {}),
+      ...(observer?.onFactExplain !== undefined
+        ? { onFactExplain: observer.onFactExplain }
+        : {}),
+      ...(observer?.onProviderEvaluation !== undefined
+        ? { onProviderEvaluation: observer.onProviderEvaluation }
+        : {}),
+    });
+    const getRpcOptions = () =>
+      buildRpcRequestOptions(observer?.observe, observer?.onRpcMetrics);
+    const recordGaps = (gaps: readonly Gap[]): void => {
+      if (gaps.length > 0) {
+        observer?.onGaps?.(gaps);
+      }
+    };
     const scopedInputs = createScopedAdditionalInputRegistrar(
       dynamicRegistrar,
       { kind: "config" },
     );
+
+    const recordQueryEvent = (
+      op: string,
+      cacheStatus: "computed" | "reused",
+      candidateCount: number,
+      durationMs: number,
+    ): void => {
+      if (!collector.isActive()) return;
+      collector.recordQuery({
+        ruleId: "tssae-query",
+        op,
+        projectId: project.projectId,
+        provider: "engine",
+        cacheStatus,
+        candidateCount,
+        durationMs,
+        summary: `${op} -> ${candidateCount} item(s)`,
+      });
+    };
 
     const projectionQueries = createProjectionQueries({
       client,
@@ -702,7 +808,15 @@ export async function openProject(
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
       assertOpen: assertActiveSnapshot,
-      recordGaps: noopRecordGaps,
+      recordGaps,
+      getRpcOptions,
+      ...(collector.isActive()
+        ? {
+            onQueryCompleted: (op, candidateCount, durationMs) => {
+              recordQueryEvent(op, "computed", candidateCount, durationMs);
+            },
+          }
+        : {}),
     });
 
     const callsValuesQueries = createCallsValuesQueries({
@@ -714,7 +828,9 @@ export async function openProject(
       cwd: absCwd,
       sourceFiles: project.sourceFiles,
       assertOpen: assertActiveSnapshot,
-      recordGaps: noopRecordGaps,
+      recordGaps,
+      getRpcOptions,
+      ...(collector.isActive() ? { onQueryCompleted: recordQueryEvent } : {}),
     });
 
     const instanceQueries = createInstanceIdentityQueries({
@@ -727,7 +843,9 @@ export async function openProject(
       cwd: absCwd,
       sourceFiles: project.sourceFiles,
       assertOpen: assertActiveSnapshot,
-      recordGaps: noopRecordGaps,
+      recordGaps,
+      getRpcOptions,
+      ...(collector.isActive() ? { onQueryCompleted: recordQueryEvent } : {}),
     });
 
     const callEffectsQueries = createCallEffectsQueries({
@@ -740,9 +858,14 @@ export async function openProject(
       cwd: absCwd,
       sourceFiles: project.sourceFiles,
       assertOpen: assertActiveSnapshot,
-      recordGaps: noopRecordGaps,
+      recordGaps,
       resolveSyntaxLocation: (ref) => syntaxLocations.get(ref as SyntaxRef),
       syntaxLocations,
+      ...(observer?.onCleanupCovered !== undefined
+        ? { onCleanupCovered: observer.onCleanupCovered }
+        : {}),
+      getRpcOptions,
+      ...(collector.isActive() ? { onQueryCompleted: recordQueryEvent } : {}),
     });
 
     const packageImplQueries = createPackageImplQueries({
@@ -752,11 +875,62 @@ export async function openProject(
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
       assertOpen: assertActiveSnapshot,
-      recordGaps: noopRecordGaps,
+      recordGaps,
+      getRpcOptions,
+      ...(collector.isActive() ? { onQueryCompleted: recordQueryEvent } : {}),
+    });
+
+    const adapterProjectionQueries = createProjectionQueries({
+      client,
+      sessionToken,
+      snapshotId: activeSnapshotId,
+      projectId: project.projectId,
+      assertOpen: assertActiveSnapshot,
+      recordGaps: () => {},
+      getRpcOptions,
+    });
+
+    const adapterCallsValuesQueries = createCallsValuesQueries({
+      client,
+      cache: callsValuesCache,
+      sessionToken,
+      snapshotId: activeSnapshotId,
+      projectId: project.projectId,
+      cwd: absCwd,
+      sourceFiles: project.sourceFiles,
+      assertOpen: assertActiveSnapshot,
+      recordGaps: () => {},
+      getRpcOptions,
+    });
+
+    const adapterCallEffectsQueries = createCallEffectsQueries({
+      client,
+      cache: callEffectsCache,
+      models,
+      sessionToken,
+      snapshotId: activeSnapshotId,
+      projectId: project.projectId,
+      cwd: absCwd,
+      sourceFiles: project.sourceFiles,
+      assertOpen: assertActiveSnapshot,
+      recordGaps: () => {},
+      getRpcOptions,
+    });
+
+    const adapterPackageImplQueries = createPackageImplQueries({
+      client,
+      cache: packageImplCache,
+      sessionToken,
+      snapshotId: activeSnapshotId,
+      projectId: project.projectId,
+      assertOpen: assertActiveSnapshot,
+      recordGaps: () => {},
+      getRpcOptions,
     });
 
     const runFindSyntax = async (
       query: FindSyntaxOptions,
+      recordRuleQuery = true,
     ): Promise<readonly SyntaxNodeResult[]> => {
       assertActiveSnapshot();
       const cacheKey = JSON.stringify([
@@ -768,48 +942,99 @@ export async function openProject(
         query.textIncludes ? query.textIncludes.toSorted() : null,
         query.calleeNames ? query.calleeNames.toSorted() : null,
       ]);
+      const queryStart = collector.isActive() ? performance.now() : 0;
       const cached = syntaxCache.get(cacheKey);
+      let items: readonly SyntaxNodeResult[];
+      let cacheStatus: "computed" | "reused";
       if (cached) {
-        return cached;
-      }
-      const promise = client
-        .request<EngineBatchResult>("query.batch", {
-          snapshotId: activeSnapshotId,
-          projectId: project.projectId,
-          steps: [
+        cacheStatus = "reused";
+        items = await cached;
+      } else {
+        cacheStatus = "computed";
+        const promise = client
+          .request<EngineBatchResult>(
+            "query.batch",
             {
-              op: "findSyntax",
-              ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
-              ...(query.files !== undefined ? { files: query.files } : {}),
-              ...(query.range !== undefined ? { range: query.range } : {}),
-              ...(query.textIncludes !== undefined
-                ? { textIncludes: query.textIncludes }
-                : {}),
-              ...(query.calleeNames !== undefined
-                ? { calleeNames: query.calleeNames }
-                : {}),
+              snapshotId: activeSnapshotId,
+              projectId: project.projectId,
+              steps: [
+                {
+                  op: "findSyntax",
+                  ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+                  ...(query.files !== undefined ? { files: query.files } : {}),
+                  ...(query.range !== undefined ? { range: query.range } : {}),
+                  ...(query.textIncludes !== undefined
+                    ? { textIncludes: query.textIncludes }
+                    : {}),
+                  ...(query.calleeNames !== undefined
+                    ? { calleeNames: query.calleeNames }
+                    : {}),
+                },
+              ],
             },
-          ],
-        })
-        .then((batch) => {
-          const rawItems = (batch.results[0]?.items ??
-            []) as readonly EngineSyntaxItem[];
-          return rawItems.map((item) =>
-            toSyntaxNodeResult(
-              item,
-              sessionToken,
-              project.projectId,
-              activeSnapshotId,
-              syntaxLocations,
-            ),
-          );
+            getRpcOptions(),
+          )
+          .then((batch) => {
+            const rawItems = (batch.results[0]?.items ??
+              []) as readonly EngineSyntaxItem[];
+            return rawItems.map((item) =>
+              toSyntaxNodeResult(
+                item,
+                sessionToken,
+                project.projectId,
+                activeSnapshotId,
+                syntaxLocations,
+              ),
+            );
+          });
+        syntaxCache.set(cacheKey, promise);
+        items = await promise;
+      }
+
+      if (collector.isActive() && recordRuleQuery) {
+        const durationMs = performance.now() - queryStart;
+        const matchedLocations = collector.explainTarget
+          ? items
+              .filter((item) =>
+                locationMatchesTarget(item.location, collector.explainTarget!),
+              )
+              .map((item) => item.location)
+          : undefined;
+        const kindsLabel = query.kinds ? query.kinds.join(", ") : "range";
+        collector.recordQuery({
+          ruleId: "tssae-query",
+          op: "findSyntax",
+          projectId: project.projectId,
+          provider: "engine",
+          cacheStatus,
+          candidateCount: items.length,
+          durationMs,
+          summary: `findSyntax(${kindsLabel}) -> ${items.length} candidate(s)`,
+          ...(matchedLocations !== undefined ? { matchedLocations } : {}),
+          ...(collector.mode === "detail" || collector.isExplainEnabled()
+            ? {
+                detail: {
+                  ...(query.kinds !== undefined ? { kinds: query.kinds } : {}),
+                  ...(query.files !== undefined ? { files: query.files } : {}),
+                  ...(query.range !== undefined ? { range: query.range } : {}),
+                  ...(query.textIncludes !== undefined
+                    ? { textIncludes: query.textIncludes }
+                    : {}),
+                  ...(query.calleeNames !== undefined
+                    ? { calleeNames: query.calleeNames }
+                    : {}),
+                },
+              }
+            : {}),
         });
-      syntaxCache.set(cacheKey, promise);
-      return promise;
+      }
+
+      return items;
     };
 
     const runTypeAt = async (
       targets: readonly SyntaxRef[],
+      recordRuleQuery = true,
     ): Promise<readonly TypeAtResult[]> => {
       assertActiveSnapshot();
       if (targets.length === 0) return [];
@@ -828,17 +1053,25 @@ export async function openProject(
         }
       }
 
+      const queryStart = collector.isActive() ? performance.now() : 0;
+      const cacheStatus: "computed" | "reused" =
+        missingTargets.length > 0 ? "computed" : "reused";
+
       if (missingTargets.length > 0) {
-        const batchPromise = client.request<EngineBatchResult>("query.batch", {
-          snapshotId: activeSnapshotId,
-          projectId: project.projectId,
-          steps: [
-            {
-              op: "typeAtLocation",
-              targets: missingTargets.map((target) => target.handleId),
-            },
-          ],
-        });
+        const batchPromise = client.request<EngineBatchResult>(
+          "query.batch",
+          {
+            snapshotId: activeSnapshotId,
+            projectId: project.projectId,
+            steps: [
+              {
+                op: "typeAtLocation",
+                targets: missingTargets.map((target) => target.handleId),
+              },
+            ],
+          },
+          getRpcOptions(),
+        );
 
         for (const [index, target] of missingTargets.entries()) {
           const key = `${activeSnapshotId}:${project.projectId}:${target.handleId}`;
@@ -852,29 +1085,72 @@ export async function openProject(
                 `Engine omitted type result for target "${target.handleId}".`,
               );
             }
-            return toTypeAtResult(
-              raw,
-              target,
-              sessionToken,
-              project.projectId,
-              activeSnapshotId,
-            );
+            return {
+              result: toTypeAtResult(
+                raw,
+                target,
+                sessionToken,
+                project.projectId,
+                activeSnapshotId,
+              ),
+              gaps: raw.gaps ?? [],
+            };
           });
           typeCache.set(key, itemPromise);
         }
       }
 
-      return Promise.all(
+      const cachedEntries = await Promise.all(
         targets.map((target) =>
           typeCache.get(
             `${activeSnapshotId}:${project.projectId}:${target.handleId}`,
           )!,
         ),
       );
+      if (recordRuleQuery) {
+        for (const entry of cachedEntries) {
+          recordGaps(entry.gaps);
+        }
+      }
+      const results = cachedEntries.map((entry) => entry.result);
+
+      if (collector.isActive() && recordRuleQuery) {
+        const durationMs = performance.now() - queryStart;
+        const matchedLocations: DiagnosticLocation[] = [];
+        const matchedTypeTexts: string[] = [];
+        if (collector.explainTarget) {
+          for (const item of results) {
+            const loc = syntaxLocations.get(item.target);
+            if (loc && locationMatchesTarget(loc, collector.explainTarget)) {
+              matchedLocations.push(loc);
+              matchedTypeTexts.push(item.typeText);
+            }
+          }
+        }
+        collector.recordQuery({
+          ruleId: "tssae-query",
+          op: "typeAtLocation",
+          projectId: project.projectId,
+          provider: "engine",
+          cacheStatus,
+          candidateCount: results.length,
+          durationMs,
+          summary: `typeAtLocation(${targets.length} target(s))`,
+          ...(collector.explainTarget !== undefined
+            ? { matchedLocations }
+            : {}),
+          ...(matchedTypeTexts.length > 0
+            ? { detail: { matchedTypes: matchedTypeTexts } }
+            : {}),
+        });
+      }
+
+      return results;
     };
 
     const runListBranches = async (
       functions: readonly SyntaxRef[],
+      recordRuleQuery = true,
     ): Promise<readonly FunctionBranchesResult[]> => {
       assertActiveSnapshot();
       if (functions.length === 0) return [];
@@ -888,6 +1164,7 @@ export async function openProject(
         );
       }
 
+      const queryStart = collector.isActive() ? performance.now() : 0;
       const missingFunctions: SyntaxRef[] = [];
       for (const fnRef of functions) {
         const key = `${activeSnapshotId}:${project.projectId}:${fnRef.handleId}`;
@@ -895,18 +1172,24 @@ export async function openProject(
           missingFunctions.push(fnRef);
         }
       }
+      const cacheStatus: "computed" | "reused" =
+        missingFunctions.length > 0 ? "computed" : "reused";
 
       if (missingFunctions.length > 0) {
-        const batchPromise = client.request<EngineBatchResult>("query.batch", {
-          snapshotId: activeSnapshotId,
-          projectId: project.projectId,
-          steps: [
-            {
-              op: "listBranches",
-              targets: missingFunctions.map((fnRef) => fnRef.handleId),
-            },
-          ],
-        });
+        const batchPromise = client.request<EngineBatchResult>(
+          "query.batch",
+          {
+            snapshotId: activeSnapshotId,
+            projectId: project.projectId,
+            steps: [
+              {
+                op: "listBranches",
+                targets: missingFunctions.map((fnRef) => fnRef.handleId),
+              },
+            ],
+          },
+          getRpcOptions(),
+        );
 
         for (const [index, fnRef] of missingFunctions.entries()) {
           const key = `${activeSnapshotId}:${project.projectId}:${fnRef.handleId}`;
@@ -929,6 +1212,7 @@ export async function openProject(
             );
             for (const branch of mapped.branches) {
               syntaxLocations.set(branch.condition, branch.location);
+              recordSyntaxLocation(branch.condition, branch.location);
             }
             return mapped;
           });
@@ -936,17 +1220,41 @@ export async function openProject(
         }
       }
 
-      return Promise.all(
+      const results = await Promise.all(
         functions.map((fnRef) =>
           branchListCache.get(
             `${activeSnapshotId}:${project.projectId}:${fnRef.handleId}`,
           )!,
         ),
       );
+      if (recordRuleQuery) {
+        for (const item of results) {
+          recordGaps(item.gaps);
+        }
+      }
+
+      if (collector.isActive() && recordRuleQuery) {
+        collector.recordQuery({
+          ruleId: "tssae-query",
+          op: "listBranches",
+          projectId: project.projectId,
+          provider: "engine",
+          cacheStatus,
+          candidateCount: results.reduce(
+            (total, item) => total + item.branches.length,
+            0,
+          ),
+          durationMs: performance.now() - queryStart,
+          summary: `listBranches(${functions.length} function(s))`,
+        });
+      }
+
+      return results;
     };
 
     const runBranchCoverage = async (
       query: BranchCoverageOptions,
+      recordRuleQuery = true,
     ): Promise<readonly BranchCoverageItem[]> => {
       assertActiveSnapshot();
       if (query.function !== undefined && query.scope !== undefined) {
@@ -989,23 +1297,28 @@ export async function openProject(
       }
       if (query.targets.length === 0) return [];
 
-      const batch = await client.request<EngineBatchResult>("query.batch", {
-        snapshotId: activeSnapshotId,
-        projectId: project.projectId,
-        steps: [
-          {
-            op: "branchCoverage",
-            ...(query.function !== undefined
-              ? { function: query.function.handleId }
-              : {}),
-            ...(query.scope !== undefined
-              ? { scope: query.scope.handleId }
-              : {}),
-            branches: query.branches.map((branch) => branch.handleId),
-            targets: query.targets.map((target) => target.handleId),
-          },
-        ],
-      });
+      const queryStart = collector.isActive() ? performance.now() : 0;
+      const batch = await client.request<EngineBatchResult>(
+        "query.batch",
+        {
+          snapshotId: activeSnapshotId,
+          projectId: project.projectId,
+          steps: [
+            {
+              op: "branchCoverage",
+              ...(query.function !== undefined
+                ? { function: query.function.handleId }
+                : {}),
+              ...(query.scope !== undefined
+                ? { scope: query.scope.handleId }
+                : {}),
+              branches: query.branches.map((branch) => branch.handleId),
+              targets: query.targets.map((target) => target.handleId),
+            },
+          ],
+        },
+        getRpcOptions(),
+      );
 
       const rawItems = (batch.results[0]?.items ??
         []) as readonly EngineBranchCoverageItem[];
@@ -1018,8 +1331,26 @@ export async function openProject(
             `Engine omitted branchCoverage result for target "${targetRef.handleId}".`,
           );
         }
-        results.push(toBranchCoverageItem(raw, targetRef));
+        const mapped = toBranchCoverageItem(raw, targetRef);
+        if (recordRuleQuery) {
+          recordGaps(mapped.gaps);
+        }
+        results.push(mapped);
       }
+
+      if (collector.isActive() && recordRuleQuery) {
+        collector.recordQuery({
+          ruleId: "tssae-query",
+          op: "branchCoverage",
+          projectId: project.projectId,
+          provider: "engine",
+          cacheStatus: "computed",
+          candidateCount: results.length,
+          durationMs: performance.now() - queryStart,
+          summary: `branchCoverage(${query.branches.length} branch(es), ${query.targets.length} target(s))`,
+        });
+      }
+
       return results;
     };
 
@@ -1037,15 +1368,17 @@ export async function openProject(
         project,
         models,
         getModel: (id: string) => models.find((model) => model.id === id),
-        ...projectionQueries,
-        ...callsValuesQueries,
-        ...packageImplQueries,
-        ...callEffectsQueries,
+        ...adapterProjectionQueries,
+        ...adapterCallsValuesQueries,
+        ...adapterPackageImplQueries,
+        ...adapterCallEffectsQueries,
         facts,
-        findSyntax: runFindSyntax,
-        typeAt: runTypeAt,
-        listBranches: runListBranches,
-        branchCoverage: runBranchCoverage,
+        findSyntax: (query: FindSyntaxOptions) => runFindSyntax(query, false),
+        typeAt: (targets: readonly SyntaxRef[]) => runTypeAt(targets, false),
+        listBranches: (functions: readonly SyntaxRef[]) =>
+          runListBranches(functions, false),
+        branchCoverage: (query: BranchCoverageOptions) =>
+          runBranchCoverage(query, false),
         extractEngineFacts: async <
           SubjectKind extends ProgramObjectKind,
           Condition = unknown,
@@ -1066,32 +1399,37 @@ export async function openProject(
             );
           }
 
-          const explainMode = extractOptions.explain ?? false;
-          const batch = await client.request<EngineBatchResult>("query.batch", {
-            snapshotId: activeSnapshotId,
-            projectId: project.projectId,
-            steps: [
-              {
-                op: "extractFacts",
-                factTypeId: extractOptions.factTypeId,
-                providerId: extractOptions.providerId,
-                ...(extractOptions.reportProviderId !== undefined
-                  ? { reportProviderId: extractOptions.reportProviderId }
-                  : {}),
-                ...(extractOptions.targets !== undefined
-                  ? {
-                      targets: extractOptions.targets.map(
-                        (target) => target.handleId,
-                      ),
-                    }
-                  : {}),
-                ...(extractOptions.condition !== undefined
-                  ? { condition: extractOptions.condition }
-                  : {}),
-                ...(explainMode ? { explain: true } : {}),
-              },
-            ],
-          });
+          const explainMode =
+            extractOptions.explain ?? collector.isExplainEnabled();
+          const batch = await client.request<EngineBatchResult>(
+            "query.batch",
+            {
+              snapshotId: activeSnapshotId,
+              projectId: project.projectId,
+              steps: [
+                {
+                  op: "extractFacts",
+                  factTypeId: extractOptions.factTypeId,
+                  providerId: extractOptions.providerId,
+                  ...(extractOptions.reportProviderId !== undefined
+                    ? { reportProviderId: extractOptions.reportProviderId }
+                    : {}),
+                  ...(extractOptions.targets !== undefined
+                    ? {
+                        targets: extractOptions.targets.map(
+                          (target) => target.handleId,
+                        ),
+                      }
+                    : {}),
+                  ...(extractOptions.condition !== undefined
+                    ? { condition: extractOptions.condition }
+                    : {}),
+                  ...(explainMode ? { explain: true } : {}),
+                },
+              ],
+            },
+            getRpcOptions(),
+          );
 
           const rawItems = (batch.results[0]?.items ?? []) as readonly {
             readonly subject: string;
@@ -1136,6 +1474,7 @@ export async function openProject(
             );
             if (item.subjectLocation !== undefined) {
               syntaxLocations.set(ref, item.subjectLocation);
+              recordSyntaxLocation(ref, item.subjectLocation);
             }
             return {
               subject: ref as unknown as ProgramRef<SubjectKind>,
@@ -1183,10 +1522,12 @@ export async function openProject(
       ...callEffectsQueries,
       ...instanceQueries,
       ...packageImplQueries,
-      findSyntax: runFindSyntax,
-      typeAt: runTypeAt,
-      listBranches: runListBranches,
-      branchCoverage: runBranchCoverage,
+      findSyntax: (query: FindSyntaxOptions) => runFindSyntax(query, true),
+      typeAt: (targets: readonly SyntaxRef[]) => runTypeAt(targets, true),
+      listBranches: (functions: readonly SyntaxRef[]) =>
+        runListBranches(functions, true),
+      branchCoverage: (query: BranchCoverageOptions) =>
+        runBranchCoverage(query, true),
       facts: <SubjectKind extends ProgramObjectKind, Condition, Value>(
         factType: FactType<SubjectKind, Condition, Value>,
         factOptions?: FactQueryOptions<SubjectKind, Condition>,
@@ -1203,7 +1544,7 @@ export async function openProject(
           assertActiveSnapshot,
           createAdapterContext,
           replayAdapterAdditionalInput,
-          recordGaps: noopRecordGaps,
+          recordGaps,
           collector,
           syntaxLocations,
         }),
@@ -1268,6 +1609,7 @@ export async function openProject(
     instanceCache.clear();
     packageImplCache.clear();
     factCache.clear();
+    commentScanCache.clear();
     try {
       await client.request("snapshot.release", {
         snapshotId: currentSnapshotId,
@@ -1292,6 +1634,9 @@ export async function openProject(
     get fileOrigins() {
       return currentFileOrigins;
     },
+    get workspaceSourceFiles() {
+      return currentWorkspaceSourceFiles;
+    },
     get additionalInputs(): readonly AdditionalInputEntry[] {
       return sessionRegistry.listAdditionalInputs();
     },
@@ -1311,13 +1656,51 @@ export async function openProject(
         ),
       );
     },
-    project: (target?: string | ProjectSummary): ProjectContext => {
+    project: (
+      target?: string | ProjectSummary,
+      contextOptions?: ProjectContextOptions,
+    ): ProjectContext => {
       const resolved = resolveProjectTarget(target);
       return createProjectContext(
         resolved,
         currentSnapshotId,
         normalizedConfig.models,
+        contextOptions,
       );
+    },
+    scanComments: async (
+      scanOptions?: ScanCommentsOptions,
+    ): Promise<readonly ScannedComment[]> => {
+      assertOpen();
+      const files = normalizeScanFilePaths(absCwd, scanOptions?.files);
+      if (files !== undefined && files.length === 0) {
+        return [];
+      }
+      const rpcOptions = buildRpcRequestOptions(
+        scanOptions?.observe,
+        scanOptions?.onRpcMetrics,
+      );
+      const snapshotId = currentSnapshotId;
+      const cacheKey = `${snapshotId}:${files ? JSON.stringify(files) : "*"}`;
+      const cached =
+        rpcOptions === undefined ? commentScanCache.get(cacheKey) : undefined;
+      if (cached) {
+        return cached;
+      }
+      const promise = client
+        .request<EngineCommentsScanResult>(
+          "comments.scan",
+          {
+            snapshotId,
+            ...(files !== undefined ? { files } : {}),
+          },
+          rpcOptions,
+        )
+        .then((res) => res.comments);
+      if (rpcOptions === undefined) {
+        commentScanCache.set(cacheKey, promise);
+      }
+      return promise;
     },
     registerAdditionalInput: (
       filePath: string,
@@ -1367,6 +1750,10 @@ export async function openProject(
             ? { nativeAdapters: nextPackageResolution.nativeAdapters }
             : {}),
         },
+        buildRpcRequestOptions(
+          updateOptions?.observe,
+          updateOptions?.onRpcMetrics,
+        ),
       );
 
       const invalidatedBy = collectInvalidatedBy(
@@ -1384,6 +1771,7 @@ export async function openProject(
       currentSnapshotId = updated.snapshotId;
       currentSnapshotDigest = updated.snapshotDigest;
       currentProjects = updated.projects;
+      currentWorkspaceSourceFiles = updated.workspaceSourceFiles;
       currentNativeAdapters = updated.nativeAdapters;
       currentFileOrigins = updatedFileOrigins;
       lastEngineRssBytes = updated.engineRssBytes;
@@ -1395,6 +1783,7 @@ export async function openProject(
       instanceCache.clear();
       packageImplCache.clear();
       factCache.clear();
+      commentScanCache.clear();
       sessionRegistry = buildSessionRegistry(
         nextConfig.additionalInputs,
         explicitRegistrations,
@@ -1416,6 +1805,7 @@ export async function openProject(
         snapshotId: updated.snapshotId,
         projects: updated.projects,
         fileOrigins: updatedFileOrigins,
+        workspaceSourceFiles: updated.workspaceSourceFiles,
         additionalInputs: updatedAdditionalInputs,
         recomputation,
         memory: readMemoryStats(updated.engineRssBytes),

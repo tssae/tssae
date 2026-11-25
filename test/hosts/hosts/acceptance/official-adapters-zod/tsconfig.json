@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "erasableSyntaxOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "noEmit": true,
+    "paths": {
+      "@acceptance-host/db": ["./packages/db/src/index.ts"]
+    }
+  },
+  "include": ["packages/db/src/**/*.ts", "packages/app/src/**/*.ts"]
+}

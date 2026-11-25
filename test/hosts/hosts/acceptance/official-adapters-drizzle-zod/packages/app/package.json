@@ -1,0 +1,11 @@
+{
+  "name": "@acceptance-host/app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@acceptance-host/db": "workspace:*",
+    "drizzle-orm": "0.45.3",
+    "zod": "^4.6.7"
+  }
+}

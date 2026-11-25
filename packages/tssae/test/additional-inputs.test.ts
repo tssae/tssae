@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { symlinkSync } from "node:fs";
 import { describe, it } from "node:test";
 
-import { withTempHost } from "@verule/test-hosts";
+import { withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   createAdditionalInputRegistry,

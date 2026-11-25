@@ -7,7 +7,7 @@ import {
   linkNodeModulesPackage,
   type PreparedTempHost,
   withTempHost,
-} from "@verule/test-hosts";
+} from "@tssae/test-hosts";
 import {
   defineModel,
   isSameInstance,

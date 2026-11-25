@@ -1,5 +1,5 @@
 {
-  "extends": "@verule/tooling-config/node.json",
+  "extends": "@tssae/tooling-config/node.json",
   "compilerOptions": {
     "types": ["node"],
     "composite": false,

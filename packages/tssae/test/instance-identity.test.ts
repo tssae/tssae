@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import {
-  copyDirectory,
-  resolveHostDir,
-  withTempHost,
-} from "@verule/test-hosts";
+import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   defineModel,

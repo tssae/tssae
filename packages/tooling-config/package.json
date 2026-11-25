@@ -1,5 +1,5 @@
 {
-  "name": "@verule/tooling-config",
+  "name": "@tssae/tooling-config",
   "version": "0.0.0",
   "private": true,
   "type": "module",

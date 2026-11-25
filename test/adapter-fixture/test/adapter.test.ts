@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { withTempHost, type SyntheticPackageSpec } from "@verule/test-hosts";
+import { withTempHost, type SyntheticPackageSpec } from "@tssae/test-hosts";
 import {
   TssaeError,
   defineFactType,

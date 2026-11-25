@@ -19,8 +19,8 @@
   },
   "devDependencies": {
     "@changesets/cli": "catalog:",
+    "@tssae/tooling-config": "workspace:./packages/tooling-config",
     "@types/node": "catalog:",
-    "@verule/tooling-config": "workspace:./packages/tooling-config",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "tsrs": "catalog:",

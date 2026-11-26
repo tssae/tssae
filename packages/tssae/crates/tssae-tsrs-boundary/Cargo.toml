@@ -14,7 +14,9 @@ tsrs_ast = "=7.1.0-beta.tsrs4"
 tsrs_checker = "=7.1.0-beta.tsrs4"
 tsrs_compiler = "=7.1.0-beta.tsrs4"
 tsrs_core = "=7.1.0-beta.tsrs4"
+tsrs_module = "=7.1.0-beta.tsrs4"
 tsrs_scanner = "=7.1.0-beta.tsrs4"
+tsrs_sourcemap = "=7.1.0-beta.tsrs4"
 
 [lints]
 workspace = true

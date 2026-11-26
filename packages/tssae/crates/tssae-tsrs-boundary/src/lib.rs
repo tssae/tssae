@@ -4,8 +4,15 @@
 //! comment scanning, and [`semantic_facade::SemanticFacade`] for symbols, types,
 //! signatures, assignability, and module/project-reference mapping.
 
+pub mod impl_resolution;
 pub mod semantic_facade;
 pub mod syntax_view;
+
+pub use impl_resolution::{
+    DeclarationProvenance, FacadeImplementationInput, FacadeImplementationOutcome,
+    FacadeImplementationTarget, FirstPartyResolutionSource, SourceMapCache,
+    is_first_party_source_file, is_first_party_workspace_path,
+};
 
 pub use semantic_facade::{
     FacadeAssignability, FacadeCallProjection, FacadeCallSelect, FacadeDeclarationResolution,

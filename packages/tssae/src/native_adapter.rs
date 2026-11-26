@@ -1012,12 +1012,9 @@ impl SnapshotAdapterHost<'_> {
     fn read_declaration_info(&mut self, node: P<Node>) -> Option<DeclarationInfo> {
         resolve_decl_raw(self.checker, node).map(|(name, declaration)| {
             let source_file = get_source_file_of_node(declaration);
-            let provenance = crate::package_impl::resolve_declaration_provenance(
-                self.program,
-                self.checker,
-                node,
-                declaration,
-            );
+            let provenance =
+                tssae_tsrs_boundary::SemanticFacade::new(&self.cwd, self.program, self.checker)
+                    .resolve_declaration_provenance(node, declaration);
             let syntax = can_follow_declaration(&self.cwd, declaration)
                 .then(|| self.table.handle(declaration));
             DeclarationInfo {

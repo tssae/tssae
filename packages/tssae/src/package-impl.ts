@@ -3,57 +3,87 @@ import { performance } from "node:perf_hooks";
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { registerProvenance } from "./evidence.ts";
 import { validateProgramRefs } from "./projection.ts";
-import type {
-  CallRef,
-  DeclarationRef,
-  DiagnosticLocation,
-  Evidence,
-  Gap,
-  SyntaxRef,
+import {
+  makeProgramRef,
+  type CallRef,
+  type DeclarationRef,
+  type DiagnosticLocation,
+  type Evidence,
+  type Gap,
+  type SyntaxRef,
 } from "./types.ts";
 
-export type PackageResolutionMode = "import" | "require" | "unknown";
-
-export type ImplementationStatus =
-  | "source"
-  | "resolved"
-  | "declaration-only"
-  | "missing-package"
-  | "ambiguous"
-  | "unimplemented";
+export type FirstPartyResolutionSource =
+  | "current-project"
+  | "project-reference"
+  | "custom-conditions"
+  | "declaration-map";
 
 export type ImplementationTargetRef = CallRef | DeclarationRef | SyntaxRef;
 
 export type ResolvedImplementationTarget = {
   readonly file: string;
-  readonly location: DiagnosticLocation | null;
+  readonly location: DiagnosticLocation;
+  readonly declaration: DeclarationRef;
   readonly exportName: string | null;
-  readonly isExternal: boolean;
   readonly packageName: string | null;
-  readonly packageVersion: string | null;
-  readonly subpath: string | null;
-  readonly resolutionMode: PackageResolutionMode;
-  readonly conditions: readonly string[];
+  readonly resolutionSource: FirstPartyResolutionSource;
   readonly declarationFile: string | null;
 };
 
 export type ImplementationResolutionResult = {
   readonly target: ImplementationTargetRef;
-  readonly status: ImplementationStatus;
-  readonly implementation: ResolvedImplementationTarget | null;
-  readonly candidates: readonly ResolvedImplementationTarget[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
+} & (
+  | {
+      readonly status: "resolved";
+      readonly implementation: ResolvedImplementationTarget;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "external";
+      readonly packageName: string | null;
+      readonly declarationFile: string | null;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly declarationFile: string | null;
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
+
+export type RawResolvedImplementationTarget = {
+  readonly file: string;
+  readonly location: DiagnosticLocation;
+  readonly declaration: string;
+  readonly exportName: string | null;
+  readonly packageName: string | null;
+  readonly resolutionSource: FirstPartyResolutionSource;
+  readonly declarationFile: string | null;
 };
 
-type RawImplementationResolutionRow = {
-  readonly target: string;
-  readonly status: ImplementationStatus;
-  readonly implementation: ResolvedImplementationTarget | null;
-  readonly candidates: readonly ResolvedImplementationTarget[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+type RawImplementationResolutionRow =
+  | {
+      readonly target: string;
+      readonly status: "resolved";
+      readonly implementation: RawResolvedImplementationTarget;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly target: string;
+      readonly status: "external";
+      readonly packageName: string | null;
+      readonly declarationFile: string | null;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly target: string;
+      readonly status: "inconclusive";
+      readonly declarationFile: string | null;
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    };
 
 type EngineBatchResult = {
   readonly results: readonly {
@@ -73,6 +103,30 @@ export function createPackageImplCache(): PackageImplCache {
     clear: () => {
       implCache.clear();
     },
+  };
+}
+
+/** Converts an engine-serialized implementation target into a typed SDK object. */
+export function mapRawImplementationTarget(
+  raw: RawResolvedImplementationTarget,
+  sessionToken: symbol,
+  projectId: string,
+  snapshotId: number,
+): ResolvedImplementationTarget {
+  return {
+    file: raw.file,
+    location: raw.location,
+    declaration: makeProgramRef(
+      "declaration",
+      sessionToken,
+      projectId,
+      snapshotId,
+      raw.declaration,
+    ),
+    exportName: raw.exportName,
+    packageName: raw.packageName,
+    resolutionSource: raw.resolutionSource,
+    declarationFile: raw.declarationFile,
   };
 }
 
@@ -152,17 +206,35 @@ export function createPackageImplQueries(deps: {
                 `Engine omitted resolveImplementations result for "${target.handleId}".`,
               );
             }
-            return registerProvenance(
-              {
-                target,
-                status: raw.status,
-                implementation: raw.implementation,
-                candidates: raw.candidates,
-                evidence: raw.evidence,
-                gaps: raw.gaps,
-              },
-              raw.evidence,
-            );
+            const result: ImplementationResolutionResult =
+              raw.status === "resolved"
+                ? {
+                    target,
+                    status: "resolved",
+                    implementation: mapRawImplementationTarget(
+                      raw.implementation,
+                      sessionToken,
+                      projectId,
+                      snapshotId,
+                    ),
+                    evidence: raw.evidence,
+                  }
+                : raw.status === "external"
+                  ? {
+                      target,
+                      status: "external",
+                      packageName: raw.packageName,
+                      declarationFile: raw.declarationFile,
+                      evidence: raw.evidence,
+                    }
+                  : {
+                      target,
+                      status: "inconclusive",
+                      declarationFile: raw.declarationFile,
+                      gaps: raw.gaps,
+                      evidence: raw.evidence,
+                    };
+            return registerProvenance(result, raw.evidence);
           });
           cache.implCache.set(key, rowPromise);
         }
@@ -174,11 +246,13 @@ export function createPackageImplQueries(deps: {
         ),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.status === "inconclusive") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {
-        const count = results.filter((r) => r.implementation !== null).length;
+        const count = results.filter((r) => r.status === "resolved").length;
         onQueryCompleted(
           "resolveImplementations",
           cacheStatus,

@@ -1382,7 +1382,23 @@ impl SemanticFacade<'_> {
             Some(unwrap_expr_wrappers(node))
         };
 
-        let resolved = resolve_symbol_for_node(self.checker_mut(), node);
+        let resolved = {
+            let initial = resolve_symbol_for_node(self.checker_mut(), node);
+            if initial.primary_decl.is_none() && node.kind() == Kind::BinaryExpression {
+                let bin = node.as_binary_expression();
+                let lhs = unwrap_expr_wrappers(bin.left());
+                if matches!(
+                    lhs.kind(),
+                    Kind::PropertyAccessExpression | Kind::ElementAccessExpression
+                ) {
+                    resolve_symbol_for_node(self.checker_mut(), lhs)
+                } else {
+                    initial
+                }
+            } else {
+                initial
+            }
+        };
         let sig_decl = if matches!(
             node.kind(),
             Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression

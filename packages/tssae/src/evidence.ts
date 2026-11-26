@@ -7,6 +7,7 @@ import type {
   CallbackInvocationInfo,
   CleanupSiteInfo,
   FieldEffect,
+  ImplicitExceptionCleanupOutcome,
   TargetInstanceCleanupResult,
 } from "./call-effects.ts";
 import type {
@@ -59,6 +60,7 @@ export type SelectableQueryResult =
   | ResolvedInstanceInfo
   | InstanceResolutionResult
   | TargetInstanceCleanupResult
+  | ImplicitExceptionCleanupOutcome
   | CleanupSiteInfo
   | ImplementationResolutionResult
   | SyntaxNodeResult

@@ -5150,6 +5150,10 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         call_v
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Unwraps LHS expression wrappers and lowers property, element, or variable assignment targets."
+    )]
     fn prepare_assign_target(
         &mut self,
         node: P<Node>,
@@ -5158,8 +5162,22 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         out_val: ValueId,
         next: VertexId,
     ) -> (AssignTargetPrefix, VertexId) {
-        if left.kind() == Kind::PropertyAccessExpression {
-            let pa = left.as_property_access_expression();
+        let mut wrappers = Vec::new();
+        let mut unwrapped_left = left;
+        while matches!(
+            unwrapped_left.kind(),
+            Kind::ParenthesizedExpression
+                | Kind::NonNullExpression
+                | Kind::AsExpression
+                | Kind::TypeAssertionExpression
+                | Kind::SatisfiesExpression
+        ) {
+            wrappers.push(unwrapped_left);
+            unwrapped_left = unwrap_one_wrapper(unwrapped_left);
+        }
+
+        if unwrapped_left.kind() == Kind::PropertyAccessExpression {
+            let pa = unwrapped_left.as_property_access_expression();
             let base = pa.expression();
             let name_node = pa.name();
             let key_name = node_text(name_node).unwrap_or_default();
@@ -5171,7 +5189,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             let is_super = base.kind() == Kind::SuperKeyword;
             let implicit_call_kind = self
                 .bridge
-                .is_some_and(|b| b.has_set_accessor(left))
+                .is_some_and(|b| b.has_set_accessor(unwrapped_left))
                 .then_some(ImplicitAccessorKind::Setter);
             let setter_call_v = if implicit_call_kind == Some(ImplicitAccessorKind::Setter) {
                 let cv = self.new_vertex(
@@ -5209,7 +5227,10 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             self.add_edge(assign_v, write_next, ExplicitEdgeKind::Fallthrough);
             let map_v = setter_call_v.unwrap_or(assign_v);
             self.bind_expr_maps(node, map_v, out_val);
-            self.bind_expr_maps(left, map_v, out_val);
+            self.bind_expr_maps(unwrapped_left, map_v, out_val);
+            for w in wrappers {
+                self.bind_expr_maps(w, map_v, out_val);
+            }
             return (
                 AssignTargetPrefix::Prop {
                     base,
@@ -5220,8 +5241,8 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             );
         }
 
-        if left.kind() == Kind::ElementAccessExpression {
-            let ea = left.as_element_access_expression();
+        if unwrapped_left.kind() == Kind::ElementAccessExpression {
+            let ea = unwrapped_left.as_element_access_expression();
             let base = ea.expression();
             let arg = ea.argument_expression();
             let is_super = base.kind() == Kind::SuperKeyword;
@@ -5245,7 +5266,10 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             self.attach_may_throw(assign_v, node, MayThrowReason::PropertyAccess);
             self.add_edge(assign_v, next, ExplicitEdgeKind::Fallthrough);
             self.bind_expr_maps(node, assign_v, out_val);
-            self.bind_expr_maps(left, assign_v, out_val);
+            self.bind_expr_maps(unwrapped_left, assign_v, out_val);
+            for w in wrappers {
+                self.bind_expr_maps(w, assign_v, out_val);
+            }
             return (
                 AssignTargetPrefix::Element {
                     base,
@@ -5256,8 +5280,11 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             );
         }
 
-        let assign_v = self.build_assign_target_vertex(node, left, op, out_val, next);
-        (AssignTargetPrefix::Other(left), assign_v)
+        let assign_v = self.build_assign_target_vertex(node, unwrapped_left, op, out_val, next);
+        for w in wrappers {
+            self.bind_expr_maps(w, assign_v, out_val);
+        }
+        (AssignTargetPrefix::Other(unwrapped_left), assign_v)
     }
 
     fn lower_assign_target_prefix(

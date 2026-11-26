@@ -18,8 +18,8 @@ use tssae_analysis::{
 use tssae_common::{
     DeclarationIdentity, DeclarationSummaryData, DiagnosticLocation, FileId, GapItem,
     ImplementationFact, ImplementationSourceKind, MemberTargetHierarchy, SemanticModel,
-    SignatureId, SummaryLookupStats, SummarySource, SymbolId, SyntaxCatalog, SyntaxId, TypeId,
-    TypeSummaryData, UnknownReason,
+    SignatureId, SummaryLookupStats, SummarySource, SymbolId, SyntaxCatalog, SyntaxId,
+    SyntaxScopeInfo, TypeId, TypeSummaryData, UnknownReason, WriteSyntaxInfo,
 };
 use tssae_tsrs_boundary::{FirstPartyResolutionSource, SemanticModelBridge, normalize_path};
 
@@ -294,6 +294,18 @@ impl SemanticModel for SnapshotIrEnv<'_> {
 
     fn declaration_identity(&self, syntax: SyntaxId) -> Option<DeclarationIdentity> {
         self.semantic.declaration_identity(syntax)
+    }
+
+    fn syntax_scope_info(&self, syntax: SyntaxId) -> Option<SyntaxScopeInfo> {
+        self.semantic.syntax_scope_info(syntax)
+    }
+
+    fn branch_statement_syntax(&self, condition_syntax: SyntaxId) -> Option<SyntaxId> {
+        self.semantic.branch_statement_syntax(condition_syntax)
+    }
+
+    fn write_syntax_info(&self, write_syntax: SyntaxId) -> Option<WriteSyntaxInfo> {
+        self.semantic.write_syntax_info(write_syntax)
     }
 
     fn record_summary_lookup(&self, source: Option<SummarySource>) {

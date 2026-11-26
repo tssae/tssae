@@ -5,10 +5,10 @@ use tssae_common::{
     BehaviorSummaryEntry, CallAspectSummary, CallbackCardinality, CallbackTiming,
     DeclarationIdentity, EffectAspectSummary, ForwardCallMode, ForwardCallReceiver,
     ForwardCallSpec, ForwardCallTarget, InstanceAspectSummary, InstanceOutcome, InvokeCallbackSpec,
-    SummaryAspectKind, SummaryCompleteness, SummaryConfigPayload, SummaryConflictError,
-    SummaryConflictParty, SummaryNamedValueRef, SummarySlotRef, SummarySource,
-    SummaryTaggedValueRef, SummaryTargetMatcher, SummaryThisArg, SummaryThisUndefined,
-    SummaryValueRef, ValueAspectSummary, ValueFlowSpec,
+    ResourceOpSpec, SummaryAspectKind, SummaryCompleteness, SummaryConfigPayload,
+    SummaryConflictError, SummaryConflictParty, SummaryNamedValueRef, SummarySlotRef,
+    SummarySource, SummaryTaggedValueRef, SummaryTargetMatcher, SummaryThisArg,
+    SummaryThisUndefined, SummaryValueRef, ValueAspectSummary, ValueFlowSpec,
 };
 
 #[derive(Clone, Debug)]
@@ -1367,6 +1367,26 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
             mutates_receiver: Some(true),
         }),
     ));
+
+    for (iface, sym_key) in [
+        ("Disposable", "[Symbol.dispose]"),
+        ("AsyncDisposable", "[Symbol.asyncDispose]"),
+    ] {
+        entries.push(mk_entry(
+            &format!("builtin:{iface}.prototype.{sym_key}"),
+            &[iface, "prototype", sym_key],
+            None,
+            None,
+            None,
+            Some(EffectAspectSummary {
+                completeness: SummaryCompleteness::Complete,
+                resource_ops: vec![ResourceOpSpec::DisposesTarget {
+                    target: SummarySlotRef::Receiver(ForwardCallReceiver::Receiver),
+                }],
+                mutates_receiver: Some(true),
+            }),
+        ));
+    }
 
     entries
 }

@@ -3,17 +3,20 @@ use std::cell::RefCell;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use tsrs_ast::{Kind, Node, SourceFile, Symbol, SymbolFlags, get_source_file_of_node};
-use tsrs_checker::{LiteralValue, Signature, Type, TypeDataTag, TypeFlags, TypeFormatFlags};
+use tsrs_checker::{
+    LiteralValue, Signature, Type, TypeDataTag, TypeFlags, TypeFormatFlags, TypePredicateKind,
+};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, resolve_project_reference_path};
+use tssae_analysis::ir::{ImplicitAccessorKind, TypeGuardSemantics};
 use tssae_common::{
-    DeclarationSummaryData, DiagnosticLocation, GapItem, SemanticModel, SignatureId, SymbolId,
-    SyntaxId, TypeId, TypeSummaryData, UnknownReason,
+    DeclarationSummaryData, DiagnosticLocation, FileId, GapItem, SemanticModel, SignatureId,
+    SymbolId, SyntaxId, TypeId, TypeSummaryData, UnknownReason,
 };
 
 use crate::syntax_view::{
-    SyntaxCatalogBridge, is_project_source_file, node_location, node_location_relative,
-    relative_to_cwd, resolve_against_cwd, slice_source_text,
+    FileSyntaxIndex, SyntaxCatalogBridge, is_project_source_file, node_location,
+    node_location_relative, relative_to_cwd, resolve_against_cwd, slice_source_text,
 };
 
 /// Parameter index selector forwarded from projection queries.
@@ -708,6 +711,7 @@ pub struct SemanticModelBridge<'a> {
     program: &'static Program,
     checker: RefCell<&'a mut CheckerHandle>,
     syntax: RefCell<SyntaxCatalogBridge>,
+    file_index: Option<(&'a FileSyntaxIndex, FileId)>,
     symbols: RefCell<FxHashMap<SymbolId, P<Symbol>>>,
     symbol_ids: RefCell<FxHashMap<P<Symbol>, SymbolId>>,
     types: RefCell<InternedTypeMap>,
@@ -724,6 +728,7 @@ impl<'a> SemanticModelBridge<'a> {
             program,
             checker: RefCell::new(checker),
             syntax: RefCell::new(SyntaxCatalogBridge::new(cwd)),
+            file_index: None,
             symbols: RefCell::new(FxHashMap::default()),
             symbol_ids: RefCell::new(FxHashMap::default()),
             types: RefCell::new(FxHashMap::default()),
@@ -734,12 +739,121 @@ impl<'a> SemanticModelBridge<'a> {
     }
 
     #[must_use]
+    pub fn with_file_index(
+        cwd: &'a str,
+        program: &'static Program,
+        checker: &'a mut CheckerHandle,
+        file_index: &'a FileSyntaxIndex,
+    ) -> Self {
+        let mut bridge = Self::new(cwd, program, checker);
+        bridge.file_index = Some((file_index, file_index.file_id));
+        bridge
+    }
+
+    #[must_use]
     pub const fn cwd(&self) -> &'a str {
         self.cwd
     }
 
     pub fn intern_syntax(&self, node: P<Node>) -> Option<SyntaxId> {
+        if let Some((index, _)) = self.file_index
+            && let Some(sid) = index.syntax_id_for_node(node)
+        {
+            return Some(sid);
+        }
         self.syntax.borrow_mut().intern_node(node)
+    }
+
+    #[must_use]
+    pub fn symbol_for_node_raw(&self, node: P<Node>) -> Option<P<Symbol>> {
+        let mut checker = self.checker.borrow_mut();
+        resolve_symbol_for_node(&mut checker, node).symbol
+    }
+
+    #[must_use]
+    pub fn property_accessor_flags(&self, node: P<Node>) -> Option<ImplicitAccessorKind> {
+        let mut checker = self.checker.borrow_mut();
+        let sym = checker
+            .get_symbol_at_location_exported(node)
+            .or_else(|| {
+                node.name()
+                    .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
+            })
+            .map(|s| unwrap_aliased_symbol(&mut checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol())?;
+        drop(checker);
+        let flags = sym.flags();
+        if flags.intersects(SymbolFlags::GetAccessor) {
+            Some(ImplicitAccessorKind::Getter)
+        } else if flags.intersects(SymbolFlags::SetAccessor) {
+            Some(ImplicitAccessorKind::Setter)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn has_get_accessor(&self, node: P<Node>) -> bool {
+        let mut checker = self.checker.borrow_mut();
+        checker
+            .get_symbol_at_location_exported(node)
+            .or_else(|| {
+                node.name()
+                    .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
+            })
+            .map(|s| unwrap_aliased_symbol(&mut checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol())
+            .is_some_and(|s| s.flags().intersects(SymbolFlags::GetAccessor))
+    }
+
+    #[must_use]
+    pub fn has_set_accessor(&self, node: P<Node>) -> bool {
+        let mut checker = self.checker.borrow_mut();
+        checker
+            .get_symbol_at_location_exported(node)
+            .or_else(|| {
+                node.name()
+                    .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
+            })
+            .map(|s| unwrap_aliased_symbol(&mut checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol())
+            .is_some_and(|s| s.flags().intersects(SymbolFlags::SetAccessor))
+    }
+
+    #[must_use]
+    pub fn type_guard_for_function(&self, fn_node: P<Node>) -> Option<TypeGuardSemantics> {
+        let mut checker = self.checker.borrow_mut();
+        let sig = checker.get_signature_from_declaration_exported(fn_node);
+        if is_unresolved_signature(&mut checker, sig) {
+            return None;
+        }
+        let pred = checker.get_type_predicate_of_signature_exported(sig)?;
+        let narrowed_type_text = pred.type_().map(|ty| {
+            checker.type_to_string_ex_exported(ty, Some(fn_node), TypeFormatFlags::None, None)
+        });
+        drop(checker);
+        match pred.kind() {
+            TypePredicateKind::This => Some(TypeGuardSemantics::ThisPredicate {
+                is_asserts: false,
+                narrowed_type_text,
+            }),
+            TypePredicateKind::AssertsThis => Some(TypeGuardSemantics::ThisPredicate {
+                is_asserts: true,
+                narrowed_type_text,
+            }),
+            TypePredicateKind::Identifier => Some(TypeGuardSemantics::ParamPredicate {
+                param_index: pred.parameter_index().unwrap_or(0),
+                param_name: pred.parameter_name().to_string(),
+                is_asserts: false,
+                narrowed_type_text,
+            }),
+            TypePredicateKind::AssertsIdentifier => Some(TypeGuardSemantics::ParamPredicate {
+                param_index: pred.parameter_index().unwrap_or(0),
+                param_name: pred.parameter_name().to_string(),
+                is_asserts: true,
+                narrowed_type_text,
+            }),
+        }
     }
 
     pub fn intern_symbol(&self, sym: P<Symbol>) -> SymbolId {

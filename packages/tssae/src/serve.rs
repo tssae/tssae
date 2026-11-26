@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Write},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
@@ -15,14 +15,17 @@ use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
 use tsrs_project::ID as ProjectId;
 use tsrs_vfs::{FS, bundled, osvfs};
-use tssae_analysis::branch_coverage::{
-    BranchBypassPath, BranchCoverageOutcome, ImplicitExceptionCoverageOutcome,
-    evaluate_branch_coverage,
+use tssae_analysis::{
+    branch_coverage::{
+        BranchBypassPath, BranchCoverageOutcome, ImplicitExceptionCoverageOutcome,
+        evaluate_branch_coverage,
+    },
+    ir::{FileIrEntry, FunctionIr, SnapshotIrCache},
 };
-use tssae_common::{BranchId, UnknownReason};
+use tssae_common::{BranchId, FileId, UnknownReason};
 use tssae_tsrs_boundary::{
-    LoweredScope, lower_scope_to_ir, normalize_cfg_scope_node, normalize_function_node,
-    resolve_enclosing_function,
+    FileIdRegistry, FileSyntaxIndex, lower_scope_to_ir_with_index, normalize_cfg_scope_node,
+    normalize_function_node, resolve_enclosing_function,
 };
 
 use crate::calls_values::ProjectCallGraph;
@@ -306,8 +309,10 @@ pub struct SnapshotState {
     pub handle_intern: FxHashMap<HandleInternKey, String>,
     pub instances: Vec<InstanceHandleData>,
     pub instance_handles: FxHashMap<(String, String), String>,
+    pub file_ids: Arc<RwLock<FileIdRegistry>>,
     pub cfg_cache: FxHashMap<(String, P<Node>), Result<Arc<FunctionCfg>, GapItem>>,
-    pub ir_cache: FxHashMap<(String, P<Node>), Result<Arc<LoweredScope>, GapItem>>,
+    pub ir_cache: SnapshotIrCache,
+    pub file_syntax_indices: FxHashMap<FileId, Arc<FileSyntaxIndex>>,
     pub call_graph_cache: FxHashMap<String, Arc<ProjectCallGraph>>,
     pub field_write_index: FxHashMap<String, Arc<FieldWriteIndex>>,
     pub sourcemap_cache: SourceMapCache,
@@ -573,20 +578,71 @@ impl SnapshotState {
 
     pub fn get_or_build_ir(
         &mut self,
-        project_id: &str,
         program: &'static Program,
         checker: &mut CheckerHandle,
         scope_node: P<Node>,
-    ) -> Result<Arc<LoweredScope>, GapItem> {
-        let key = (project_id.to_string(), scope_node);
-        if let Some(cached) = self.ir_cache.get(&key) {
-            return cached.clone();
+        observer: &mut ObserveCollector,
+    ) -> Result<(Arc<FunctionIr>, Arc<FileSyntaxIndex>), GapItem> {
+        let Some(sf) = get_source_file_of_node(scope_node) else {
+            return Err(GapItem::from_reason(
+                UnknownReason::MissingSourceFile,
+                "Function node has no associated source file.".to_string(),
+                None,
+            ));
+        };
+        let rel_file = relative_to_cwd(&self.cwd, sf.file_name());
+        let file_id = self
+            .file_ids
+            .write()
+            .map_or(FileId(0), |mut reg| reg.intern(&rel_file));
+        let source_file_addr = std::ptr::from_ref(&*sf) as usize;
+        let file_index = self
+            .file_syntax_indices
+            .entry(file_id)
+            .or_insert_with(|| Arc::new(FileSyntaxIndex::build(file_id, rel_file.clone(), sf)))
+            .clone();
+        let Some(local_syntax) = file_index.local_id_for_node(scope_node) else {
+            return Err(GapItem::from_reason(
+                UnknownReason::InvalidCfgScope,
+                "Scope node was not indexed in its source file.".to_string(),
+                Some(node_location(sf, &rel_file, scope_node)),
+            ));
+        };
+
+        let file_entry = self.ir_cache.get_or_insert_file(file_id, || {
+            FileIrEntry::new(
+                file_id,
+                rel_file.clone(),
+                source_file_addr,
+                file_index.scope_catalog.clone(),
+            )
+        });
+
+        let mut lowering_duration_ms = 0.0;
+        let cwd = &self.cwd;
+        let (result, is_hit) = file_entry.get_or_init_scope(local_syntax, |local_scope| {
+            let started = Instant::now();
+            let lowered = lower_scope_to_ir_with_index(
+                cwd,
+                program,
+                checker,
+                scope_node,
+                local_scope,
+                Some(&file_index),
+            )
+            .map(|ls| ls.ir);
+            lowering_duration_ms = elapsed_ms(started);
+            lowered
+        });
+
+        if is_hit {
+            observer.record_ir_cache_hit();
+        } else {
+            let vertices_created = result.as_ref().map_or(0, |ir| ir.vertices.len());
+            observer.record_ir_lowering(vertices_created, lowering_duration_ms, result.is_ok());
         }
-        let local_scope = u32::try_from(self.ir_cache.len()).unwrap_or(u32::MAX);
-        let built =
-            lower_scope_to_ir(&self.cwd, program, checker, scope_node, local_scope).map(Arc::new);
-        self.ir_cache.insert(key, built.clone());
-        built
+
+        result.map(|ir| (ir, file_index))
     }
 
     pub fn get_or_build_cfg(
@@ -615,14 +671,16 @@ impl SnapshotState {
 struct EngineServer {
     session: Option<(String, Arc<Session>)>,
     snapshots: BTreeMap<u64, SnapshotState>,
+    file_ids: Arc<RwLock<FileIdRegistry>>,
     next_snapshot_id: u64,
 }
 
 impl EngineServer {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             session: None,
             snapshots: BTreeMap::new(),
+            file_ids: Arc::new(RwLock::new(FileIdRegistry::new())),
             next_snapshot_id: 0,
         }
     }
@@ -637,6 +695,7 @@ impl EngineServer {
             self.snapshots.clear();
             old_session.close();
         }
+        self.file_ids = Arc::new(RwLock::new(FileIdRegistry::new()));
         let fs: Arc<dyn FS> = Arc::new(bundled::wrap_fs(osvfs::fs()));
         let session = Session::new(SessionOptions::new(
             cwd.to_string(),
@@ -707,7 +766,7 @@ impl EngineServer {
             "snapshot.update" => {
                 let parsed: SnapshotUpdateParams = serde_json::from_value(params)
                     .map_err(|err| RpcErr::new("INVALID_PARAMS", err.to_string()))?;
-                let result = self.update_snapshot(&parsed)?;
+                let result = self.update_snapshot(&parsed, observer)?;
                 serde_json::to_value(result)
                     .map_err(|err| RpcErr::new("SERIALIZATION_ERROR", err.to_string()))
             }
@@ -761,8 +820,10 @@ impl EngineServer {
                 handle_intern: FxHashMap::default(),
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
+                file_ids: Arc::clone(&self.file_ids),
                 cfg_cache: FxHashMap::default(),
-                ir_cache: FxHashMap::default(),
+                ir_cache: SnapshotIrCache::new(),
+                file_syntax_indices: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -782,9 +843,14 @@ impl EngineServer {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Validates parameters, updates snapshot, inherits IR cache, and builds result."
+    )]
     fn update_snapshot(
         &mut self,
         params: &SnapshotUpdateParams,
+        observer: &mut ObserveCollector,
     ) -> Result<SnapshotUpdateResult, RpcErr> {
         let Some(session) = self.session.as_ref().map(|(_, s)| Arc::clone(s)) else {
             return Err(RpcErr::new(
@@ -847,12 +913,23 @@ impl EngineServer {
         .map_err(|err| RpcErr::new(err.code, err.message))?;
 
         drop(old_snapshot_data);
-        drop(self.snapshots.remove(&params.snapshot_id));
+        let old_state = self.snapshots.remove(&params.snapshot_id);
         release_tsrs_snapshot(&session, old_tsrs_snapshot_id);
 
         self.next_snapshot_id += 1;
         let snapshot_id = self.next_snapshot_id;
         let opened = updated.opened;
+
+        let (ir_cache, files_reused, files_invalidated) = inherit_snapshot_ir_cache(
+            &cwd,
+            old_state.as_ref(),
+            &updated.recomputed_files,
+            &updated.removed_files,
+            &opened.snapshot_data,
+        );
+        observer.record_ir_file_reuse(files_reused, files_invalidated);
+        drop(old_state);
+
         self.snapshots.insert(
             snapshot_id,
             SnapshotState {
@@ -867,8 +944,10 @@ impl EngineServer {
                 handle_intern: FxHashMap::default(),
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
+                file_ids: Arc::clone(&self.file_ids),
                 cfg_cache: FxHashMap::default(),
-                ir_cache: FxHashMap::default(),
+                ir_cache,
+                file_syntax_indices: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -977,6 +1056,7 @@ pub fn run_list_branches(
     program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
+    observer: &mut ObserveCollector,
 ) -> Result<Vec<FunctionBranchesItem>, RpcErr> {
     let mut fn_nodes = Vec::with_capacity(targets.len());
     for handle_id in targets {
@@ -994,10 +1074,10 @@ pub fn run_list_branches(
 
     let mut items = Vec::with_capacity(fn_nodes.len());
     for (target_id, scope_node) in fn_nodes {
-        match snapshot.get_or_build_ir(project_id, program, checker, scope_node) {
-            Ok(lowered) => {
-                let mut branch_items = Vec::with_capacity(lowered.ir.branches.len());
-                for branch in &lowered.ir.branches {
+        match snapshot.get_or_build_ir(program, checker, scope_node, observer) {
+            Ok((ir, file_index)) => {
+                let mut branch_items = Vec::with_capacity(ir.branches.len());
+                for branch in &ir.branches {
                     let branch_ref = snapshot.alloc_branch(
                         project_id,
                         BranchHandle {
@@ -1005,10 +1085,8 @@ pub fn run_list_branches(
                             edge_index: usize::try_from(branch.id.0).unwrap_or(0),
                         },
                     );
-                    let cond_node = lowered
-                        .syntax_to_node
-                        .get(&branch.condition_syntax)
-                        .copied()
+                    let cond_node = file_index
+                        .node_for_syntax_id(branch.condition_syntax)
                         .unwrap_or(scope_node);
                     let condition = snapshot.alloc_syntax(project_id, cond_node);
                     branch_items.push(BranchEdgeItem {
@@ -1132,6 +1210,7 @@ pub fn run_branch_coverage(
     snapshot: &mut SnapshotState,
     checker: &mut CheckerHandle,
     req: &BranchCoverageRequest<'_>,
+    observer: &mut ObserveCollector,
 ) -> Result<Vec<BranchCoverageItem>, RpcErr> {
     let explicit_scope = resolve_explicit_scope(
         snapshot,
@@ -1187,9 +1266,9 @@ pub fn run_branch_coverage(
             continue;
         };
 
-        let lowered =
-            match snapshot.get_or_build_ir(req.project_id, req.program, checker, scope_node) {
-                Ok(lowered) => lowered,
+        let (ir, file_index) =
+            match snapshot.get_or_build_ir(req.program, checker, scope_node, observer) {
+                Ok(pair) => pair,
                 Err(gap) => {
                     let evidence = vec![EvidenceItem::simple(
                         "note",
@@ -1227,9 +1306,9 @@ pub fn run_branch_coverage(
             }
         }
 
-        let target_syntax = lowered.node_to_syntax.get(&target_node).copied();
+        let target_syntax = file_index.syntax_id_for_node(target_node);
         let outcome = evaluate_branch_coverage(
-            &lowered.ir,
+            &ir,
             target_syntax,
             &target_loc,
             &selected_branches,
@@ -1239,6 +1318,35 @@ pub fn run_branch_coverage(
     }
 
     Ok(items)
+}
+
+fn inherit_snapshot_ir_cache(
+    cwd: &str,
+    old_state: Option<&SnapshotState>,
+    recomputed_files: &[String],
+    removed_files: &[String],
+    new_snapshot_data: &SnapshotData,
+) -> (SnapshotIrCache, usize, usize) {
+    let Some(prev) = old_state else {
+        return (SnapshotIrCache::new(), 0, 0);
+    };
+    let recomputed_set: BTreeSet<&str> = recomputed_files.iter().map(String::as_str).collect();
+    let removed_set: BTreeSet<&str> = removed_files.iter().map(String::as_str).collect();
+    let mut new_source_file_addrs = FxHashMap::default();
+    for proj in new_snapshot_data.snapshot.project_collection.projects() {
+        if let Some(prog) = proj.get_program() {
+            for &sf in prog.get_source_files() {
+                let rel = relative_to_cwd(cwd, sf.file_name());
+                let addr = std::ptr::from_ref(&*sf) as usize;
+                new_source_file_addrs.insert(rel, addr);
+            }
+        }
+    }
+    SnapshotIrCache::inherit_from(&prev.ir_cache, |entry| {
+        !recomputed_set.contains(entry.rel_file.as_str())
+            && !removed_set.contains(entry.rel_file.as_str())
+            && new_source_file_addrs.get(entry.rel_file.as_str()) == Some(&entry.source_file_addr)
+    })
 }
 
 fn read_process_rss_bytes() -> Option<u64> {

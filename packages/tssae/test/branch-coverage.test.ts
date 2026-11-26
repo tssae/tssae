@@ -730,59 +730,40 @@ void describe("tssae branchCoverage", () => {
           {
             compilerOptions: {
               strict: true,
+              allowJs: true,
+              checkJs: false,
               target: "ES2022",
               module: "NodeNext",
               moduleResolution: "NodeNext",
-              jsx: "preserve",
               noEmit: true,
             },
-            include: ["src/**/*.tsx", "src/**/*.d.ts"],
+            include: ["src/**/*.ts", "src/**/*.cjs"],
           },
           null,
           2,
         ),
-        "src/jsx-ambient.d.ts": `declare namespace JSX {
-  interface IntrinsicElements {
-    tag: Record<string, never>;
-  }
-}
-`,
-        "src/cases.tsx": `declare function isAuthorized(req: string): boolean;
-declare function log(msg: string): void;
-declare function execute(req: string): void;
-declare function consume(v: unknown): void;
-
-export function unrelatedUnknownAroundGuard(
-  req: string,
-  debug: boolean,
-): void {
+        "src/legacy-with.cjs": `function unrelatedUnknownAroundGuard(req, debug) {
   if (debug) {
-    consume(<tag />);
+    with ({}) {}
     return;
   }
   if (!isAuthorized(req)) {
     return;
   }
   execute(req);
-  consume(<tag />);
+  with ({}) {}
 }
 
-export function knownBypassWithParallelUnknown(
-  req: string,
-  useJsx: boolean,
-): void {
-  if (useJsx) {
-    consume(<tag />);
+function knownBypassWithParallelUnknown(req, useWith) {
+  if (useWith) {
+    with ({}) {}
   } else if (isAuthorized(req)) {
     log(req);
   }
   execute(req);
 }
 
-export function criticalVsOffPathUnknown(
-  req: string,
-  debug: boolean,
-): void {
+function criticalVsOffPathUnknown(req, debug) {
   if (debug) {
     try {
       log(req);
@@ -792,12 +773,16 @@ export function criticalVsOffPathUnknown(
     return;
   }
   if (isAuthorized(req)) {
-    consume(<tag />);
+    with ({}) {}
   } else {
     return;
   }
   execute(req);
 }
+`,
+        "src/cases.ts": `declare function isAuthorized(req: string): boolean;
+declare function log(msg: string): void;
+declare function execute(req: string): void;
 
 export function optionalChainShortCircuit(
   cfg: { readonly run?: (req: string) => void } | undefined,
@@ -816,11 +801,11 @@ export function optionalChainShortCircuit(
       try {
         const ctx = session.project();
         const fns = await ctx.findSyntax({
-          files: ["src/cases.tsx"],
+          files: ["src/legacy-with.cjs", "src/cases.ts"],
           kinds: ["FunctionDeclaration"],
         });
         const calls = await ctx.findSyntax({
-          files: ["src/cases.tsx"],
+          files: ["src/legacy-with.cjs", "src/cases.ts"],
           kinds: ["CallExpression"],
         });
         const branchGroups = await ctx.listBranches(fns.map((f) => f.ref));
@@ -872,7 +857,7 @@ export function optionalChainShortCircuit(
           }
         }
 
-        // 3. Critical-path unknown yields "inconclusive" with ONLY critical-path unmodeled-construct gaps
+        // 3. Critical-path unknown yields "inconclusive" with ONLY critical-path unmodeled gaps
         {
           const c = findCase("criticalVsOffPathUnknown");
           const authFalse = c.branches.find(
@@ -889,7 +874,7 @@ export function optionalChainShortCircuit(
           assert.equal(res.status, "inconclusive");
           if (res.status === "inconclusive") {
             assert.ok(res.gaps.length >= 1);
-            assert.ok(res.gaps.every((g) => g.kind === "unmodeled-construct"));
+            assert.ok(res.gaps.every((g) => g.kind === "with-statement"));
             assert.ok(res.gaps.every((g) => insideSpan(g.at!, c.fn.location)));
           }
         }
@@ -923,28 +908,22 @@ export function optionalChainShortCircuit(
           {
             compilerOptions: {
               strict: true,
+              allowJs: true,
+              checkJs: false,
               target: "ES2022",
               module: "NodeNext",
               moduleResolution: "NodeNext",
-              jsx: "preserve",
               noEmit: true,
             },
-            include: ["src/**/*.tsx", "src/**/*.d.ts"],
+            include: ["src/**/*.ts", "src/**/*.cjs"],
           },
           null,
           2,
         ),
-        "src/jsx-ambient.d.ts": `declare namespace JSX {
-  interface IntrinsicElements {
-    tag: Record<string, never>;
-  }
-}
-`,
-        "src/control-flow.tsx": `declare function execute(tag: string): void;
+        "src/control-flow.ts": `declare function execute(tag: string): void;
 declare function risky(): void;
 declare function mightThrow(): void;
 declare function cleanup(): void;
-declare function consume(v: unknown): void;
 declare function asyncStream(): AsyncIterable<string>;
 
 export function collatzGuarded(n: number, ok: boolean): void {
@@ -1121,11 +1100,11 @@ export async function forAwaitAndDoWhile(items: Record<string, number>): Promise
     }
   }
 }
-
-export function implicitBypassThroughUnknown(flag: boolean): void {
+`,
+        "src/with-bypass.cjs": `function implicitBypassThroughUnknown(flag) {
   try {
     if (flag) {
-      consume(<tag />);
+      with ({}) {}
       risky();
     }
   } catch {
@@ -1143,15 +1122,15 @@ export function implicitBypassThroughUnknown(flag: boolean): void {
       try {
         const ctx = session.project();
         const fns = await ctx.findSyntax({
-          files: ["src/control-flow.tsx"],
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
           kinds: ["FunctionDeclaration"],
         });
         const calls = await ctx.findSyntax({
-          files: ["src/control-flow.tsx"],
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
           kinds: ["CallExpression"],
         });
         const exprStmts = await ctx.findSyntax({
-          files: ["src/control-flow.tsx"],
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
           kinds: ["ExpressionStatement"],
         });
         const branchGroups = await ctx.listBranches(fns.map((f) => f.ref));
@@ -1475,7 +1454,7 @@ export function implicitBypassThroughUnknown(flag: boolean): void {
             assert.ok(resUnk!.implicitExceptions.gaps.length >= 1);
             assert.ok(
               resUnk!.implicitExceptions.gaps.every(
-                (g) => g.kind === "unmodeled-construct",
+                (g) => g.kind === "with-statement",
               ),
             );
             assert.ok(

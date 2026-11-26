@@ -1205,7 +1205,7 @@ fn execute_list_branches_step(
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
 ) -> Result<StepResult, RpcErr> {
-    let items = run_list_branches(snapshot, project_id, program, checker, targets)?;
+    let items = run_list_branches(snapshot, project_id, program, checker, targets, observer)?;
     let raw_details = if observer.is_detail() {
         items
             .iter()
@@ -1256,6 +1256,7 @@ fn execute_branch_coverage_step(
             branch_handles: branches,
             target_handles: targets,
         },
+        observer,
     )?;
     let raw_details = if observer.is_detail() {
         items

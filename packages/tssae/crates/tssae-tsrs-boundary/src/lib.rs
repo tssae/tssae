@@ -16,8 +16,9 @@ pub use impl_resolution::{
     is_first_party_source_file, is_first_party_workspace_path,
 };
 pub use ir_lower::{
-    LoweredScope, lower_scope_to_ir, normalize_cfg_scope_node, normalize_function_node,
-    resolve_enclosing_function,
+    LoweredScope, lower_class_default_constructor_to_ir, lower_class_static_init_to_ir,
+    lower_class_to_ir, lower_scope_to_ir, lower_scope_to_ir_with_index, normalize_cfg_scope_node,
+    normalize_function_node, resolve_enclosing_function,
 };
 
 pub use semantic_facade::{
@@ -28,10 +29,10 @@ pub use semantic_facade::{
     FacadeTypeSummary, NotACallError, ResolvedModuleSummary, SemanticFacade, SemanticModelBridge,
 };
 pub use syntax_view::{
-    CommentKind, FindSyntaxFilter, RangeMatchMode, ScannedComment, SourceRangeSpec,
-    SyntaxCatalogBridge, SyntaxChildren, SyntaxLookupMatch, SyntaxLookupOptions, SyntaxMatch,
-    SyntaxView, SyntaxViewError, is_project_source_file, node_location, node_location_relative,
-    node_text, normalize_path, parse_syntax_kind, prop_key_text, relative_to_cwd,
-    resolve_against_cwd, safe_arguments, safe_expression, safe_initializer, safe_parameters,
-    slice_source_text, unwrap_expr_wrappers,
+    CommentKind, FileIdRegistry, FileSyntaxIndex, FindSyntaxFilter, RangeMatchMode, ScannedComment,
+    SourceRangeSpec, SyntaxCatalogBridge, SyntaxChildren, SyntaxLookupMatch, SyntaxLookupOptions,
+    SyntaxMatch, SyntaxView, SyntaxViewError, is_project_source_file, node_location,
+    node_location_relative, node_text, normalize_path, parse_syntax_kind, prop_key_text,
+    relative_to_cwd, resolve_against_cwd, safe_arguments, safe_expression, safe_initializer,
+    safe_parameters, slice_source_text, unwrap_expr_wrappers,
 };

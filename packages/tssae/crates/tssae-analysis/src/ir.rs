@@ -1,8 +1,10 @@
+use std::sync::{Arc, OnceLock, RwLock};
+
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use tssae_common::{
-    BranchId, DiagnosticLocation, FileId, FinallyId, FunctionIrId, LocalBindingId, LocalSyntaxId,
-    SignatureId, SymbolId, SyntaxId, TypeId, UnknownReason, ValueId, VertexId,
+    BranchId, DiagnosticLocation, FileId, FinallyId, FunctionIrId, GapItem, LocalBindingId,
+    LocalSyntaxId, SignatureId, SymbolId, SyntaxId, TypeId, UnknownReason, ValueId, VertexId,
 };
 
 /// Kind of analyzable scope represented by an IR unit.
@@ -67,6 +69,68 @@ pub struct IrLocalBinding {
     pub mutability: BindingMutability,
     pub syntax: SyntaxId,
     pub symbol: Option<SymbolId>,
+}
+
+/// Implicit accessor kind detected during lowering for property read/write sites.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ImplicitAccessorKind {
+    Getter,
+    Setter,
+}
+
+/// User-defined type guard or assertion predicate extracted from a function signature.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeGuardSemantics {
+    ThisPredicate {
+        is_asserts: bool,
+        narrowed_type_text: Option<String>,
+    },
+    ParamPredicate {
+        param_index: usize,
+        param_name: String,
+        is_asserts: bool,
+        narrowed_type_text: Option<String>,
+    },
+}
+
+/// Outer lexical binding captured by a nested function literal or closure scope.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CapturedBinding {
+    pub name: String,
+    pub mutability: BindingMutability,
+    pub outer_binding: Option<LocalBindingId>,
+    pub decl_syntax: SyntaxId,
+    pub is_written_in_closure: bool,
+    pub is_written_in_outer_after_capture: bool,
+}
+
+/// Metadata for a lowered class field or parameter property initializer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Represents independent ECMAScript/TypeScript class field modifier flags."
+)]
+pub struct ClassFieldInit {
+    pub name: String,
+    pub syntax: SyntaxId,
+    pub is_static: bool,
+    pub is_readonly: bool,
+    pub is_override: bool,
+    pub visibility: Option<MemberVisibility>,
+    pub has_initializer: bool,
+}
+
+/// Class-level IR summarizing field initializers, constructor, and static initialization scopes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClassIr {
+    pub syntax: SyntaxId,
+    pub name: Option<String>,
+    pub decl_semantics: DeclarationSemantics,
+    pub has_extends: bool,
+    pub instance_fields: Vec<ClassFieldInit>,
+    pub static_fields: Vec<ClassFieldInit>,
+    pub has_explicit_constructor: bool,
+    pub has_static_init: bool,
 }
 
 /// Function parameter metadata in IR.
@@ -376,11 +440,18 @@ pub enum IrOp {
         op: AssignOp,
         value: ValueId,
         is_super: bool,
+        implicit_call_kind: Option<ImplicitAccessorKind>,
     },
     PropRead {
         object: ValueId,
         key: IrPropKey,
         is_super: bool,
+        implicit_call_kind: Option<ImplicitAccessorKind>,
+    },
+    ObjectRest {
+        source: ValueId,
+        omitted_static_keys: Vec<String>,
+        has_dynamic_omitted: bool,
     },
     Call {
         call_kind: IrCallKind,
@@ -400,6 +471,12 @@ pub enum IrOp {
     ArrayAlloc {
         elems: Vec<IrArrayElem>,
         as_const: bool,
+    },
+    JsxElement {
+        tag_name: Option<String>,
+        tag_expr: Option<ValueId>,
+        props: Vec<IrObjectProp>,
+        children: Vec<ValueId>,
     },
     Branch {
         condition: ValueId,
@@ -431,12 +508,17 @@ pub enum IrOp {
         iterator: ValueId,
         is_async: bool,
     },
+    IteratorRest {
+        iterator: ValueId,
+        is_async: bool,
+    },
     IteratorClose {
         iterator: ValueId,
         is_async: bool,
     },
     FunctionLiteral {
         syntax: SyntaxId,
+        captures: Vec<CapturedBinding>,
     },
     ClassLiteral {
         syntax: SyntaxId,
@@ -474,8 +556,10 @@ pub struct FunctionIr {
     pub scope_kind: IrScopeKind,
     pub scope_location: DiagnosticLocation,
     pub decl_semantics: DeclarationSemantics,
+    pub type_guard: Option<TypeGuardSemantics>,
     pub parameters: Vec<IrParameter>,
     pub bindings: Vec<IrLocalBinding>,
+    pub captured_bindings: Vec<CapturedBinding>,
     pub vertices: Vec<CfgVertex>,
     pub entry: VertexId,
     pub normal_exit: VertexId,
@@ -601,63 +685,196 @@ impl FunctionIr {
     }
 }
 
-/// Lightweight scope metadata placeholder used for file scope cataloging.
+/// Lightweight scope metadata entry recorded in a file's [`FileIrEntry`] catalog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ScopeStub {
+pub struct ScopeCatalogEntry {
     pub id: FunctionIrId,
+    pub local_syntax: LocalSyntaxId,
     pub root_syntax: SyntaxId,
     pub kind: IrScopeKind,
 }
 
-/// Per-file catalog of analyzable scope stubs indexed by [`FileId`].
-#[derive(Default, Debug)]
-pub struct FileScopeCatalog {
-    scopes_by_file: FxHashMap<FileId, Vec<ScopeStub>>,
+type CachedScopeOutcome = Result<Arc<FunctionIr>, GapItem>;
+
+/// Per-file lazy IR cache entry holding a snapshot-independent scope catalog and `OnceLock` slots.
+///
+/// Never stores `tsrs` arena pointers or transient type/signature handles, allowing safe reuse
+/// across `snapshot.update` whenever the underlying `SourceFile` pointer is unchanged.
+#[derive(Debug)]
+pub struct FileIrEntry {
+    pub file_id: FileId,
+    pub rel_file: String,
+    pub source_file_addr: usize,
+    pub scope_catalog: Vec<ScopeCatalogEntry>,
+    scope_by_local_syntax: FxHashMap<LocalSyntaxId, usize>,
+    lowered_scopes: Box<[OnceLock<CachedScopeOutcome>]>,
+    extra_scopes: RwLock<FxHashMap<LocalSyntaxId, CachedScopeOutcome>>,
 }
 
-impl FileScopeCatalog {
+impl FileIrEntry {
+    #[must_use]
+    pub fn new(
+        file_id: FileId,
+        rel_file: String,
+        source_file_addr: usize,
+        scope_catalog: Vec<ScopeCatalogEntry>,
+    ) -> Self {
+        let mut scope_by_local_syntax = FxHashMap::default();
+        for (slot, entry) in scope_catalog.iter().enumerate() {
+            scope_by_local_syntax.insert(entry.local_syntax, slot);
+        }
+        let lowered_scopes = (0..scope_catalog.len())
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            file_id,
+            rel_file,
+            source_file_addr,
+            scope_catalog,
+            scope_by_local_syntax,
+            lowered_scopes,
+            extra_scopes: RwLock::new(FxHashMap::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn slot_for_local_syntax(&self, local: LocalSyntaxId) -> Option<usize> {
+        self.scope_by_local_syntax.get(&local).copied()
+    }
+
+    #[must_use]
+    pub fn lowered_scope_count(&self) -> usize {
+        self.lowered_scopes
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count()
+            + self.extra_scopes.read().map_or(0, |guard| guard.len())
+    }
+
+    /// Returns the cached IR for `local`, lazily invoking `lower` only on cache miss.
+    ///
+    /// Returns `(result, is_cache_hit)`.
+    pub fn get_or_init_scope(
+        &self,
+        local: LocalSyntaxId,
+        lower: impl FnOnce(u32) -> Result<Arc<FunctionIr>, GapItem>,
+    ) -> (Result<Arc<FunctionIr>, GapItem>, bool) {
+        if let Some(slot) = self.slot_for_local_syntax(local)
+            && let Some(lock) = self.lowered_scopes.get(slot)
+        {
+            if let Some(existing) = lock.get() {
+                return (existing.clone(), true);
+            }
+            let scope_id = u32::try_from(slot).unwrap_or(u32::MAX);
+            let mut lowered_here = false;
+            let value = lock.get_or_init(|| {
+                lowered_here = true;
+                lower(scope_id)
+            });
+            return (value.clone(), !lowered_here);
+        }
+
+        if let Ok(guard) = self.extra_scopes.read()
+            && let Some(existing) = guard.get(&local)
+        {
+            return (existing.clone(), true);
+        }
+        let scope_id = 0x8000_0000_u32 | local.0;
+        let built = lower(scope_id);
+        if let Ok(mut guard) = self.extra_scopes.write() {
+            if let Some(existing) = guard.get(&local) {
+                return (existing.clone(), true);
+            }
+            guard.insert(local, built.clone());
+        }
+        (built, false)
+    }
+}
+
+/// Snapshot-level lazy IR cache indexed by session-stable [`FileId`].
+#[derive(Default, Debug)]
+pub struct SnapshotIrCache {
+    files: RwLock<FxHashMap<FileId, Arc<FileIrEntry>>>,
+}
+
+impl SnapshotIrCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert_scope(&mut self, scope: ScopeStub) {
-        self.scopes_by_file
-            .entry(scope.id.file)
-            .or_default()
-            .push(scope);
+    #[must_use]
+    pub fn get_file(&self, file_id: FileId) -> Option<Arc<FileIrEntry>> {
+        self.files
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&file_id).cloned())
     }
 
+    pub fn get_or_insert_file(
+        &self,
+        file_id: FileId,
+        build: impl FnOnce() -> FileIrEntry,
+    ) -> Arc<FileIrEntry> {
+        if let Some(existing) = self.get_file(file_id) {
+            return existing;
+        }
+        let created = Arc::new(build());
+        if let Ok(mut guard) = self.files.write() {
+            if let Some(existing) = guard.get(&file_id) {
+                return Arc::clone(existing);
+            }
+            guard.insert(file_id, Arc::clone(&created));
+        }
+        created
+    }
+
+    /// Inherits unchanged [`FileIrEntry`] values from `old` into a new snapshot cache.
+    ///
+    /// Returns `(new_cache, files_reused, files_invalidated)`.
     #[must_use]
-    pub fn scopes_for_file(&self, file: FileId) -> &[ScopeStub] {
-        self.scopes_by_file.get(&file).map_or(&[], Vec::as_slice)
+    pub fn inherit_from(
+        old: &Self,
+        mut is_file_reused: impl FnMut(&FileIrEntry) -> bool,
+    ) -> (Self, usize, usize) {
+        let mut next_files = FxHashMap::default();
+        let mut files_reused = 0usize;
+        let mut files_invalidated = 0usize;
+
+        if let Ok(guard) = old.files.read() {
+            for (&file_id, entry) in guard.iter() {
+                if is_file_reused(entry) {
+                    next_files.insert(file_id, Arc::clone(entry));
+                    files_reused += 1;
+                } else {
+                    files_invalidated += 1;
+                }
+            }
+        }
+
+        (
+            Self {
+                files: RwLock::new(next_files),
+            },
+            files_reused,
+            files_invalidated,
+        )
     }
 
     #[must_use]
     pub fn file_count(&self) -> usize {
-        self.scopes_by_file.len()
+        self.files.read().map_or(0, |guard| guard.len())
     }
-}
 
-/// Snapshot-level IR lowering and cache statistics.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IrCacheStats {
-    pub files_cached: usize,
-    pub scopes_lowered: usize,
-    pub cache_hits: usize,
-    pub cache_invalidations: usize,
-}
-
-impl IrCacheStats {
     #[must_use]
-    pub const fn for_file_count(files_cached: usize) -> Self {
-        Self {
-            files_cached,
-            scopes_lowered: 0,
-            cache_hits: 0,
-            cache_invalidations: 0,
-        }
+    pub fn total_lowered_scopes(&self) -> usize {
+        self.files.read().map_or(0, |guard| {
+            guard
+                .values()
+                .map(|entry| entry.lowered_scope_count())
+                .sum()
+        })
     }
 }
 

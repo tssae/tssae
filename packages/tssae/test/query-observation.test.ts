@@ -336,4 +336,102 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
       },
     );
   });
+
+  void it("tracks lazy per-function IR lowering and function-level cache hits in observe metrics", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-observe-metrics-host",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2024",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/two-fns.ts": [
+            "export function firstFn(flag: boolean): number {",
+            "  if (flag) {",
+            "    return 1;",
+            "  }",
+            "  return 2;",
+            "}",
+            "export function secondFn(flag: boolean): number {",
+            "  if (flag) {",
+            "    return 3;",
+            "  }",
+            "  return 4;",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        const openMetrics: EngineCallIoMetrics[] = [];
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          observe: "summary",
+          onRpcMetrics: (m) => openMetrics.push(m),
+        });
+        try {
+          assert.equal(
+            openMetrics[0]?.engineMetrics?.lowering?.functionsLowered,
+            0,
+          );
+
+          const rpcMetrics: EngineCallIoMetrics[] = [];
+          const ctx = session.project(undefined, {
+            observer: {
+              observe: "summary",
+              onRpcMetrics: (m) => rpcMetrics.push(m),
+            },
+          });
+          const fns = await ctx.findSyntax({ kinds: ["FunctionDeclaration"] });
+          const firstFn = fns.find((f) => f.text.includes("firstFn"));
+          const secondFn = fns.find((f) => f.text.includes("secondFn"));
+          const rets = await ctx.findSyntax({ kinds: ["ReturnStatement"] });
+          const firstRet = rets.find((r) => r.text === "return 1;");
+          assert.ok(firstFn && secondFn && firstRet);
+
+          rpcMetrics.length = 0;
+          const firstBranches = await ctx.listBranches([firstFn.ref]);
+          const firstLowerMetric = rpcMetrics.at(-1)?.engineMetrics;
+          assert.equal(firstLowerMetric?.lowering?.functionsLowered, 1);
+          assert.equal(firstLowerMetric?.irCache?.functionMisses, 1);
+          assert.equal(firstLowerMetric?.irCache?.functionHits, 0);
+          assert.ok((firstLowerMetric?.lowering?.verticesCreated ?? 0) > 0);
+          assert.equal(typeof firstLowerMetric?.lowering?.durationMs, "number");
+
+          const branchRef = firstBranches[0]?.branches[0]?.ref;
+          assert.ok(branchRef);
+          rpcMetrics.length = 0;
+          await ctx.branchCoverage({
+            function: firstFn.ref,
+            branches: [branchRef],
+            targets: [firstRet.ref],
+          });
+          const firstHitMetric = rpcMetrics.at(-1)?.engineMetrics;
+          assert.equal(firstHitMetric?.lowering?.functionsLowered, 0);
+          assert.equal(firstHitMetric?.irCache?.functionHits, 1);
+          assert.equal(firstHitMetric?.irCache?.functionMisses, 0);
+
+          // Querying secondFn in the same file triggers lazy lowering only now.
+          rpcMetrics.length = 0;
+          await ctx.listBranches([secondFn.ref]);
+          const secondLowerMetric = rpcMetrics.at(-1)?.engineMetrics;
+          assert.equal(secondLowerMetric?.lowering?.functionsLowered, 1);
+          assert.equal(secondLowerMetric?.irCache?.functionMisses, 1);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

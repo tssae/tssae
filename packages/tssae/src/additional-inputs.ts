@@ -8,7 +8,6 @@ import { TssaeError } from "./types.ts";
 export type AdditionalInputSource =
   | { readonly kind: "config" }
   | { readonly kind: "rule"; readonly id: string }
-  | { readonly kind: "adapter"; readonly id: string }
   | { readonly kind: "summary"; readonly id: string };
 
 /** Deduplicated additional input entry with its normalized relative path, digest, and all declaration sources. */
@@ -19,7 +18,7 @@ export type AdditionalInputEntry = {
   readonly sources: readonly AdditionalInputSource[];
 };
 
-/** Shared registration hook used by config, rules, and library adapters to declare local non-source inputs. */
+/** Shared registration hook used by config, rules, and summaries to declare local non-source inputs. */
 export type AdditionalInputRegistrar = {
   readonly cwd: string;
   registerAdditionalInput: (
@@ -34,7 +33,7 @@ export type AdditionalInputRegistrar = {
   getTrackedAbsolutePaths: () => readonly string[];
 };
 
-/** Source-bound registrar passed to individual rules or library adapters. */
+/** Source-bound registrar passed to individual rules or summary loaders. */
 export type ScopedAdditionalInputRegistrar = {
   registerAdditionalInput: (filePath: string) => AdditionalInputEntry;
   readAdditionalInput: (filePath: string) => string;
@@ -100,9 +99,8 @@ function sourceKey(source: AdditionalInputSource): string {
 
 function sourceKindRank(kind: AdditionalInputSource["kind"]): number {
   if (kind === "config") return 0;
-  if (kind === "adapter") return 1;
-  if (kind === "summary") return 2;
-  return 3;
+  if (kind === "summary") return 1;
+  return 2;
 }
 
 function compareSources(
@@ -181,7 +179,7 @@ export function validateAdditionalInputPaths(
 
 /**
  * Creates a registry that normalizes local additional input paths, deduplicates physical files
- * across config, rule, and adapter declarations, tracks content digests, and preserves all
+ * across config, rule, and summary declarations, tracks content digests, and preserves all
  * declaration sources without expanding compiler source file sets.
  */
 export function createAdditionalInputRegistry(options: {
@@ -282,7 +280,7 @@ export function createAdditionalInputRegistry(options: {
   };
 }
 
-/** Binds an `AdditionalInputRegistrar` to a fixed rule or adapter source tag. */
+/** Binds an `AdditionalInputRegistrar` to a fixed rule or summary source tag. */
 export function createScopedAdditionalInputRegistrar(
   registrar: AdditionalInputRegistrar,
   source: AdditionalInputSource,

@@ -92,6 +92,8 @@ pub struct FacadeDeclarationSelect {
     pub kind: bool,
     pub location: bool,
     pub is_external: bool,
+    pub package_name: bool,
+    pub export_name: bool,
     pub declarations: bool,
 }
 
@@ -106,6 +108,8 @@ pub struct FacadeDeclarationResolution {
     pub kind: Option<String>,
     pub location: Option<DiagnosticLocation>,
     pub is_external: Option<bool>,
+    pub package_name: Option<String>,
+    pub export_name: Option<String>,
 }
 
 /// Selection options for [`SemanticFacade::resolve_call`] and [`SemanticFacade::project_call`].
@@ -441,6 +445,24 @@ impl<'a> SemanticFacade<'a> {
             Vec::new()
         };
 
+        let (package_name, export_name) = if select.package_name || select.export_name {
+            resolved.primary_decl.map_or((None, None), |decl_node| {
+                let prov_node = match target {
+                    FacadeDeclarationTarget::Node(node)
+                    | FacadeDeclarationTarget::Declaration(node, _) => node,
+                    FacadeDeclarationTarget::Signature(_, Some(call_node)) => call_node,
+                    FacadeDeclarationTarget::Signature(_, None) => decl_node,
+                };
+                let prov = self.resolve_declaration_provenance(prov_node, decl_node);
+                (
+                    select.package_name.then_some(prov.package_name).flatten(),
+                    select.export_name.then_some(prov.export_name).flatten(),
+                )
+            })
+        } else {
+            (None, None)
+        };
+
         FacadeDeclarationResolution {
             primary_decl: resolved.primary_decl,
             all_decls,
@@ -451,6 +473,8 @@ impl<'a> SemanticFacade<'a> {
             kind,
             location,
             is_external,
+            package_name,
+            export_name,
         }
     }
 

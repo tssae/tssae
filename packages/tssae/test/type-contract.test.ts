@@ -226,31 +226,6 @@ void describe("tssae external TypeScript consumer contract", () => {
           expectedPattern: /TS2322|TS2345/u,
         },
         {
-          name: 'CallRef passed to FactType<"syntax">',
-          body: `
-            declare const callRef: CallRef;
-            declare const syntaxFact: FactType<"syntax", { readonly mode?: string } | undefined, string>;
-            await ctx.facts(syntaxFact, { targets: [callRef] });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
-          name: "wrong condition passed to FactType",
-          body: `
-            declare const syntaxFact: FactType<"syntax", { readonly mode: "a" | "b" }, string>;
-            await ctx.facts(syntaxFact, { condition: { mode: "c" } });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
-          name: "non-string providerId passed to facts",
-          body: `
-            declare const syntaxFact: FactType<"syntax", undefined, string>;
-            await ctx.facts(syntaxFact, { providerId: 123 });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
           name: "SyntaxRef passed to projectInstances",
           body: `
             const syntaxRef = undefined as unknown as SyntaxRef;
@@ -542,7 +517,7 @@ void describe("tssae external TypeScript consumer contract", () => {
 
       for (const testCase of negativeCases) {
         const snippet = [
-          'import { extractBasisEvidence, type CallRef, type DeclarationRef, type FactType, type InstanceRef, type ProjectContext, type SignatureRef, type SyntaxRef, type TypeRef } from "tssae";',
+          'import { extractBasisEvidence, type CallRef, type DeclarationRef, type InstanceRef, type ProjectContext, type SignatureRef, type SyntaxRef, type TypeRef } from "tssae";',
           "",
           "export async function checkContract(ctx: ProjectContext): Promise<void> {",
           testCase.body,

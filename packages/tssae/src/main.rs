@@ -4,7 +4,6 @@ mod ir_effects;
 mod ir_impls;
 mod ir_instances;
 mod ir_values;
-mod native_adapter;
 mod observe;
 mod projection;
 mod projects;

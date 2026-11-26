@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tssae_common::SummaryLookupStats;
@@ -50,14 +50,6 @@ pub struct EngineStepMetrics {
     pub candidate_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Vec<EngineStepDetail>>,
-}
-
-/// Built-in engine fact provider extraction counters for one RPC call.
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineProviderExtractionStats {
-    pub extractions: usize,
-    pub candidates: usize,
 }
 
 /// Engine-side IR lowering summary counters for one RPC call.
@@ -112,8 +104,6 @@ pub struct EngineRpcMetrics {
     pub lowering: EngineLoweringMetrics,
     pub ir_cache: EngineIrCacheMetrics,
     pub summary_lookup: EngineSummaryLookupMetrics,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
 
 /// Tracks engine-side timing, candidate counts, and bounded detail records for one RPC call.
@@ -131,7 +121,6 @@ pub struct ObserveCollector {
     lowering: EngineLoweringMetrics,
     ir_cache: EngineIrCacheMetrics,
     summary_lookup: EngineSummaryLookupMetrics,
-    provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
 
 impl ObserveCollector {
@@ -157,7 +146,6 @@ impl ObserveCollector {
             lowering: EngineLoweringMetrics::default(),
             ir_cache: EngineIrCacheMetrics::default(),
             summary_lookup: EngineSummaryLookupMetrics::default(),
-            provider_extractions: BTreeMap::new(),
         }
     }
 
@@ -245,41 +233,6 @@ impl ObserveCollector {
         );
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Observation recording takes step identity, cache status, timing, and detail items."
-    )]
-    pub fn record_provider_step_with_cache(
-        &mut self,
-        op: &'static str,
-        provider: &str,
-        engine_provider_id: &str,
-        cache_status: &'static str,
-        step_start: Option<Instant>,
-        candidate_count: usize,
-        raw_details: Vec<EngineStepDetail>,
-    ) {
-        if !self.is_active() {
-            return;
-        }
-        if cache_status == "computed" {
-            let stats = self
-                .provider_extractions
-                .entry(engine_provider_id.to_string())
-                .or_default();
-            stats.extractions += 1;
-            stats.candidates += candidate_count;
-        }
-        self.push_step_metrics(
-            op,
-            provider,
-            cache_status,
-            step_start,
-            candidate_count,
-            raw_details,
-        );
-    }
-
     fn push_step_metrics(
         &mut self,
         op: &'static str,
@@ -352,7 +305,6 @@ impl ObserveCollector {
             lowering: self.lowering,
             ir_cache: self.ir_cache,
             summary_lookup: self.summary_lookup,
-            provider_extractions: self.provider_extractions,
         })
     }
 }

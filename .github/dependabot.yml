@@ -39,18 +39,6 @@ updates:
     directory: /packages/tssae
     schedule:
       interval: weekly
-  - package-ecosystem: cargo
-    directory: /packages/adapter-api
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /packages/adapters/native/zod
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /packages/adapters/native/drizzle
-    schedule:
-      interval: weekly
   - package-ecosystem: rust-toolchain
     directory: /
     schedule:

@@ -3,12 +3,11 @@ import { describe, it } from "node:test";
 
 import { withTempHost } from "@tssae/test-hosts";
 import {
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
   defineSummaries,
+  evidenceOf,
   extractBasisEvidence,
   openProject,
+  registerProvenance,
   type DiagnosticBasis,
   type Evidence,
 } from "tssae";
@@ -420,132 +419,34 @@ void describe("tssae selected query evidence", () => {
     );
   });
 
-  void it("threads FactResult and FactContribution.basis transitively into derived facts", async () => {
-    await withTempHost(
-      { host: "sdk-queries/selected-evidence-facts" },
-      async (host) => {
-        await host.typecheck();
-
-        const SourceOriginFact = defineFactType<
-          "call",
-          undefined,
-          { readonly tag: string }
-        >({
-          id: "test.source-origin",
-          subjectKind: "call",
-        });
-        const DerivedSinkFact = defineFactType<
-          "syntax",
-          undefined,
-          { readonly tainted: boolean }
-        >({
-          id: "test.derived-sink",
-          subjectKind: "syntax",
-        });
-
-        const sourceAdapter = defineAdapter({
-          id: "test-source-adapter",
-          provides: [
-            defineFactProvider(SourceOriginFact, async (ctx) => {
-              const calls = await ctx.findSyntax({
-                files: ["src/service.ts"],
-                kinds: ["CallExpression"],
-              });
-              const resolved = await ctx.resolveCalls(
-                calls.map((c) => c.ref),
-                { select: { location: true } },
-              );
-              const callees = await ctx.calleesOf(
-                resolved
-                  .map((r) => r.call)
-                  .filter((c): c is NonNullable<typeof c> => c !== null),
-              );
-              const out = [];
-              for (const entry of callees) {
-                const target = entry.resolvedTargets.find(
-                  (t) => t.name === "fetchSecret",
-                );
-                if (!target) continue;
-                out.push({
-                  subject: entry.call,
-                  value: { tag: "secret" },
-                  basis: [entry, target],
-                });
-              }
-              return out;
-            }),
-          ],
-        });
-
-        const derivedAdapter = defineAdapter({
-          id: "test-derived-adapter",
-          provides: [
-            defineFactProvider(DerivedSinkFact, async (ctx) => {
-              const calls = await ctx.findSyntax({
-                files: ["src/service.ts"],
-                kinds: ["CallExpression"],
-              });
-              const fetchCall = calls.find((c) => c.text === "fetchSecret()");
-              if (!fetchCall) return [];
-              const [resolved] = await ctx.resolveCalls([fetchCall.ref], {
-                select: { location: true },
-              });
-              if (!resolved?.call) return [];
-              const [callTarget] = await ctx.calleesOf([resolved.call]);
-              if (!callTarget) return [];
-              return [
-                {
-                  subject: fetchCall.ref,
-                  value: { tainted: true },
-                  basis: [callTarget],
-                  evidence: [
-                    {
-                      kind: "note",
-                      message: "Derived taint from call target provenance.",
-                      at: fetchCall.location,
-                    },
-                  ],
-                },
-              ];
-            }),
-          ],
-        });
-
-        const session = await openProject({
-          cwd: host.rootDir,
-          tsconfig: "tsconfig.json",
-          adapters: [sourceAdapter, derivedAdapter],
-        });
-        try {
-          const ctx = session.project();
-          const origins = await ctx.facts(SourceOriginFact);
-          const derived = await ctx.facts(DerivedSinkFact);
-          assert.equal(origins.length, 1);
-          assert.equal(derived.length, 1);
-
-          const evidence = extractBasisEvidence([origins[0]!, derived[0]!]);
-          assert.ok(
-            evidence.some(
-              (ev) =>
-                ev.kind === "source" &&
-                ev.at?.file === "src/service.ts" &&
-                ev.at.line === 1,
-            ),
-            JSON.stringify(evidence),
-          );
-          assert.ok(
-            evidence.some(
-              (ev) =>
-                ev.kind === "note" &&
-                ev.message === "Derived taint from call target provenance." &&
-                ev.at?.line === 5,
-            ),
-            JSON.stringify(evidence),
-          );
-        } finally {
-          await session.close();
-        }
+  void it("threads provenance registered via registerProvenance() through evidenceOf() and extractBasisEvidence()", () => {
+    const loc = {
+      file: "src/schema.ts",
+      line: 4,
+      column: 1,
+      endLine: 4,
+      endColumn: 20,
+      start: 40,
+      end: 60,
+    };
+    const domainItem = registerProvenance({ schemaName: "userSchema" }, [
+      {
+        kind: "source",
+        message: "Zod object schema defined via z.object()",
+        at: loc,
       },
+    ]);
+
+    assert.equal(evidenceOf(domainItem).length, 1);
+    const combined = extractBasisEvidence([
+      domainItem,
+      { kind: "note", message: "Rule diagnostic note", at: loc },
+    ]);
+    assert.equal(combined.length, 2);
+    assert.equal(
+      combined[0]?.message,
+      "Zod object schema defined via z.object()",
     );
+    assert.equal(combined[1]?.message, "Rule diagnostic note");
   });
 });

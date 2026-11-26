@@ -4,9 +4,6 @@ import { describe, it } from "node:test";
 import { withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
   defineSummaries,
   openProject,
   type BranchRef,
@@ -86,32 +83,10 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
           ],
         });
 
-        const CallTagFact = defineFactType<"call", undefined, string>({
-          id: "test.call-tag",
-          subjectKind: "call",
-        });
-
-        const callTagAdapter = defineAdapter({
-          id: "call-tag-adapter",
-          provides: [
-            defineFactProvider(CallTagFact, async (ctx) => {
-              const calls = await ctx.findSyntax({ kinds: ["CallExpression"] });
-              const resolved = await ctx.resolveCalls(calls.map((c) => c.ref));
-              return resolved
-                .filter(
-                  (row): row is typeof row & { call: CallRef } =>
-                    row.call !== null,
-                )
-                .map((row) => ({ subject: row.call, value: "tagged" }));
-            }),
-          ],
-        });
-
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
           summaries: { packs: [resourceSummaries] },
-          adapters: [callTagAdapter],
         });
 
         try {
@@ -303,10 +278,6 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
               ctx2.instanceCleanup({
                 scopes: [],
                 targets: [staleInstanceRef],
-              }),
-            () =>
-              ctx2.facts(CallTagFact, {
-                targets: [staleCallRef],
               }),
           ];
 

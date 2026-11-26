@@ -18,7 +18,6 @@ import type {
   ValuePropagationPath,
   ValuePropagationTargetResult,
 } from "./calls-values.ts";
-import type { FactResult } from "./facts.ts";
 import type {
   InstanceProjectionSelection,
   InstanceResolutionResult,
@@ -43,7 +42,14 @@ import type {
   SyntaxRef,
 } from "./types.ts";
 
-/** Any individual query result, behavior summary, or fact item that carries per-item provenance. */
+declare const provenanceCarrierBrand: unique symbol;
+
+/** Structural marker attached by `registerProvenance` so domain-library results work in `basis` lists. */
+export type ProvenanceCarrier<T extends object = object> = T & {
+  readonly [provenanceCarrierBrand]: true;
+};
+
+/** Any individual query result, behavior summary, or provenance-registered domain item that carries per-item provenance. */
 export type SelectableQueryResult =
   | ValuePropagationPath
   | ValuePropagationTargetResult
@@ -69,7 +75,7 @@ export type SelectableQueryResult =
   | ProjectedCallResolutionRow<CallProjectionSelection>
   | ProjectedInstanceRow<InstanceProjectionSelection>
   | BehaviorSummaryPack
-  | FactResult;
+  | ProvenanceCarrier;
 
 /** Item accepted in `basis` lists to supply selected provenance or explicit evidence. */
 export type DiagnosticBasis = SelectableQueryResult | Evidence;
@@ -156,18 +162,18 @@ export function dedupeEvidence(
   return out;
 }
 
-/** Associates per-item provenance evidence with a materialized query result, behavior summary, or fact object. */
+/** Associates per-item provenance evidence with a materialized query result, behavior summary, or domain item. */
 export function registerProvenance<T extends object>(
   item: T,
   evidence: readonly Evidence[],
-): T {
+): ProvenanceCarrier<T> {
   provenanceRegistry.set(item, {
     evidence: dedupeEvidence(evidence),
   });
-  return item;
+  return item as ProvenanceCarrier<T>;
 }
 
-/** Returns the normalized provenance evidence recorded on a query result, behavior summary, or fact item. */
+/** Returns the normalized provenance evidence recorded on a query result, behavior summary, or domain item. */
 export function evidenceOf(item: SelectableQueryResult): readonly Evidence[] {
   if (typeof item !== "object" || item === null) {
     return [];

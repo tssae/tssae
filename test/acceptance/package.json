@@ -30,11 +30,9 @@
     "@tssae/test-hosts": "workspace:*"
   },
   "devDependencies": {
-    "@tssae/adapter-api": "workspace:*",
-    "@tssae/adapter-fixture": "workspace:*",
-    "@tssae/adapter-fixture-complement": "workspace:*",
-    "@tssae/adapters": "workspace:*",
+    "@tssae/drizzle": "workspace:*",
     "@tssae/tooling-config": "workspace:*",
+    "@tssae/zod": "workspace:*",
     "@types/node": "catalog:",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",

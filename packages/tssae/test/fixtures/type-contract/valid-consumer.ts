@@ -1,13 +1,10 @@
 import {
-  TssaeError,
   createAdditionalInputRegistry,
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
   defineSummaries,
   isSameInstance,
   extractBasisEvidence,
   openProject,
+  registerProvenance,
   type AdditionalInputEntry,
   type AdditionalInputRegistrar,
   type AdditionalInputSource,
@@ -15,10 +12,9 @@ import {
   type CallRef,
   type DeclarationRef,
   type ExplainCleanupPath,
-  type FactConflictDetails,
-  type FactConflictParty,
   type InstanceCleanupScopeResult,
   type InstanceRef,
+  type ProvenanceCarrier,
   type SignatureRef,
   type SyntaxRef,
   type TypeRef,
@@ -73,62 +69,19 @@ const extSummaries = defineSummaries({
 const registrar: AdditionalInputRegistrar = createAdditionalInputRegistry({
   cwd: "/tmp/workspace",
 });
-const adapterSource: AdditionalInputSource = {
-  kind: "adapter",
-  id: "demo-adapter",
+const ruleSource: AdditionalInputSource = {
+  kind: "rule",
+  id: "demo-rule",
 };
 const regEntry: AdditionalInputEntry = registrar.registerAdditionalInput(
   "allowed-packages.json",
-  adapterSource,
+  ruleSource,
 );
 void regEntry;
 
-const sampleFact = defineFactType<
-  "syntax",
-  { readonly strict?: boolean } | undefined,
-  readonly string[]
->({
-  id: "demo.sample-fact",
-  subjectKind: "syntax",
-  merge: (existing, incoming) => {
-    if (existing.value[0] === incoming.value[0]) {
-      return { ok: true, value: [...existing.value, ...incoming.value] };
-    }
-    return {
-      ok: false,
-      conflict: {
-        message: "Mismatched head tag",
-        existingConclusion: existing.value[0] ?? "none",
-        incomingConclusion: incoming.value[0] ?? "none",
-      },
-    };
-  },
-});
-
-function inspectConflict(
-  err: TssaeError,
-): readonly FactConflictParty[] | undefined {
-  const details: FactConflictDetails | undefined = err.conflict;
-  return details?.parties;
-}
-void inspectConflict;
-
-const sampleAdapter = defineAdapter({
-  id: "demo-adapter",
-  provides: [
-    defineFactProvider(sampleFact, async (ctx) => {
-      const adapterInput: AdditionalInputEntry = ctx.registerAdditionalInput(
-        "allowed-packages.json",
-      );
-      if (adapterInput.exists) {
-        const raw: string = ctx.readAdditionalInput("allowed-packages.json");
-        void raw;
-      }
-      const nodes = await ctx.findSyntax({ kinds: ["CallExpression"] });
-      return nodes.map((n) => ({ subject: n.ref, value: ["ok"] }));
-    }),
-  ],
-});
+const domainCarrier: ProvenanceCarrier<{ readonly name: string }> =
+  registerProvenance({ name: "demo" }, []);
+void extractBasisEvidence([domainCarrier]);
 
 export const sampleExplainPath: ExplainCleanupPath | undefined = undefined;
 export function inspectExplainSummaryIds(
@@ -141,7 +94,6 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
   const session = await openProject({
     cwd,
     tsconfig: "tsconfig.json",
-    adapters: [sampleAdapter],
     additionalInputs: ["allowed-packages.json"],
     summaries: { packs: [extSummaries] },
   });
@@ -158,12 +110,13 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
       range: { file: "src/app.ts", startLine: 1, endLine: 20 },
       kinds: ["CallExpression"],
     });
-    const facts = await ctx.facts(sampleFact, {
-      targets: syntaxNodes.map((n) => n.ref),
-      providerId: "demo-adapter",
-      condition: { strict: true },
-    });
-    void facts;
+    ctx.recordGaps([]);
+    const declRows = await ctx.resolveDeclarations(
+      syntaxNodes.map((n) => n.ref),
+      { select: { packageName: true, exportName: true } },
+    );
+    void declRows[0]?.packageName;
+    void declRows[0]?.exportName;
     const callResolutions = await ctx.resolveCalls(
       syntaxNodes.map((n) => n.ref),
       { select: { signature: true, location: true } },

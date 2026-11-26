@@ -54,9 +54,6 @@ function mapEngineErrorCode(code: string): TssaeErrorCode {
     case "STALE_REFERENCE":
     case "CROSS_PROJECT_REFERENCE":
     case "STALE_SNAPSHOT":
-    case "NATIVE_ADAPTER_LOAD":
-    case "NATIVE_ADAPTER_EXTRACT":
-    case "FACT_CONFLICT":
     case "SUMMARY_CONFLICT":
       return code;
     default:

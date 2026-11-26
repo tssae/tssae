@@ -1,0 +1,52 @@
+{
+  "extends": ["//"],
+  "tags": ["library"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": ["dist/**"],
+      "cache": false,
+      "tags": ["work:preparation"]
+    },
+    "format:check": {
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "format:write": {
+      "dependsOn": ["lint:fix"],
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "lint": {
+      "dependsOn": ["^lint", "@tssae/test-hosts#typecheck"],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "lint:fix": {
+      "inputs": [],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:repair"]
+    },
+    "test": {
+      "dependsOn": ["^build", "build", "@tssae/test-hosts#typecheck"],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    },
+    "typecheck": {
+      "dependsOn": [
+        "@tssae/tooling-config#typecheck",
+        "@tssae/test-hosts#typecheck"
+      ],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "tags": ["quality:light"]
+    }
+  }
+}

@@ -435,6 +435,42 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2339/u,
         },
+        {
+          name: "paths cannot be read on ValuePropagationTargetResult before narrowing to proved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.results[0]?.paths;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on ValuePropagationTargetResult before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.results[0]?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "reachable does not exist on ValuePropagationTargetResult",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.results[0]?.reachable;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps does not exist on aggregate ValuePropagationResult",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

@@ -365,11 +365,11 @@ try {
     to: [acceptRowResolved.arguments[0], unrelatedVar.initializer],
   });
   const [propPositive, propNegative] = propResult.results;
-  assert.equal(propPositive?.reachable, true);
-  assert.equal(propNegative?.reachable, false);
+  assert.equal(propPositive?.status, "proved");
+  assert.equal(propNegative?.status, "disproved");
 
-  const propPath = propPositive?.paths[0];
-  assert.ok(propPath);
+  assert.ok(propPositive?.status === "proved");
+  const propPath = propPositive.paths[0];
   const retained = resolveRetainedObjectFields(
     { fields: ["id", "name", "secret"] },
     propPath,

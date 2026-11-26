@@ -105,9 +105,9 @@ void describe("tssae selected query evidence", () => {
           const selectedFlow = propagation.results.find(
             (res) =>
               res.from.handleId === restrictedLoader.callSyntax.ref.handleId &&
-              res.reachable,
+              res.status === "proved",
           );
-          assert.ok(selectedFlow);
+          assert.ok(selectedFlow && selectedFlow.status === "proved");
           const selectedPath = selectedFlow.paths[0];
           assert.ok(selectedPath);
 

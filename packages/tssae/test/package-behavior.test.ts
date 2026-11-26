@@ -689,8 +689,8 @@ void describe("tssae first-party implementation resolution", () => {
           });
           assert.equal(prop.results.length, 3);
           for (const res of prop.results) {
-            assert.equal(res.reachable, false);
-            assert.ok(res.gaps.length > 0);
+            assert.equal(res.status, "inconclusive");
+            assert.ok(res.status === "inconclusive" && res.gaps.length > 0);
           }
 
           const instances = await ctx.resolveInstances([

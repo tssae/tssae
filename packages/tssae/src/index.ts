@@ -34,6 +34,7 @@ export {
   type EngineLoweringMetrics,
   type EngineRpcMetrics,
   type EngineStepMetrics,
+  type EngineSummaryLookupMetrics,
   type FactExplainEvent,
   type QueryCompletedEvent,
   type QueryObserver,
@@ -59,6 +60,23 @@ export {
 } from "./facts.ts";
 export { isSameInstance } from "./instance-identity.ts";
 export { defineModel, openProject } from "./session.ts";
+export {
+  defineSummaries,
+  type BehaviorSummaryEntry,
+  type BehaviorSummaryPack,
+  type CallAspectSummary,
+  type EffectAspectSummary,
+  type InstanceAspectSummary,
+  type SummaryAspectName,
+  type SummaryCompleteness,
+  type SummaryConflictDetails,
+  type SummaryConflictParty,
+  type SummaryDiscoverySource,
+  type SummaryOptions,
+  type SummaryTargetMatcher,
+  type SummaryValueRef,
+  type ValueAspectSummary,
+} from "./summaries.ts";
 export type {
   BranchBypassPath,
   BranchCoverageItem,

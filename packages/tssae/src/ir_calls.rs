@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -9,19 +9,22 @@ use tssae_analysis::{
     IrProvider,
     call_resolution::{
         CallParameterBindingData, CallTargetsOutcome, CallerSiteData, CallersOutcome, IrCallGraph,
-        ResolvedCallTargetData, build_ir_call_graph, find_callers_on_ir,
-        resolve_call_targets_on_ir,
+        ResolvedCallTargetData, build_ir_call_graph_with_summaries, find_callers_on_ir,
+        resolve_call_targets_with_summaries,
     },
     ir::{FunctionIr, IrScopeKind, ScopeCatalogEntry},
+    summaries::BehaviorSummaryIndex,
 };
 use tssae_common::{
-    DeclarationSummaryData, DiagnosticLocation, FileId, GapItem, ImplementationFact,
-    ImplementationSourceKind, MemberTargetHierarchy, SemanticModel, SignatureId, SymbolId,
-    SyntaxCatalog, SyntaxId, TypeId, TypeSummaryData, UnknownReason,
+    DeclarationIdentity, DeclarationSummaryData, DiagnosticLocation, FileId, GapItem,
+    ImplementationFact, ImplementationSourceKind, MemberTargetHierarchy, SemanticModel,
+    SignatureId, SummaryLookupStats, SummarySource, SymbolId, SyntaxCatalog, SyntaxId, TypeId,
+    TypeSummaryData, UnknownReason,
 };
 use tssae_tsrs_boundary::{FirstPartyResolutionSource, SemanticModelBridge, normalize_path};
 
 use crate::cfg::{EvidenceItem, resolve_enclosing_function};
+use crate::observe::ObserveCollector;
 use crate::package_impl::ResolvedImplTargetPayload;
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
@@ -108,6 +111,7 @@ struct SnapshotIrEnv<'a> {
     sf_by_file_id: FxHashMap<FileId, P<SourceFile>>,
     rel_paths_by_file_id: FxHashMap<FileId, String>,
     project_files: Vec<FileId>,
+    summary_stats: Cell<SummaryLookupStats>,
 }
 
 impl<'a> SnapshotIrEnv<'a> {
@@ -175,6 +179,7 @@ impl<'a> SnapshotIrEnv<'a> {
             sf_by_file_id,
             rel_paths_by_file_id,
             project_files,
+            summary_stats: Cell::new(SummaryLookupStats::default()),
         }
     }
 
@@ -285,6 +290,16 @@ impl SemanticModel for SnapshotIrEnv<'_> {
 
     fn check_call_missing_package_gap(&self, call_syntax: SyntaxId) -> Option<GapItem> {
         self.semantic.check_call_missing_package_gap(call_syntax)
+    }
+
+    fn declaration_identity(&self, syntax: SyntaxId) -> Option<DeclarationIdentity> {
+        self.semantic.declaration_identity(syntax)
+    }
+
+    fn record_summary_lookup(&self, source: Option<SummarySource>) {
+        let mut stats = self.summary_stats.get();
+        stats.record(source);
+        self.summary_stats.set(stats);
     }
 }
 
@@ -552,6 +567,7 @@ pub fn run_callees_of(
     program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
+    observer: &mut ObserveCollector,
 ) -> Result<Vec<CallTargetsRow>, RpcErr> {
     let mut call_nodes = Vec::with_capacity(targets.len());
     for handle_id in targets {
@@ -560,8 +576,16 @@ pub fn run_callees_of(
     }
 
     let workspace_programs = snapshot.workspace_programs();
-    let materialized_rows =
-        collect_materialized_callees(snapshot, program, &workspace_programs, checker, call_nodes);
+    let summary_index = Arc::clone(&snapshot.summary_index);
+    let materialized_rows = collect_materialized_callees(
+        snapshot,
+        program,
+        &workspace_programs,
+        checker,
+        &summary_index,
+        call_nodes,
+        observer,
+    )?;
 
     let mut rows = Vec::with_capacity(materialized_rows.len());
     for row in materialized_rows {
@@ -627,8 +651,10 @@ fn collect_materialized_callees(
     program: &'static Program,
     workspace_programs: &[&'static Program],
     checker: &mut CheckerHandle,
+    summary_index: &BehaviorSummaryIndex,
     call_nodes: Vec<(String, P<Node>)>,
-) -> Vec<MaterializedCalleesRow> {
+    observer: &mut ObserveCollector,
+) -> Result<Vec<MaterializedCalleesRow>, RpcErr> {
     let env = SnapshotIrEnv::from_snapshot(snapshot, program, workspace_programs, checker);
     let mut out = Vec::with_capacity(call_nodes.len());
     for (call_id, call_node) in call_nodes {
@@ -642,9 +668,23 @@ fn collect_materialized_callees(
                 )],
                 is_complete: false,
                 evidence: Vec::new(),
+                conflict: None,
             },
-            |call_syn| resolve_call_targets_on_ir(call_syn, &env, &env, &env),
+            |call_syn| {
+                resolve_call_targets_with_summaries(call_syn, &env, &env, &env, summary_index)
+            },
         );
+        if let Some(conflict) = outcome.conflict {
+            let stats = env.summary_stats.get();
+            observer.record_summary_lookup_stats(&stats);
+            drop(env);
+            let details = serde_json::to_value(&conflict).unwrap_or(serde_json::Value::Null);
+            return Err(RpcErr::with_details(
+                "SUMMARY_CONFLICT",
+                conflict.format_message(),
+                details,
+            ));
+        }
         let mut mtargets: Vec<MaterializedTarget> = outcome
             .targets
             .into_iter()
@@ -670,8 +710,10 @@ fn collect_materialized_callees(
             is_complete: outcome.is_complete,
         });
     }
+    let stats = env.summary_stats.get();
+    observer.record_summary_lookup_stats(&stats);
     drop(env);
-    out
+    Ok(out)
 }
 
 pub fn run_callers_of(
@@ -681,6 +723,7 @@ pub fn run_callers_of(
     checker: &mut CheckerHandle,
     targets: &[String],
     lookup_files: Option<&[String]>,
+    observer: &mut ObserveCollector,
 ) -> Result<Vec<DeclarationCallersRow>, RpcErr> {
     let mut decl_inputs = Vec::with_capacity(targets.len());
     for handle_id in targets {
@@ -696,6 +739,7 @@ pub fn run_callers_of(
 
     let workspace_programs = snapshot.workspace_programs();
     let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
+    let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
         let mut set = FxHashSet::default();
@@ -712,10 +756,12 @@ pub fn run_callers_of(
         program,
         &workspace_programs,
         checker,
+        &summary_index,
         decl_inputs,
         cached_graph,
         allowed_files.as_ref(),
-    );
+        observer,
+    )?;
 
     if let Some(g) = newly_built_graph {
         snapshot
@@ -769,23 +815,43 @@ pub fn run_callers_of(
     Ok(rows)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Coordinates snapshot IR call graph caching, summary lookup metrics, and caller filtering."
+)]
 fn collect_materialized_callers(
     snapshot: &mut SnapshotState,
     program: &'static Program,
     workspace_programs: &[&'static Program],
     checker: &mut CheckerHandle,
+    summary_index: &BehaviorSummaryIndex,
     decl_inputs: Vec<(String, P<Node>, Option<P<Symbol>>)>,
     cached_graph: Option<Arc<IrCallGraph>>,
     allowed_files: Option<&FxHashSet<FileId>>,
-) -> (Vec<MaterializedCallersRow>, Option<Arc<IrCallGraph>>) {
+    observer: &mut ObserveCollector,
+) -> Result<(Vec<MaterializedCallersRow>, Option<Arc<IrCallGraph>>), RpcErr> {
     let env = SnapshotIrEnv::from_snapshot(snapshot, program, workspace_programs, checker);
     let (graph_arc, built_now) = cached_graph.map_or_else(
         || {
-            let g = Arc::new(build_ir_call_graph(&env.project_files, &env, &env, &env));
+            let g = Arc::new(build_ir_call_graph_with_summaries(
+                &env.project_files,
+                &env,
+                &env,
+                &env,
+                summary_index,
+            ));
             (Arc::clone(&g), Some(g))
         },
         |existing| (existing, None),
     );
+    if let Some(conflict) = &graph_arc.conflict {
+        let stats = env.summary_stats.get();
+        observer.record_summary_lookup_stats(&stats);
+        let msg = conflict.format_message();
+        let details = serde_json::to_value(conflict).unwrap_or(serde_json::Value::Null);
+        drop(env);
+        return Err(RpcErr::with_details("SUMMARY_CONFLICT", msg, details));
+    }
 
     let mut out = Vec::with_capacity(decl_inputs.len());
     for (decl_id, decl_node, sym_opt) in decl_inputs {
@@ -829,6 +895,8 @@ fn collect_materialized_callers(
             is_complete: outcome.is_complete,
         });
     }
+    let stats = env.summary_stats.get();
+    observer.record_summary_lookup_stats(&stats);
     drop(env);
-    (out, built_now)
+    Ok((out, built_now))
 }

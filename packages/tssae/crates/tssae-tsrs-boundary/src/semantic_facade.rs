@@ -1709,6 +1709,13 @@ impl SemanticModel for SemanticModelBridge<'_> {
         let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
         facade.check_call_missing_package_gap(node)
     }
+
+    fn declaration_identity(&self, syntax: SyntaxId) -> Option<tssae_common::DeclarationIdentity> {
+        let node = self.node_for_syntax(syntax)?;
+        let mut checker = self.checker.borrow_mut();
+        let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
+        facade.extract_declaration_identity(node)
+    }
 }
 
 pub(crate) struct ResolvedDeclarationNodes {

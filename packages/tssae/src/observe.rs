@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use serde::{Deserialize, Serialize};
+use tssae_common::SummaryLookupStats;
 
 /// Engine-side observation verbosity level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -78,6 +79,26 @@ pub struct EngineIrCacheMetrics {
     pub files_invalidated: usize,
 }
 
+/// Per-source behavior summary hit counts for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSummarySourceHits {
+    pub local: usize,
+    pub package: usize,
+    pub community: usize,
+    pub builtin: usize,
+}
+
+/// Engine-side behavior summary lookup counters for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSummaryLookupMetrics {
+    pub lookups: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub hits_by_source: EngineSummarySourceHits,
+}
+
 /// Engine-side metrics attached to an RPC response only when observation is enabled.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +111,7 @@ pub struct EngineRpcMetrics {
     pub steps: Vec<EngineStepMetrics>,
     pub lowering: EngineLoweringMetrics,
     pub ir_cache: EngineIrCacheMetrics,
+    pub summary_lookup: EngineSummaryLookupMetrics,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
@@ -108,6 +130,7 @@ pub struct ObserveCollector {
     steps: Vec<EngineStepMetrics>,
     lowering: EngineLoweringMetrics,
     ir_cache: EngineIrCacheMetrics,
+    summary_lookup: EngineSummaryLookupMetrics,
     provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
 
@@ -133,6 +156,7 @@ impl ObserveCollector {
             steps: Vec::new(),
             lowering: EngineLoweringMetrics::default(),
             ir_cache: EngineIrCacheMetrics::default(),
+            summary_lookup: EngineSummaryLookupMetrics::default(),
             provider_extractions: BTreeMap::new(),
         }
     }
@@ -189,6 +213,18 @@ impl ObserveCollector {
         if self.is_active() {
             self.ir_cache.files_reused += files_reused;
             self.ir_cache.files_invalidated += files_invalidated;
+        }
+    }
+
+    pub const fn record_summary_lookup_stats(&mut self, stats: &SummaryLookupStats) {
+        if self.is_active() {
+            self.summary_lookup.lookups += stats.lookups;
+            self.summary_lookup.hits += stats.hits;
+            self.summary_lookup.misses += stats.misses;
+            self.summary_lookup.hits_by_source.local += stats.local_hits;
+            self.summary_lookup.hits_by_source.package += stats.package_hits;
+            self.summary_lookup.hits_by_source.community += stats.community_hits;
+            self.summary_lookup.hits_by_source.builtin += stats.builtin_hits;
         }
     }
 
@@ -315,6 +351,7 @@ impl ObserveCollector {
             steps: self.steps,
             lowering: self.lowering,
             ir_cache: self.ir_cache,
+            summary_lookup: self.summary_lookup,
             provider_extractions: self.provider_extractions,
         })
     }

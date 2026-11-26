@@ -7,6 +7,7 @@ pub mod branch_coverage;
 pub mod call_resolution;
 pub mod class_overrides;
 pub mod ir;
+pub mod summaries;
 pub mod var_writes;
 
 pub use ir::IrProvider;

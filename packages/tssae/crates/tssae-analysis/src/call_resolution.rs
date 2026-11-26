@@ -6,9 +6,11 @@ use std::{
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_common::{
-    DeclarationSummaryData, DiagnosticLocation, EvidenceItem, FileId, FunctionIrId, GapItem,
-    ImplementationFact, ResolvedImplementationFact, SemanticModel, SymbolId, SyntaxCatalog,
-    SyntaxId, UnknownReason, ValueId,
+    CallAspectSummary, DeclarationIdentity, DeclarationSummaryData, DiagnosticLocation,
+    EvidenceItem, FileId, ForwardCallMode, ForwardCallTarget, FunctionIrId, GapItem,
+    ImplementationFact, ResolvedImplementationFact, SemanticModel, SummaryCompleteness,
+    SummaryConflictError, SummaryNamedValueRef, SummarySource, SummaryTaggedValueRef,
+    SummaryValueRef, SymbolId, SyntaxCatalog, SyntaxId, UnknownReason, ValueAspectSummary, ValueId,
 };
 
 use crate::{
@@ -17,6 +19,7 @@ use crate::{
         CfgVertex, FunctionIr, ImplicitAccessorKind, IrArrayElem, IrCallArg, IrCallKind,
         IrObjectProp, IrOp, IrPropKey, IrProvider, LiteralKind,
     },
+    summaries::{BehaviorSummaryIndex, MatchedSummaryAspect},
     var_writes::{self, VarWriteSource},
 };
 
@@ -55,6 +58,7 @@ pub struct CallTargetsOutcome {
     pub gaps: Vec<GapItem>,
     pub is_complete: bool,
     pub evidence: Vec<EvidenceItem>,
+    pub conflict: Option<SummaryConflictError>,
 }
 
 /// One caller site matched by [`find_callers_on_ir`].
@@ -100,6 +104,7 @@ pub struct IrCallGraph {
     pub by_decl: FxHashMap<SyntaxId, Vec<usize>>,
     pub by_symbol: FxHashMap<SymbolId, Vec<usize>>,
     pub incomplete_sites: Vec<usize>,
+    pub conflict: Option<SummaryConflictError>,
 }
 
 /// Static frame mapping callee parameters back to caller arguments during inter-procedural tracing.
@@ -107,6 +112,16 @@ pub struct IrCallGraph {
 struct CallFrame {
     caller_ir: Arc<FunctionIr>,
     args: Vec<IrCallArg>,
+}
+
+/// Active call context threaded while resolving a direct call or constructor expression.
+#[derive(Clone, Copy)]
+struct ActiveCallContext<'a> {
+    caller_ir: &'a Arc<FunctionIr>,
+    receiver: Option<ValueId>,
+    args: &'a [IrCallArg],
+    call_stack: &'a [CallFrame],
+    is_construct: bool,
 }
 
 /// Internal intermediate callable descriptor prior to parameter-binding & return enrichment.
@@ -120,6 +135,7 @@ struct RawTargetDescriptor {
     is_external: bool,
     is_default_library: bool,
     implementation: Option<ResolvedImplementationFact>,
+    args_offset: usize,
 }
 
 /// Mutable state threaded through IR callee value tracing.
@@ -129,6 +145,7 @@ struct TraceCollector<'a> {
     semantic: &'a dyn SemanticModel,
     syntax: &'a dyn SyntaxCatalog,
     ir_provider: &'a dyn IrProvider,
+    summary_index: &'a BehaviorSummaryIndex,
     targets: Vec<RawTargetDescriptor>,
     seen_targets: FxHashSet<SyntaxId>,
     gaps: Vec<GapItem>,
@@ -138,6 +155,7 @@ struct TraceCollector<'a> {
     is_untyped_dynamic_incomplete: bool,
     open_member_name: Option<String>,
     visited: FxHashSet<(FunctionIrId, ValueId, usize)>,
+    conflict: Option<SummaryConflictError>,
 }
 
 impl<'a> TraceCollector<'a> {
@@ -147,6 +165,7 @@ impl<'a> TraceCollector<'a> {
         semantic: &'a dyn SemanticModel,
         syntax: &'a dyn SyntaxCatalog,
         ir_provider: &'a dyn IrProvider,
+        summary_index: &'a BehaviorSummaryIndex,
     ) -> Self {
         Self {
             call_syntax,
@@ -154,6 +173,7 @@ impl<'a> TraceCollector<'a> {
             semantic,
             syntax,
             ir_provider,
+            summary_index,
             targets: Vec::new(),
             seen_targets: FxHashSet::default(),
             gaps: Vec::new(),
@@ -163,6 +183,7 @@ impl<'a> TraceCollector<'a> {
             is_untyped_dynamic_incomplete: false,
             open_member_name: None,
             visited: FxHashSet::default(),
+            conflict: None,
         }
     }
 
@@ -186,17 +207,39 @@ impl<'a> TraceCollector<'a> {
     fn push_target(&mut self, target: RawTargetDescriptor) {
         if let Some(loc) = &target.location {
             let decl_name = target.name.clone().unwrap_or_else(|| "target".to_string());
-            self.evidence.push(EvidenceItem {
-                kind: "source",
-                message: format!("Resolved call target '{decl_name}'."),
-                at: Some(loc.clone()),
-                model_id: None,
-                declaration: target.name.clone(),
-            });
+            self.evidence.push(EvidenceItem::simple(
+                "source",
+                format!("Resolved call target '{decl_name}'."),
+                Some(loc.clone()),
+            ));
+            if let Some(last) = self.evidence.last_mut() {
+                last.declaration.clone_from(&target.name);
+            }
         }
         if self.seen_targets.insert(target.decl_syntax) {
             self.targets.push(target);
         }
+    }
+
+    fn push_summary_evidence(
+        &mut self,
+        source: SummarySource,
+        pack_id: &str,
+        target_label: &str,
+        at: Option<DiagnosticLocation>,
+    ) {
+        self.evidence.push(EvidenceItem::summary(
+            format!(
+                "Applied {} behavior summary '{}' for '{}'.",
+                source.as_str(),
+                pack_id,
+                target_label
+            ),
+            at,
+            source.as_str().to_string(),
+            pack_id.to_string(),
+            Some(target_label.to_string()),
+        ));
     }
 }
 
@@ -208,7 +251,20 @@ pub fn resolve_call_targets_on_ir(
     syntax: &dyn SyntaxCatalog,
     ir_provider: &dyn IrProvider,
 ) -> CallTargetsOutcome {
-    let analyzed = analyze_call_vertex(call_syntax, semantic, syntax, ir_provider);
+    let default_index = BehaviorSummaryIndex::default();
+    resolve_call_targets_with_summaries(call_syntax, semantic, syntax, ir_provider, &default_index)
+}
+
+/// Resolves all reachable callee declarations using `summary_index` for external and summarized calls.
+#[must_use]
+pub fn resolve_call_targets_with_summaries(
+    call_syntax: SyntaxId,
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
+) -> CallTargetsOutcome {
+    let analyzed = analyze_call_vertex(call_syntax, semantic, syntax, ir_provider, summary_index);
     analyzed.outcome
 }
 
@@ -229,10 +285,17 @@ fn analyze_call_vertex(
     semantic: &dyn SemanticModel,
     syntax: &dyn SyntaxCatalog,
     ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
 ) -> AnalyzedCallSite {
     let call_loc = syntax.syntax_location(call_syntax);
-    let mut collector =
-        TraceCollector::new(call_syntax, call_loc.clone(), semantic, syntax, ir_provider);
+    let mut collector = TraceCollector::new(
+        call_syntax,
+        call_loc.clone(),
+        semantic,
+        syntax,
+        ir_provider,
+        summary_index,
+    );
 
     if let Some(missing_pkg_gap) = semantic.check_call_missing_package_gap(call_syntax) {
         collector.push_gap(missing_pkg_gap);
@@ -250,6 +313,7 @@ fn analyze_call_vertex(
                 gaps: collector.gaps,
                 is_complete: false,
                 evidence: collector.evidence,
+                conflict: None,
             },
             caller_decl_syntax: None,
             caller_symbol: None,
@@ -270,6 +334,7 @@ fn analyze_call_vertex(
                 gaps: collector.gaps,
                 is_complete: false,
                 evidence: collector.evidence,
+                conflict: None,
             },
             caller_decl_syntax,
             caller_symbol,
@@ -287,9 +352,16 @@ fn analyze_call_vertex(
             args,
         } => {
             arg_syntaxes = collect_arg_syntaxes(&ir, args, syntax);
+            let call_ctx = ActiveCallContext {
+                caller_ir: &ir,
+                receiver: *receiver,
+                args,
+                call_stack: &[],
+                is_construct: false,
+            };
             match call_kind {
                 IrCallKind::Explicit | IrCallKind::TaggedTemplate | IrCallKind::DecoratorApply => {
-                    trace_callable_value(&ir, *callee, &[], 0, &mut collector);
+                    trace_callable_value(&ir, *callee, &[], 0, Some(call_ctx), 0, &mut collector);
                 }
                 IrCallKind::SuperCall => {
                     resolve_super_constructor_call(call_syntax, &mut collector);
@@ -314,6 +386,8 @@ fn analyze_call_vertex(
                         false,
                         MemberAccessKind::MethodOrProp,
                         &[],
+                        Some(call_ctx),
+                        0,
                         &mut collector,
                     );
                 }
@@ -326,22 +400,27 @@ fn analyze_call_vertex(
         }
         IrOp::Construct { callee, args, .. } => {
             arg_syntaxes = collect_arg_syntaxes(&ir, args, syntax);
-            trace_construct_value(&ir, *callee, &[], 0, &mut collector);
+            let call_ctx = ActiveCallContext {
+                caller_ir: &ir,
+                receiver: None,
+                args,
+                call_stack: &[],
+                is_construct: true,
+            };
+            trace_construct_value(&ir, *callee, &[], 0, Some(call_ctx), &mut collector);
         }
         _ => {}
     }
 
     if let Some(loc) = &call_loc {
-        collector.evidence.push(EvidenceItem {
-            kind: "source",
-            message: "Analyzed call site on IR.".to_string(),
-            at: Some(loc.clone()),
-            model_id: None,
-            declaration: None,
-        });
+        collector.evidence.push(EvidenceItem::simple(
+            "source",
+            "Analyzed call site on IR.".to_string(),
+            Some(loc.clone()),
+        ));
     }
 
-    if collector.targets.is_empty() && collector.is_complete {
+    if collector.targets.is_empty() && collector.is_complete && collector.conflict.is_none() {
         collector.push_dynamic_gap("Call target could not be statically determined.");
     }
 
@@ -357,6 +436,7 @@ fn analyze_call_vertex(
             gaps: collector.gaps,
             is_complete: collector.is_complete,
             evidence: collector.evidence,
+            conflict: collector.conflict,
         },
         caller_decl_syntax,
         caller_symbol,
@@ -455,7 +535,7 @@ fn resolve_super_constructor_call(call_syntax: SyntaxId, collector: &mut TraceCo
         collector.push_dynamic_gap("Could not resolve `super()` target constructor.");
         return;
     };
-    emit_resolved_declaration(&decl, Some(call_syntax), false, collector);
+    emit_resolved_declaration(&decl, Some(call_syntax), false, None, 0, collector);
 }
 
 fn resolve_implicit_getter_call(
@@ -491,7 +571,14 @@ fn resolve_implicit_getter_call(
                 .semantic
                 .resolve_declaration(collector.call_syntax)
         {
-            emit_resolved_declaration(&decl, Some(collector.call_syntax), false, collector);
+            emit_resolved_declaration(
+                &decl,
+                Some(collector.call_syntax),
+                false,
+                None,
+                0,
+                collector,
+            );
             return;
         }
         resolve_member_call(
@@ -501,6 +588,8 @@ fn resolve_implicit_getter_call(
             *is_super,
             MemberAccessKind::Getter,
             &[],
+            None,
+            0,
             collector,
         );
     }
@@ -544,6 +633,8 @@ fn resolve_implicit_setter_call(
             *is_super,
             MemberAccessKind::Setter,
             &[],
+            None,
+            0,
             collector,
         );
         return;
@@ -553,7 +644,14 @@ fn resolve_implicit_setter_call(
         .semantic
         .resolve_declaration(collector.call_syntax)
     {
-        emit_resolved_declaration(&decl, Some(collector.call_syntax), false, collector);
+        emit_resolved_declaration(
+            &decl,
+            Some(collector.call_syntax),
+            false,
+            None,
+            0,
+            collector,
+        );
     } else {
         collector.push_dynamic_gap("Could not locate setter target declaration.");
     }
@@ -576,6 +674,7 @@ fn value_producers(ir: &FunctionIr, val: ValueId) -> Vec<&CfgVertex> {
 fn emit_function_literal_target(
     fn_syn: SyntaxId,
     vertex_syntax: Option<SyntaxId>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
     let sym = collector.semantic.symbol_at_syntax(fn_syn);
@@ -598,6 +697,7 @@ fn emit_function_literal_target(
         is_external,
         is_default_library: decl_info.as_ref().is_some_and(|d| d.is_default_library),
         implementation: None,
+        args_offset,
     });
 }
 
@@ -606,8 +706,13 @@ fn trace_callable_value(
     val: ValueId,
     call_stack: &[CallFrame],
     depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
+    if collector.conflict.is_some() {
+        return;
+    }
     if depth >= MAX_TRACE_DEPTH {
         collector.push_dynamic_gap("Call target tracing exceeded maximum recursion depth.");
         return;
@@ -623,7 +728,15 @@ fn trace_callable_value(
         && !sources.is_empty()
     {
         for &src in sources {
-            trace_callable_value(ir, src, call_stack, depth + 1, collector);
+            trace_callable_value(
+                ir,
+                src,
+                call_stack,
+                depth + 1,
+                call_ctx,
+                args_offset,
+                collector,
+            );
         }
         return;
     }
@@ -635,90 +748,141 @@ fn trace_callable_value(
     }
 
     for v in producers {
-        match &v.op {
-            IrOp::FunctionLiteral { syntax: fn_syn, .. } => {
-                emit_function_literal_target(*fn_syn, v.syntax, collector);
-            }
-            IrOp::ValueForward { source, .. }
-            | IrOp::AssignLocal { value: source, .. }
-            | IrOp::AssignSymbol { value: source, .. } => {
-                trace_callable_value(ir, *source, call_stack, depth + 1, collector);
-            }
-            IrOp::Literal {
-                kind: LiteralKind::Null | LiteralKind::Undefined,
-                ..
-            } => {}
-            IrOp::Literal { .. } => {
-                collector.push_dynamic_gap("Cannot statically call a primitive literal value.");
-            }
-            IrOp::ClassLiteral { .. } => {
-                collector.push_dynamic_gap(
-                    "Class constructors require `new` and cannot be invoked directly.",
-                );
-            }
-            IrOp::ReadLocal { binding } => {
-                trace_read_local_callee(ir, v, *binding, call_stack, depth, collector);
-            }
-            IrOp::ReadSymbol { ident_syntax } => {
-                resolve_symbol_callee(*ident_syntax, depth, collector);
-            }
-            IrOp::PropRead {
-                object,
-                key,
-                is_super,
-                ..
-            } => {
-                resolve_prop_read_callable(
-                    ir, v, *object, key, *is_super, call_stack, depth, collector,
-                );
-            }
-            IrOp::IteratorNext { iterator, .. } => {
-                trace_iterator_element_callable(ir, v, *iterator, call_stack, depth, collector);
-            }
-            IrOp::IteratorRest { .. } | IrOp::ObjectRest { .. } => {
-                collector.push_dynamic_gap(
-                    "Rest destructuring target cannot yield a callable function.",
-                );
-            }
-            IrOp::Call {
-                callee: inner_callee,
-                args: inner_args,
-                ..
-            } => {
-                trace_call_return_values(
-                    ir,
-                    v.syntax,
-                    *inner_callee,
-                    inner_args,
-                    call_stack,
-                    depth,
-                    collector,
-                    false,
-                );
-            }
-            IrOp::Await { promise } => {
-                trace_callable_value(ir, *promise, call_stack, depth + 1, collector);
-            }
-            IrOp::ThisRef | IrOp::SuperRef | IrOp::MetaProp => {
-                collector.push_dynamic_gap(
-                    "Dynamic `this`/`super`/meta property callee cannot be resolved statically.",
-                );
-            }
-            _ => {
-                collector.push_dynamic_gap(
-                    "Callee expression could not be resolved to static declarations.",
-                );
-            }
+        if collector.conflict.is_some() {
+            return;
         }
+        trace_callable_vertex_op(ir, v, call_stack, depth, call_ctx, args_offset, collector);
     }
 }
 
+fn trace_callable_vertex_op(
+    ir: &Arc<FunctionIr>,
+    v: &CfgVertex,
+    call_stack: &[CallFrame],
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) {
+    match &v.op {
+        IrOp::FunctionLiteral { syntax: fn_syn, .. } => {
+            emit_function_literal_target(*fn_syn, v.syntax, args_offset, collector);
+        }
+        IrOp::ValueForward { source, .. }
+        | IrOp::AssignLocal { value: source, .. }
+        | IrOp::AssignSymbol { value: source, .. } => {
+            trace_callable_value(
+                ir,
+                *source,
+                call_stack,
+                depth + 1,
+                call_ctx,
+                args_offset,
+                collector,
+            );
+        }
+        IrOp::Literal {
+            kind: LiteralKind::Null | LiteralKind::Undefined,
+            ..
+        } => {}
+        IrOp::ReadLocal { binding } => {
+            trace_read_local_callee(
+                ir,
+                v,
+                *binding,
+                call_stack,
+                depth,
+                call_ctx,
+                args_offset,
+                collector,
+            );
+        }
+        IrOp::ReadSymbol { ident_syntax } => {
+            resolve_symbol_callee(*ident_syntax, depth, call_ctx, args_offset, collector);
+        }
+        IrOp::PropRead {
+            object,
+            key,
+            is_super,
+            ..
+        } => {
+            resolve_prop_read_callable(
+                ir,
+                v,
+                *object,
+                key,
+                *is_super,
+                call_stack,
+                depth,
+                call_ctx,
+                args_offset,
+                collector,
+            );
+        }
+        IrOp::IteratorNext { iterator, .. } => {
+            trace_iterator_element_callable(ir, v, *iterator, call_stack, depth, collector);
+        }
+        IrOp::Call {
+            callee: inner_callee,
+            receiver: inner_receiver,
+            args: inner_args,
+            ..
+        } => {
+            trace_call_return_values(
+                ir,
+                v.syntax,
+                *inner_callee,
+                *inner_receiver,
+                inner_args,
+                call_stack,
+                depth,
+                collector,
+                false,
+            );
+        }
+        IrOp::Await { promise } => {
+            trace_callable_value(
+                ir,
+                *promise,
+                call_stack,
+                depth + 1,
+                call_ctx,
+                args_offset,
+                collector,
+            );
+        }
+        other => collector.push_dynamic_gap(non_callable_op_gap(other)),
+    }
+}
+
+const fn non_callable_op_gap(op: &IrOp) -> &'static str {
+    match op {
+        IrOp::Literal { .. } => "Cannot statically call a primitive literal value.",
+        IrOp::ClassLiteral { .. } => {
+            "Class constructors require `new` and cannot be invoked directly."
+        }
+        IrOp::IteratorRest { .. } | IrOp::ObjectRest { .. } => {
+            "Rest destructuring target cannot yield a callable function."
+        }
+        IrOp::ThisRef | IrOp::SuperRef | IrOp::MetaProp => {
+            "Dynamic `this`/`super`/meta property callee cannot be resolved statically."
+        }
+        _ => "Callee expression could not be resolved to static declarations.",
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Traces local variable writes, CallFrame parameters, and callback parameter summaries."
+)]
 fn trace_read_local_callee(
     ir: &Arc<FunctionIr>,
     read_vertex: &CfgVertex,
     binding: tssae_common::LocalBindingId,
     call_stack: &[CallFrame],
     depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
     let mut handled_by_frame = false;
@@ -737,6 +901,8 @@ fn trace_read_local_callee(
                     *arg_val,
                     parent_stack,
                     depth + 1,
+                    call_ctx,
+                    args_offset,
                     collector,
                 );
             }
@@ -778,10 +944,19 @@ fn trace_read_local_callee(
                     is_external: collector.semantic.is_external_syntax(fn_syn),
                     is_default_library: decl.as_ref().is_some_and(|d| d.is_default_library),
                     implementation: None,
+                    args_offset,
                 });
             }
             VarWriteSource::Value(w_val) => {
-                trace_callable_value(&write.scope_ir, w_val, call_stack, depth + 1, collector);
+                trace_callable_value(
+                    &write.scope_ir,
+                    w_val,
+                    call_stack,
+                    depth + 1,
+                    call_ctx,
+                    args_offset,
+                    collector,
+                );
             }
             VarWriteSource::Uninitialized => {
                 if !handled_by_frame {
@@ -799,13 +974,17 @@ fn trace_read_local_callee(
     }
 
     if writes_res.entry_param_reaches && !handled_by_frame {
-        let param_name = ir
-            .bindings
-            .get(binding.0 as usize)
-            .map_or("<param>", |b| b.name.as_str());
-        collector.push_dynamic_gap(format!(
-            "Callee parameter '{param_name}' holds an unknown runtime callback value."
-        ));
+        let resolved_completely =
+            resolve_callback_param_from_callers(ir, binding, depth, collector);
+        if !resolved_completely && collector.conflict.is_none() {
+            let param_name = ir
+                .bindings
+                .get(binding.0 as usize)
+                .map_or("<param>", |b| b.name.as_str());
+            collector.push_dynamic_gap(format!(
+                "Callee parameter '{param_name}' holds an unknown runtime callback value."
+            ));
+        }
     }
 }
 
@@ -814,8 +993,12 @@ fn trace_construct_value(
     val: ValueId,
     call_stack: &[CallFrame],
     depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
     collector: &mut TraceCollector<'_>,
 ) {
+    if collector.conflict.is_some() {
+        return;
+    }
     if depth >= MAX_TRACE_DEPTH {
         collector.push_dynamic_gap("Constructor target tracing exceeded maximum depth.");
         return;
@@ -825,7 +1008,7 @@ fn trace_construct_value(
         && !sources.is_empty()
     {
         for &src in sources {
-            trace_construct_value(ir, src, call_stack, depth + 1, collector);
+            trace_construct_value(ir, src, call_stack, depth + 1, call_ctx, collector);
         }
         return;
     }
@@ -837,95 +1020,140 @@ fn trace_construct_value(
     }
 
     for v in producers {
-        match &v.op {
-            IrOp::ClassLiteral { syntax: class_syn } => {
-                emit_class_constructor_from_syntax(*class_syn, collector);
-            }
-            IrOp::ValueForward { source, .. }
-            | IrOp::AssignLocal { value: source, .. }
-            | IrOp::AssignSymbol { value: source, .. } => {
-                trace_construct_value(ir, *source, call_stack, depth + 1, collector);
-            }
-            IrOp::ReadSymbol { ident_syntax } => {
-                if let Some(decl) = collector.semantic.resolve_declaration(*ident_syntax) {
-                    emit_constructor_from_decl(&decl, depth, collector);
-                } else {
-                    collector.push_dynamic_gap("Constructor target symbol could not be resolved.");
+        if collector.conflict.is_some() {
+            return;
+        }
+        trace_construct_vertex_op(ir, v, call_stack, depth, call_ctx, collector);
+    }
+}
+
+fn trace_construct_vertex_op(
+    ir: &Arc<FunctionIr>,
+    v: &CfgVertex,
+    call_stack: &[CallFrame],
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    collector: &mut TraceCollector<'_>,
+) {
+    match &v.op {
+        IrOp::ClassLiteral { syntax: class_syn } => {
+            emit_class_constructor_from_syntax(*class_syn, collector);
+        }
+        IrOp::ValueForward { source, .. }
+        | IrOp::AssignLocal { value: source, .. }
+        | IrOp::AssignSymbol { value: source, .. } => {
+            trace_construct_value(ir, *source, call_stack, depth + 1, call_ctx, collector);
+        }
+        IrOp::ReadSymbol { ident_syntax } => {
+            if let Some(decl) = collector.semantic.resolve_declaration(*ident_syntax) {
+                let mut lookup_syns = vec![*ident_syntax];
+                if depth == 0 {
+                    lookup_syns.insert(0, collector.call_syntax);
                 }
+                if try_apply_calls_summary(
+                    &lookup_syns,
+                    Some(&decl),
+                    call_ctx.as_ref(),
+                    depth,
+                    0,
+                    collector,
+                ) {
+                    return;
+                }
+                emit_constructor_from_decl(&decl, depth, collector);
+            } else {
+                collector.push_dynamic_gap("Constructor target symbol could not be resolved.");
             }
-            IrOp::ReadLocal { binding } => {
-                let mut handled_by_frame = false;
-                if let Some((frame, parent_stack)) = call_stack.split_last()
-                    && let Some(param_idx) = ir
-                        .parameters
-                        .iter()
-                        .position(|p| p.binding == Some(*binding))
-                    && let Some(IrCallArg::Positional(arg_val)) = frame.args.get(param_idx)
-                {
-                    handled_by_frame = true;
+        }
+        IrOp::ReadLocal { binding } => {
+            let mut handled_by_frame = false;
+            if let Some((frame, parent_stack)) = call_stack.split_last()
+                && let Some(param_idx) = ir
+                    .parameters
+                    .iter()
+                    .position(|p| p.binding == Some(*binding))
+                && let Some(IrCallArg::Positional(arg_val)) = frame.args.get(param_idx)
+            {
+                handled_by_frame = true;
+                trace_construct_value(
+                    &frame.caller_ir,
+                    *arg_val,
+                    parent_stack,
+                    depth + 1,
+                    call_ctx,
+                    collector,
+                );
+            }
+            let writes = var_writes::resolve_reaching_writes_for_local(
+                ir,
+                v.id,
+                *binding,
+                collector.semantic,
+                collector.syntax,
+                collector.ir_provider,
+            );
+            for write in &writes.writes {
+                if let VarWriteSource::Value(w_val) = write.source {
                     trace_construct_value(
-                        &frame.caller_ir,
-                        *arg_val,
-                        parent_stack,
+                        &write.scope_ir,
+                        w_val,
+                        call_stack,
                         depth + 1,
+                        call_ctx,
                         collector,
                     );
                 }
-                let writes = var_writes::resolve_reaching_writes_for_local(
-                    ir,
-                    v.id,
-                    *binding,
-                    collector.semantic,
-                    collector.syntax,
-                    collector.ir_provider,
-                );
-                for write in &writes.writes {
-                    if let VarWriteSource::Value(w_val) = write.source {
-                        trace_construct_value(
-                            &write.scope_ir,
-                            w_val,
-                            call_stack,
-                            depth + 1,
-                            collector,
-                        );
-                    }
-                }
-                if writes.entry_param_reaches && !handled_by_frame {
-                    collector.push_dynamic_gap(
-                        "Constructor parameter holds an unknown runtime class/constructor.",
-                    );
-                }
             }
-            IrOp::Call {
-                callee: inner_callee,
-                args: inner_args,
-                ..
-            } => {
-                trace_call_return_values(
-                    ir,
-                    v.syntax,
-                    *inner_callee,
-                    inner_args,
-                    call_stack,
-                    depth,
-                    collector,
-                    true,
-                );
-            }
-            _ => {
+            if writes.entry_param_reaches && !handled_by_frame {
                 collector.push_dynamic_gap(
-                    "Dynamic constructor target could not be statically resolved.",
+                    "Constructor parameter holds an unknown runtime class/constructor.",
                 );
             }
+        }
+        IrOp::Call {
+            callee: inner_callee,
+            receiver: inner_receiver,
+            args: inner_args,
+            ..
+        } => {
+            trace_call_return_values(
+                ir,
+                v.syntax,
+                *inner_callee,
+                *inner_receiver,
+                inner_args,
+                call_stack,
+                depth,
+                collector,
+                true,
+            );
+        }
+        _ => {
+            collector
+                .push_dynamic_gap("Dynamic constructor target could not be statically resolved.");
         }
     }
 }
 
 fn emit_class_constructor_from_syntax(class_syn: SyntaxId, collector: &mut TraceCollector<'_>) {
     if let Some(ctor_decl) = collector.semantic.resolve_class_constructor(class_syn) {
-        emit_resolved_declaration(&ctor_decl, Some(collector.call_syntax), false, collector);
+        emit_resolved_declaration(
+            &ctor_decl,
+            Some(collector.call_syntax),
+            false,
+            None,
+            0,
+            collector,
+        );
     } else if let Some(class_decl) = collector.semantic.resolve_declaration(class_syn) {
-        emit_resolved_declaration(&class_decl, Some(collector.call_syntax), false, collector);
+        emit_resolved_declaration(
+            &class_decl,
+            Some(collector.call_syntax),
+            false,
+            None,
+            0,
+            collector,
+        );
     } else {
         collector.push_dynamic_gap("Class constructor declaration could not be resolved.");
     }
@@ -961,17 +1189,23 @@ fn emit_constructor_from_decl(
         if !writes.writes.is_empty() {
             for w in writes.writes {
                 if let VarWriteSource::Value(w_val) = w.source {
-                    trace_construct_value(&w.scope_ir, w_val, &[], depth + 1, collector);
+                    trace_construct_value(&w.scope_ir, w_val, &[], depth + 1, None, collector);
                 }
             }
             return;
         }
         let _ = decl_ir;
     }
-    emit_resolved_declaration(decl, Some(collector.call_syntax), false, collector);
+    emit_resolved_declaration(decl, Some(collector.call_syntax), false, None, 0, collector);
 }
 
-fn resolve_symbol_callee(ident_syntax: SyntaxId, depth: usize, collector: &mut TraceCollector<'_>) {
+fn resolve_symbol_callee(
+    ident_syntax: SyntaxId,
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) {
     let Some(decl) = collector.semantic.resolve_declaration(ident_syntax) else {
         collector
             .push_dynamic_gap("Unresolved callee identifier cannot be mapped to a declaration.");
@@ -982,6 +1216,21 @@ fn resolve_symbol_callee(ident_syntax: SyntaxId, depth: usize, collector: &mut T
         && decl.name.as_deref() == Some("undefined")
         && decl.kind.as_deref() == Some("VariableDeclaration")
     {
+        return;
+    }
+
+    let mut lookup_syns = vec![ident_syntax];
+    if depth == 0 && call_ctx.is_some() {
+        lookup_syns.insert(0, collector.call_syntax);
+    }
+    if try_apply_calls_summary(
+        &lookup_syns,
+        Some(&decl),
+        call_ctx.as_ref(),
+        depth,
+        args_offset,
+        collector,
+    ) {
         return;
     }
 
@@ -1023,12 +1272,22 @@ fn resolve_symbol_callee(ident_syntax: SyntaxId, depth: usize, collector: &mut T
                                 &fn_decl,
                                 Some(collector.call_syntax),
                                 false,
+                                call_ctx.as_ref(),
+                                args_offset,
                                 collector,
                             );
                         }
                     }
                     VarWriteSource::Value(w_val) => {
-                        trace_callable_value(&w.scope_ir, w_val, &[], depth + 1, collector);
+                        trace_callable_value(
+                            &w.scope_ir,
+                            w_val,
+                            &[],
+                            depth + 1,
+                            call_ctx,
+                            args_offset,
+                            collector,
+                        );
                     }
                     VarWriteSource::Uninitialized => {
                         collector.push_dynamic_gap("Variable may be uninitialized at call site.");
@@ -1042,12 +1301,19 @@ fn resolve_symbol_callee(ident_syntax: SyntaxId, depth: usize, collector: &mut T
         }
     }
 
-    emit_resolved_declaration(&decl, Some(collector.call_syntax), false, collector);
+    emit_resolved_declaration(
+        &decl,
+        Some(collector.call_syntax),
+        false,
+        call_ctx.as_ref(),
+        args_offset,
+        collector,
+    );
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Resolves local object literals, exact constructor instances, static accessors, and polymorphic class overrides."
+    reason = "Resolves local object literals, exact constructor instances, static accessors, behavior summaries, and polymorphic class overrides."
 )]
 fn resolve_prop_read_callable(
     ir: &Arc<FunctionIr>,
@@ -1057,6 +1323,8 @@ fn resolve_prop_read_callable(
     is_super: bool,
     call_stack: &[CallFrame],
     depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
     let Some(member_name) = prop_key_static_name(key) else {
@@ -1072,7 +1340,14 @@ fn resolve_prop_read_callable(
         && let Some(decl) = collector.semantic.resolve_declaration(prop_syn)
         && !decl.is_signature_only
     {
-        emit_resolved_declaration(&decl, Some(collector.call_syntax), false, collector);
+        emit_resolved_declaration(
+            &decl,
+            Some(collector.call_syntax),
+            false,
+            call_ctx.as_ref(),
+            args_offset,
+            collector,
+        );
         return;
     }
 
@@ -1085,54 +1360,49 @@ fn resolve_prop_read_callable(
             ));
         }
         for (prop_ir, prop_val, prop_stack) in prop_vals.values {
-            trace_callable_value(&prop_ir, prop_val, &prop_stack, depth + 1, collector);
+            trace_callable_value(
+                &prop_ir,
+                prop_val,
+                &prop_stack,
+                depth + 1,
+                call_ctx,
+                args_offset,
+                collector,
+            );
         }
         return;
+    }
+
+    // 2.5 Behavior summary lookup on resolved property/member access (takes precedence over body & external gaps).
+    if let Some(prop_syn) = prop_vertex.syntax {
+        let decl = collector.semantic.resolve_declaration(prop_syn);
+        let mut lookup_syns = vec![prop_syn];
+        if depth == 0 && call_ctx.is_some() {
+            lookup_syns.push(collector.call_syntax);
+        }
+        if try_apply_calls_summary(
+            &lookup_syns,
+            decl.as_ref(),
+            call_ctx.as_ref(),
+            depth,
+            args_offset,
+            collector,
+        ) {
+            return;
+        }
     }
 
     // 3. Static class methods / module namespace property calls (`Namespace.fn()`, `Foo.bar()`).
     if let Some(prop_syn) = prop_vertex.syntax
-        && let Some(decl) = collector.semantic.resolve_declaration(prop_syn)
-        && matches!(
-            decl.kind.as_deref(),
-            Some("FunctionDeclaration" | "VariableDeclaration" | "ExportAssignment")
+        && resolve_static_member_call(
+            prop_syn,
+            member_name,
+            call_ctx.as_ref(),
+            args_offset,
+            collector,
         )
-        && !decl.is_signature_only
     {
-        emit_resolved_declaration(&decl, Some(collector.call_syntax), false, collector);
         return;
-    }
-
-    // Check explicit static method call (`ClassName.staticMethod()`).
-    if let Some(prop_syn) = prop_vertex.syntax
-        && let Some(static_hierarchy) =
-            collector
-                .semantic
-                .member_target_hierarchy(prop_syn, Some(member_name), true)
-    {
-        let mut found_static = false;
-        for node in &static_hierarchy.candidate_classes {
-            if static_hierarchy.receiver_symbols.contains(&node.symbol)
-                && let Some(m) = node
-                    .members
-                    .iter()
-                    .find(|m| m.is_static && m.name == member_name)
-            {
-                found_static = true;
-                let target_syn = m.callable_syntax.unwrap_or(m.member_syntax);
-                if let Some(decl) = collector.semantic.resolve_declaration(target_syn) {
-                    emit_resolved_declaration(
-                        &decl,
-                        Some(collector.call_syntax),
-                        node.is_external,
-                        collector,
-                    );
-                }
-            }
-        }
-        if found_static {
-            return;
-        }
     }
 
     // 4. Instance member call -> `class_overrides` (using exact local instance identity when known).
@@ -1143,10 +1413,74 @@ fn resolve_prop_read_callable(
         is_super,
         MemberAccessKind::MethodOrProp,
         call_stack,
+        call_ctx,
+        args_offset,
         collector,
     );
 }
 
+fn resolve_static_member_call(
+    prop_syn: SyntaxId,
+    member_name: &str,
+    call_ctx: Option<&ActiveCallContext<'_>>,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    if let Some(decl) = collector.semantic.resolve_declaration(prop_syn)
+        && matches!(
+            decl.kind.as_deref(),
+            Some("FunctionDeclaration" | "VariableDeclaration" | "ExportAssignment")
+        )
+        && !decl.is_signature_only
+    {
+        emit_resolved_declaration(
+            &decl,
+            Some(collector.call_syntax),
+            false,
+            call_ctx,
+            args_offset,
+            collector,
+        );
+        return true;
+    }
+
+    let Some(static_hierarchy) =
+        collector
+            .semantic
+            .member_target_hierarchy(prop_syn, Some(member_name), true)
+    else {
+        return false;
+    };
+
+    let mut found_static = false;
+    for node in &static_hierarchy.candidate_classes {
+        if static_hierarchy.receiver_symbols.contains(&node.symbol)
+            && let Some(m) = node
+                .members
+                .iter()
+                .find(|m| m.is_static && m.name == member_name)
+        {
+            found_static = true;
+            let target_syn = m.callable_syntax.unwrap_or(m.member_syntax);
+            if let Some(decl) = collector.semantic.resolve_declaration(target_syn) {
+                emit_resolved_declaration(
+                    &decl,
+                    Some(collector.call_syntax),
+                    node.is_external,
+                    call_ctx,
+                    args_offset,
+                    collector,
+                );
+            }
+        }
+    }
+    found_static
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Resolves exact-instance or polymorphic member call targets with optional call summary context."
+)]
 fn resolve_member_call(
     ir: &Arc<FunctionIr>,
     object_val: ValueId,
@@ -1154,6 +1488,8 @@ fn resolve_member_call(
     _is_super: bool,
     access_kind: MemberAccessKind,
     call_stack: &[CallFrame],
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
     // Check if receiver originates purely from local `new Sub()` allocations.
@@ -1177,7 +1513,7 @@ fn resolve_member_call(
                     collector.call_location.as_ref(),
                     true,
                 );
-                apply_override_resolution(member_name, res, collector);
+                apply_override_resolution(member_name, res, call_ctx, args_offset, collector);
             }
         }
         if any_resolved {
@@ -1208,12 +1544,14 @@ fn resolve_member_call(
         collector.call_location.as_ref(),
         false,
     );
-    apply_override_resolution(member_name, res, collector);
+    apply_override_resolution(member_name, res, call_ctx, args_offset, collector);
 }
 
 fn apply_override_resolution(
     member_name: &str,
     res: class_overrides::ClassOverrideResolution,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
     if !res.is_complete {
@@ -1228,6 +1566,8 @@ fn apply_override_resolution(
                 &decl,
                 Some(collector.call_syntax),
                 ov.is_external,
+                call_ctx.as_ref(),
+                args_offset,
                 collector,
             );
         } else {
@@ -1240,6 +1580,7 @@ fn apply_override_resolution(
                 is_external: ov.is_external,
                 is_default_library: false,
                 implementation: None,
+                args_offset,
             });
         }
     }
@@ -1249,8 +1590,30 @@ fn emit_resolved_declaration(
     decl: &DeclarationSummaryData,
     call_site_syntax: Option<SyntaxId>,
     force_external: bool,
+    call_ctx: Option<&ActiveCallContext<'_>>,
+    args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
+    if let Some(decl_syn) = decl.primary_syntax {
+        let mut lookup_syns = vec![decl_syn];
+        if call_ctx.is_some()
+            && let Some(cs) = call_site_syntax
+            && cs != decl_syn
+        {
+            lookup_syns.insert(0, cs);
+        }
+        if try_apply_calls_summary(
+            &lookup_syns,
+            Some(decl),
+            call_ctx,
+            0,
+            args_offset,
+            collector,
+        ) {
+            return;
+        }
+    }
+
     if decl.is_signature_only {
         collector.push_dynamic_gap(
             "Target resolves only to a type signature rather than a concrete implementation.",
@@ -1284,6 +1647,7 @@ fn emit_resolved_declaration(
                 implementation: (imp.resolution_source
                     != tssae_common::ImplementationSourceKind::CurrentProject)
                     .then_some(imp),
+                args_offset,
             });
         }
         ImplementationFact::Inconclusive { gaps, evidence, .. } => {
@@ -1298,16 +1662,7 @@ fn emit_resolved_declaration(
             {
                 collector.is_complete = false;
             }
-            collector.push_target(RawTargetDescriptor {
-                decl_syntax: decl_syn,
-                fn_scope_syntax: None,
-                symbol: decl.symbol,
-                name: decl.name.clone(),
-                location: decl.location.clone(),
-                is_external: true,
-                is_default_library: decl.is_default_library,
-                implementation: None,
-            });
+            push_external_fallback_target(decl, decl_syn, args_offset, collector);
         }
         ImplementationFact::External {
             package_name,
@@ -1327,18 +1682,28 @@ fn emit_resolved_declaration(
                 ),
                 collector.call_location.clone(),
             ));
-            collector.push_target(RawTargetDescriptor {
-                decl_syntax: decl_syn,
-                fn_scope_syntax: None,
-                symbol: decl.symbol,
-                name: decl.name.clone(),
-                location: decl.location.clone(),
-                is_external: true,
-                is_default_library: decl.is_default_library,
-                implementation: None,
-            });
+            push_external_fallback_target(decl, decl_syn, args_offset, collector);
         }
     }
+}
+
+fn push_external_fallback_target(
+    decl: &DeclarationSummaryData,
+    decl_syn: SyntaxId,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) {
+    collector.push_target(RawTargetDescriptor {
+        decl_syntax: decl_syn,
+        fn_scope_syntax: None,
+        symbol: decl.symbol,
+        name: decl.name.clone(),
+        location: decl.location.clone(),
+        is_external: true,
+        is_default_library: decl.is_default_library,
+        implementation: None,
+        args_offset,
+    });
 }
 
 struct ObjectPropLookupResult {
@@ -1716,7 +2081,7 @@ fn trace_iterator_element_callable(
         );
     }
     for (el_ir, el_val, el_stack) in elem_vals {
-        trace_callable_value(&el_ir, el_val, &el_stack, depth + 1, collector);
+        trace_callable_value(&el_ir, el_val, &el_stack, depth + 1, None, 0, collector);
     }
 }
 
@@ -1844,12 +2209,13 @@ fn collect_array_elements(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Inter-procedural return value resolution propagating CallFrame parameter bindings."
+    reason = "Inter-procedural return value resolution propagating CallFrame parameter bindings and summary return flows."
 )]
 fn trace_call_return_values(
     caller_ir: &Arc<FunctionIr>,
     inner_call_syntax: Option<SyntaxId>,
     inner_callee: ValueId,
+    inner_receiver: Option<ValueId>,
     inner_args: &[IrCallArg],
     call_stack: &[CallFrame],
     depth: usize,
@@ -1862,20 +2228,45 @@ fn trace_call_return_values(
     }
 
     let inner_syntax = inner_call_syntax.unwrap_or(collector.call_syntax);
+
+    // Check behavior summaries first: summaries take precedence over source body inspection.
+    if try_resolve_call_return_by_summary(
+        caller_ir,
+        inner_call_syntax,
+        inner_callee,
+        inner_receiver,
+        inner_args,
+        call_stack,
+        depth,
+        collector,
+        expect_constructor,
+    ) || collector.conflict.is_some()
+    {
+        return;
+    }
+
     let mut sub_collector = TraceCollector::new(
         inner_syntax,
         collector.call_location.clone(),
         collector.semantic,
         collector.syntax,
         collector.ir_provider,
+        collector.summary_index,
     );
     trace_callable_value(
         caller_ir,
         inner_callee,
         call_stack,
         depth + 1,
+        None,
+        0,
         &mut sub_collector,
     );
+
+    if let Some(conflict) = sub_collector.conflict {
+        collector.conflict = Some(conflict);
+        return;
+    }
 
     if !sub_collector.is_complete {
         for gap in sub_collector.gaps {
@@ -1898,45 +2289,1190 @@ fn trace_call_return_values(
     });
 
     for target in sub_collector.targets {
-        let Some(scope_syn) = target.fn_scope_syntax else {
-            collector.push_gap(GapItem::from_reason(
-                UnknownReason::MissingFunctionBody,
-                "Called factory declaration has no analyzable body for return resolution."
-                    .to_string(),
-                collector.call_location.clone(),
-            ));
-            continue;
-        };
-        let Ok(target_ir) = collector.ir_provider.function_ir(scope_syn) else {
-            collector.push_gap(GapItem::from_reason(
-                UnknownReason::MissingFunctionBody,
-                "Called factory IR could not be lowered.".to_string(),
-                collector.call_location.clone(),
-            ));
-            continue;
-        };
+        trace_target_return_values(&target, &next_stack, depth, expect_constructor, collector);
+    }
+}
 
-        let mut return_vals: Vec<ValueId> = Vec::new();
-        for cv in &target_ir.vertices {
-            if let IrOp::Return {
-                value: Some(ret_val),
-            } = cv.op
-            {
-                return_vals.push(ret_val);
-            }
+fn trace_target_return_values(
+    target: &RawTargetDescriptor,
+    next_stack: &[CallFrame],
+    depth: usize,
+    expect_constructor: bool,
+    collector: &mut TraceCollector<'_>,
+) {
+    let Some(scope_syn) = target.fn_scope_syntax else {
+        collector.push_gap(GapItem::from_reason(
+            UnknownReason::MissingFunctionBody,
+            "Called factory declaration has no analyzable body for return resolution.".to_string(),
+            collector.call_location.clone(),
+        ));
+        return;
+    };
+    let Ok(target_ir) = collector.ir_provider.function_ir(scope_syn) else {
+        collector.push_gap(GapItem::from_reason(
+            UnknownReason::MissingFunctionBody,
+            "Called factory IR could not be lowered.".to_string(),
+            collector.call_location.clone(),
+        ));
+        return;
+    };
+
+    let mut return_vals: Vec<ValueId> = Vec::new();
+    for cv in &target_ir.vertices {
+        if let IrOp::Return {
+            value: Some(ret_val),
+        } = cv.op
+        {
+            return_vals.push(ret_val);
         }
-        if return_vals.is_empty() {
-            collector.push_dynamic_gap("Callee factory does not return a value.");
+    }
+    if return_vals.is_empty() {
+        collector.push_dynamic_gap("Callee factory does not return a value.");
+        return;
+    }
+    for ret_val in return_vals {
+        if expect_constructor {
+            trace_construct_value(&target_ir, ret_val, next_stack, depth + 1, None, collector);
+        } else {
+            trace_callable_value(
+                &target_ir,
+                ret_val,
+                next_stack,
+                depth + 1,
+                None,
+                0,
+                collector,
+            );
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Applies summary-backed bound calls or return value flows for intermediate calls."
+)]
+fn try_resolve_call_return_by_summary(
+    caller_ir: &Arc<FunctionIr>,
+    inner_call_syntax: Option<SyntaxId>,
+    inner_callee: ValueId,
+    inner_receiver: Option<ValueId>,
+    inner_args: &[IrCallArg],
+    call_stack: &[CallFrame],
+    depth: usize,
+    collector: &mut TraceCollector<'_>,
+    expect_constructor: bool,
+) -> bool {
+    let Some(id_syn) =
+        inner_call_syntax.or_else(|| value_syntax_in_ir(caller_ir, inner_callee, collector.syntax))
+    else {
+        return false;
+    };
+    let Some(identity) = collector.semantic.declaration_identity(id_syn) else {
+        return false;
+    };
+
+    match collector
+        .summary_index
+        .resolve_calls_summary(&identity, expect_constructor)
+    {
+        Err(conflict) => {
+            collector.conflict = Some(conflict);
+            return true;
+        }
+        Ok(Some(calls_matched))
+            if apply_bind_calls_summary(
+                &identity,
+                &calls_matched,
+                caller_ir,
+                inner_receiver,
+                inner_args,
+                call_stack,
+                depth,
+                expect_constructor,
+                collector,
+            ) =>
+        {
+            return true;
+        }
+        Ok(_) => {}
+    }
+
+    match collector
+        .summary_index
+        .resolve_values_summary(&identity, expect_constructor)
+    {
+        Err(conflict) => {
+            collector.conflict = Some(conflict);
+            true
+        }
+        Ok(Some(values_matched)) => {
+            apply_return_values_summary(
+                &identity,
+                &values_matched,
+                caller_ir,
+                inner_receiver,
+                inner_args,
+                call_stack,
+                depth,
+                expect_constructor,
+                collector,
+            );
+            true
+        }
+        Ok(None) => false,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Forwards bound callable targets specified by a `calls.forwardsCall` bind summary."
+)]
+fn apply_bind_calls_summary(
+    identity: &DeclarationIdentity,
+    calls_matched: &MatchedSummaryAspect<CallAspectSummary>,
+    caller_ir: &Arc<FunctionIr>,
+    inner_receiver: Option<ValueId>,
+    inner_args: &[IrCallArg],
+    call_stack: &[CallFrame],
+    depth: usize,
+    expect_constructor: bool,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    let Some(fwd) = &calls_matched.aspect.forwards_call else {
+        return false;
+    };
+    if fwd.mode != ForwardCallMode::Bind {
+        return false;
+    }
+    collector
+        .semantic
+        .record_summary_lookup(Some(calls_matched.source));
+    let target_label = describe_identity_short(identity);
+    collector.push_summary_evidence(
+        calls_matched.source,
+        &calls_matched.pack_id,
+        &target_label,
+        collector.call_location.clone(),
+    );
+    let target_val = match fwd.target {
+        ForwardCallTarget::Receiver(_) => inner_receiver,
+        ForwardCallTarget::Arg { arg_index } => match inner_args.get(arg_index) {
+            Some(IrCallArg::Positional(v)) => Some(*v),
+            _ => None,
+        },
+    };
+    if let Some(tv) = target_val {
+        if expect_constructor {
+            trace_construct_value(caller_ir, tv, call_stack, depth + 1, None, collector);
+        } else {
+            trace_callable_value(
+                caller_ir,
+                tv,
+                call_stack,
+                depth + 1,
+                None,
+                fwd.args_from_index.unwrap_or(0),
+                collector,
+            );
+        }
+    } else {
+        collector
+            .push_dynamic_gap("Forwarded call target in behavior summary could not be resolved.");
+    }
+    if calls_matched.aspect.completeness == SummaryCompleteness::Partial {
+        collector.push_gap(GapItem::from_reason(
+            UnknownReason::MissingBehaviorSummary,
+            format!(
+                "Behavior summary '{}' declares partial 'calls' completeness.",
+                calls_matched.pack_id
+            ),
+            collector.call_location.clone(),
+        ));
+    }
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Applies `values` return flows specified by a summary for an intermediate call."
+)]
+fn apply_return_values_summary(
+    identity: &DeclarationIdentity,
+    values_matched: &MatchedSummaryAspect<ValueAspectSummary>,
+    caller_ir: &Arc<FunctionIr>,
+    inner_receiver: Option<ValueId>,
+    inner_args: &[IrCallArg],
+    call_stack: &[CallFrame],
+    depth: usize,
+    expect_constructor: bool,
+    collector: &mut TraceCollector<'_>,
+) {
+    collector
+        .semantic
+        .record_summary_lookup(Some(values_matched.source));
+    let target_label = describe_identity_short(identity);
+    collector.push_summary_evidence(
+        values_matched.source,
+        &values_matched.pack_id,
+        &target_label,
+        collector.call_location.clone(),
+    );
+    let mut any_return_flow = false;
+    for flow in &values_matched.aspect.flows {
+        if flow.to == SummaryValueRef::Named(SummaryNamedValueRef::Return) {
+            any_return_flow = true;
+            let _ = trace_summary_value_ref(
+                caller_ir,
+                inner_receiver,
+                inner_args,
+                &flow.from,
+                call_stack,
+                depth + 1,
+                expect_constructor,
+                collector,
+            );
+        }
+    }
+    if !any_return_flow || values_matched.aspect.completeness == SummaryCompleteness::Partial {
+        collector.push_gap(GapItem::from_reason(
+            UnknownReason::MissingBehaviorSummary,
+            format!(
+                "Behavior summary '{}' for '{}' does not completely specify returned callables.",
+                values_matched.pack_id, target_label
+            ),
+            collector.call_location.clone(),
+        ));
+    }
+}
+
+fn describe_identity_short(identity: &DeclarationIdentity) -> String {
+    let member = identity
+        .member_paths
+        .first()
+        .map_or_else(|| "<symbol>".to_string(), |p| p.join("."));
+    match &identity.package_name {
+        Some(pkg) => format!("{pkg}:{member}"),
+        None => member,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Matches declaration identity against BehaviorSummaryIndex, records lookup metrics, and applies callback/forwarding rules."
+)]
+fn try_apply_calls_summary(
+    lookup_syntaxes: &[SyntaxId],
+    decl_opt: Option<&DeclarationSummaryData>,
+    call_ctx: Option<&ActiveCallContext<'_>>,
+    depth: usize,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    let is_construct = call_ctx.is_some_and(|c| c.is_construct);
+    let mut matched: Option<(DeclarationIdentity, MatchedSummaryAspect<CallAspectSummary>)> = None;
+    let mut first_external_or_default_id: Option<DeclarationIdentity> = None;
+
+    for &syn in lookup_syntaxes {
+        let Some(identity) = collector.semantic.declaration_identity(syn) else {
             continue;
+        };
+        if (identity.package_name.is_some() || identity.is_default_library)
+            && first_external_or_default_id.is_none()
+        {
+            first_external_or_default_id = Some(identity.clone());
         }
-        for ret_val in return_vals {
-            if expect_constructor {
-                trace_construct_value(&target_ir, ret_val, &next_stack, depth + 1, collector);
-            } else {
-                trace_callable_value(&target_ir, ret_val, &next_stack, depth + 1, collector);
+        match collector
+            .summary_index
+            .resolve_calls_summary(&identity, is_construct)
+        {
+            Ok(Some(m)) => {
+                matched = Some((identity, m));
+                break;
+            }
+            Ok(None) => {}
+            Err(conflict) => {
+                collector.conflict = Some(conflict);
+                return true;
             }
         }
     }
+
+    let Some((identity, matched_calls)) = matched else {
+        if first_external_or_default_id.is_some()
+            || decl_opt.is_some_and(|d| d.is_external || d.is_default_library)
+        {
+            collector.semantic.record_summary_lookup(None);
+        }
+        return false;
+    };
+
+    collector
+        .semantic
+        .record_summary_lookup(Some(matched_calls.source));
+    let target_label = describe_identity_short(&identity);
+    let decl_name = decl_opt.and_then(|d| d.name.clone()).or_else(|| {
+        identity
+            .member_paths
+            .first()
+            .and_then(|p| p.last().cloned())
+    });
+    collector.push_summary_evidence(
+        matched_calls.source,
+        &matched_calls.pack_id,
+        &target_label,
+        collector.call_location.clone(),
+    );
+
+    if let Some(fwd) = &matched_calls.aspect.forwards_call {
+        match fwd.mode {
+            ForwardCallMode::Bind => {
+                if let Some(decl_syn) = decl_opt
+                    .and_then(|d| d.primary_syntax)
+                    .or_else(|| lookup_syntaxes.first().copied())
+                {
+                    collector.push_target(RawTargetDescriptor {
+                        decl_syntax: decl_syn,
+                        fn_scope_syntax: None,
+                        symbol: decl_opt.and_then(|d| d.symbol),
+                        name: decl_name,
+                        location: decl_opt.and_then(|d| d.location.clone()),
+                        is_external: decl_opt.is_none_or(|d| d.is_external || d.is_default_library),
+                        is_default_library: decl_opt.is_some_and(|d| d.is_default_library),
+                        implementation: None,
+                        args_offset,
+                    });
+                }
+            }
+            ForwardCallMode::Call | ForwardCallMode::Apply => {
+                if let Some(ctx) = call_ctx {
+                    let target_val = match fwd.target {
+                        ForwardCallTarget::Receiver(_) => ctx.receiver,
+                        ForwardCallTarget::Arg { arg_index } => match ctx.args.get(arg_index) {
+                            Some(IrCallArg::Positional(v)) => Some(*v),
+                            _ => None,
+                        },
+                    };
+                    let shifted_offset = if fwd.mode == ForwardCallMode::Call {
+                        args_offset + fwd.args_from_index.unwrap_or(0)
+                    } else {
+                        args_offset
+                    };
+                    if let Some(tv) = target_val {
+                        trace_callable_value(
+                            ctx.caller_ir,
+                            tv,
+                            ctx.call_stack,
+                            depth + 1,
+                            None,
+                            shifted_offset,
+                            collector,
+                        );
+                    } else {
+                        collector.push_dynamic_gap(
+                            "Forwarded call target in behavior summary has no receiver or argument.",
+                        );
+                    }
+                }
+            }
+        }
+        if matched_calls.aspect.completeness == SummaryCompleteness::Partial {
+            collector.push_gap(GapItem::from_reason(
+                UnknownReason::MissingBehaviorSummary,
+                format!(
+                    "Behavior summary '{}' for '{}' declares partial 'calls' completeness.",
+                    matched_calls.pack_id, target_label
+                ),
+                collector.call_location.clone(),
+            ));
+        }
+        return true;
+    }
+
+    if let Some(decl_syn) = decl_opt
+        .and_then(|d| d.primary_syntax)
+        .or_else(|| lookup_syntaxes.first().copied())
+    {
+        collector.push_target(RawTargetDescriptor {
+            decl_syntax: decl_syn,
+            fn_scope_syntax: None,
+            symbol: decl_opt.and_then(|d| d.symbol),
+            name: decl_name,
+            location: decl_opt.and_then(|d| d.location.clone()),
+            is_external: decl_opt.is_none_or(|d| d.is_external || d.is_default_library),
+            is_default_library: decl_opt.is_some_and(|d| d.is_default_library),
+            implementation: None,
+            args_offset,
+        });
+    }
+
+    if let Some(ctx) = call_ctx {
+        for cb in &matched_calls.aspect.invokes_callbacks {
+            if let Some(arg) = ctx.args.get(cb.callback_arg_index) {
+                match arg {
+                    IrCallArg::Positional(arg_val) => {
+                        trace_callable_value(
+                            ctx.caller_ir,
+                            *arg_val,
+                            ctx.call_stack,
+                            depth + 1,
+                            None,
+                            0,
+                            collector,
+                        );
+                    }
+                    IrCallArg::Spread(_) => {
+                        collector.push_dynamic_gap(
+                            "Spread argument passed to summarized callback parameter cannot be statically resolved.",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if matched_calls.aspect.completeness == SummaryCompleteness::Partial {
+        collector.push_gap(GapItem::from_reason(
+            UnknownReason::MissingBehaviorSummary,
+            format!(
+                "Behavior summary '{}' for '{}' declares partial 'calls' completeness; additional unknown call targets may exist.",
+                matched_calls.pack_id, target_label
+            ),
+            collector.call_location.clone(),
+        ));
+    }
+    true
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Resolves callback parameter call targets by tracing enclosing call sites through behavior summaries."
+)]
+fn resolve_callback_param_from_callers(
+    cb_ir: &Arc<FunctionIr>,
+    binding: tssae_common::LocalBindingId,
+    depth: usize,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    let Some(param_idx) = cb_ir
+        .parameters
+        .iter()
+        .position(|p| p.binding == Some(binding))
+    else {
+        return false;
+    };
+    let cb_syn = cb_ir.root_syntax;
+    let Ok(outer_ir) = collector.ir_provider.enclosing_scope_ir(cb_syn) else {
+        return false;
+    };
+    if outer_ir.id == cb_ir.id {
+        return false;
+    }
+
+    let is_inline_literal = matches!(
+        collector.syntax.syntax_kind(cb_syn).as_deref(),
+        Some("ArrowFunction" | "FunctionExpression")
+    );
+    let mut escapes = !is_inline_literal || cb_ir.decl_semantics.is_exported;
+
+    let mut cb_vals: FxHashSet<ValueId> = FxHashSet::default();
+    let mut cb_bindings: FxHashSet<tssae_common::LocalBindingId> = FxHashSet::default();
+    for v in &outer_ir.vertices {
+        match &v.op {
+            IrOp::FunctionLiteral { syntax, .. } if *syntax == cb_syn => {
+                if let Some(val) = v.value {
+                    cb_vals.insert(val);
+                }
+            }
+            IrOp::ReadSymbol { ident_syntax } => {
+                if collector
+                    .semantic
+                    .resolve_declaration(*ident_syntax)
+                    .and_then(|d| d.primary_syntax)
+                    == Some(cb_syn)
+                    && let Some(val) = v.value
+                {
+                    cb_vals.insert(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    if cb_vals.is_empty() {
+        return false;
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for v in &outer_ir.vertices {
+            match &v.op {
+                IrOp::ValueForward { source, .. } if cb_vals.contains(source) => {
+                    if let Some(val) = v.value
+                        && cb_vals.insert(val)
+                    {
+                        changed = true;
+                    }
+                }
+                IrOp::AssignLocal { target, value, .. } if cb_vals.contains(value) => {
+                    if cb_bindings.insert(*target) {
+                        changed = true;
+                    }
+                    if let Some(val) = v.value
+                        && cb_vals.insert(val)
+                    {
+                        changed = true;
+                    }
+                }
+                IrOp::ReadLocal { binding: rb } if cb_bindings.contains(rb) => {
+                    if let Some(val) = v.value
+                        && cb_vals.insert(val)
+                    {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (&derived, sources) in &outer_ir.value_sources {
+            if sources.iter().any(|s| cb_vals.contains(s)) && cb_vals.insert(derived) {
+                changed = true;
+            }
+        }
+    }
+
+    for v in &outer_ir.vertices {
+        match &v.op {
+            IrOp::Return { value: Some(val) } | IrOp::Throw { exception: val }
+                if cb_vals.contains(val) =>
+            {
+                escapes = true;
+            }
+            IrOp::AssignSymbol { value, .. } | IrOp::PropWrite { value, .. }
+                if cb_vals.contains(value) =>
+            {
+                escapes = true;
+            }
+            IrOp::ArrayAlloc { elems, .. } => {
+                if elems.iter().any(|e| match e {
+                    IrArrayElem::Value(val) | IrArrayElem::Spread(val) => cb_vals.contains(val),
+                    IrArrayElem::Elision => false,
+                }) {
+                    escapes = true;
+                }
+            }
+            IrOp::ObjectAlloc { props, .. } => {
+                if props.iter().any(|p| match p {
+                    IrObjectProp::KeyValue { value, .. } | IrObjectProp::Spread(value) => {
+                        cb_vals.contains(value)
+                    }
+                }) {
+                    escapes = true;
+                }
+            }
+            IrOp::Call { args, .. } | IrOp::Construct { args, .. }
+                if args
+                    .iter()
+                    .any(|a| matches!(a, IrCallArg::Spread(val) if cb_vals.contains(val))) =>
+            {
+                escapes = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut matched_any_call = false;
+    let mut all_matched_complete = !escapes;
+
+    for v in &outer_ir.vertices {
+        let (outer_callee, outer_receiver, outer_args, is_construct) = match &v.op {
+            IrOp::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            } => (*callee, *receiver, args.as_slice(), false),
+            IrOp::Construct { callee, args, .. } => (*callee, None, args.as_slice(), true),
+            _ => continue,
+        };
+
+        let matching_arg_indices: Vec<usize> = outer_args
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| match arg {
+                IrCallArg::Positional(val) if cb_vals.contains(val) => Some(idx),
+                _ => None,
+            })
+            .collect();
+        if matching_arg_indices.is_empty() {
+            continue;
+        }
+
+        let mut lookup_syns = Vec::new();
+        if let Some(cs) = v.syntax {
+            lookup_syns.push(cs);
+        }
+        if let Some(callee_syn) = value_syntax_in_ir(&outer_ir, outer_callee, collector.syntax)
+            && !lookup_syns.contains(&callee_syn)
+        {
+            lookup_syns.push(callee_syn);
+        }
+
+        let mut resolved_calls: Option<(
+            DeclarationIdentity,
+            MatchedSummaryAspect<CallAspectSummary>,
+        )> = None;
+        let mut resolved_values: Option<(
+            DeclarationIdentity,
+            MatchedSummaryAspect<ValueAspectSummary>,
+        )> = None;
+        for &syn in &lookup_syns {
+            let Some(id) = collector.semantic.declaration_identity(syn) else {
+                continue;
+            };
+            if resolved_calls.is_none() {
+                match collector
+                    .summary_index
+                    .resolve_calls_summary(&id, is_construct)
+                {
+                    Ok(Some(m)) => resolved_calls = Some((id.clone(), m)),
+                    Ok(None) => {}
+                    Err(conflict) => {
+                        collector.conflict = Some(conflict);
+                        return false;
+                    }
+                }
+            }
+            if resolved_values.is_none() {
+                match collector
+                    .summary_index
+                    .resolve_values_summary(&id, is_construct)
+                {
+                    Ok(Some(m)) => resolved_values = Some((id, m)),
+                    Ok(None) => {}
+                    Err(conflict) => {
+                        collector.conflict = Some(conflict);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let (Some((id_calls, calls_matched)), Some((_, values_matched))) =
+            (resolved_calls, resolved_values)
+        else {
+            all_matched_complete = false;
+            continue;
+        };
+
+        collector
+            .semantic
+            .record_summary_lookup(Some(calls_matched.source));
+        let target_label = describe_identity_short(&id_calls);
+        let site_loc = v
+            .syntax
+            .and_then(|s| collector.syntax.syntax_location(s))
+            .or_else(|| collector.call_location.clone());
+        collector.push_summary_evidence(
+            calls_matched.source,
+            &calls_matched.pack_id,
+            &target_label,
+            site_loc,
+        );
+        if values_matched.pack_id != calls_matched.pack_id
+            || values_matched.source != calls_matched.source
+        {
+            collector.push_summary_evidence(
+                values_matched.source,
+                &values_matched.pack_id,
+                &target_label,
+                collector.call_location.clone(),
+            );
+        }
+
+        if calls_matched.aspect.completeness != SummaryCompleteness::Complete
+            || values_matched.aspect.completeness != SummaryCompleteness::Complete
+        {
+            all_matched_complete = false;
+        }
+
+        for cb_arg_idx in matching_arg_indices {
+            if !calls_matched
+                .aspect
+                .invokes_callbacks
+                .iter()
+                .any(|cb| cb.callback_arg_index == cb_arg_idx)
+            {
+                all_matched_complete = false;
+                continue;
+            }
+            let target_ref = SummaryValueRef::Tagged(SummaryTaggedValueRef::CallbackParam {
+                callback_arg_index: cb_arg_idx,
+                param_index: param_idx,
+            });
+            let mut matched_flow = false;
+            for flow in &values_matched.aspect.flows {
+                if flow.to == target_ref {
+                    matched_flow = true;
+                    matched_any_call = true;
+                    let flow_complete = trace_summary_value_ref(
+                        &outer_ir,
+                        outer_receiver,
+                        outer_args,
+                        &flow.from,
+                        &[],
+                        depth + 1,
+                        false,
+                        collector,
+                    );
+                    if !flow_complete {
+                        all_matched_complete = false;
+                    }
+                }
+            }
+            if !matched_flow {
+                all_matched_complete = false;
+            }
+        }
+    }
+
+    matched_any_call && all_matched_complete
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Traces a SummaryValueRef endpoint (receiver, arg, or container elements) to callable targets."
+)]
+fn trace_summary_value_ref(
+    ir: &Arc<FunctionIr>,
+    receiver: Option<ValueId>,
+    args: &[IrCallArg],
+    vref: &SummaryValueRef,
+    call_stack: &[CallFrame],
+    depth: usize,
+    expect_constructor: bool,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    match vref {
+        SummaryValueRef::Named(SummaryNamedValueRef::Receiver) => {
+            let Some(recv_val) = receiver else {
+                return false;
+            };
+            if expect_constructor {
+                trace_construct_value(ir, recv_val, call_stack, depth + 1, None, collector);
+            } else {
+                trace_callable_value(ir, recv_val, call_stack, depth + 1, None, 0, collector);
+            }
+            true
+        }
+        SummaryValueRef::Named(SummaryNamedValueRef::ReceiverElement) => {
+            let Some(recv_val) = receiver else {
+                return false;
+            };
+            let mut visited = FxHashSet::default();
+            trace_container_elements_callable(
+                ir,
+                recv_val,
+                call_stack,
+                depth + 1,
+                &mut visited,
+                collector,
+            )
+        }
+        SummaryValueRef::Tagged(SummaryTaggedValueRef::Arg { index }) => match args.get(*index) {
+            Some(IrCallArg::Positional(arg_val)) => {
+                if expect_constructor {
+                    trace_construct_value(ir, *arg_val, call_stack, depth + 1, None, collector);
+                } else {
+                    trace_callable_value(ir, *arg_val, call_stack, depth + 1, None, 0, collector);
+                }
+                true
+            }
+            _ => false,
+        },
+        SummaryValueRef::Tagged(SummaryTaggedValueRef::ArgElement { index }) => {
+            match args.get(*index) {
+                Some(IrCallArg::Positional(arg_val)) => {
+                    let mut visited = FxHashSet::default();
+                    trace_container_elements_callable(
+                        ir,
+                        *arg_val,
+                        call_stack,
+                        depth + 1,
+                        &mut visited,
+                        collector,
+                    )
+                }
+                _ => false,
+            }
+        }
+        SummaryValueRef::Named(
+            SummaryNamedValueRef::Return | SummaryNamedValueRef::ReturnElement,
+        )
+        | SummaryValueRef::Tagged(
+            SummaryTaggedValueRef::CallbackParam { .. }
+            | SummaryTaggedValueRef::CallbackReturn { .. }
+            | SummaryTaggedValueRef::CallbackParamArg { .. },
+        ) => false,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Handles ArrayAlloc, local aliases, and summarized container-producing calls such as Promise.resolve and Promise.all."
+)]
+fn trace_container_elements_callable(
+    ir: &Arc<FunctionIr>,
+    container_val: ValueId,
+    call_stack: &[CallFrame],
+    depth: usize,
+    visited: &mut FxHashSet<(FunctionIrId, ValueId)>,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    if depth >= MAX_TRACE_DEPTH || !visited.insert((ir.id, container_val)) {
+        return false;
+    }
+
+    if let Some(sources) = ir.value_sources.get(&container_val)
+        && !sources.is_empty()
+    {
+        let mut all_ok = true;
+        for &src in sources {
+            if !trace_container_elements_callable(
+                ir,
+                src,
+                call_stack,
+                depth + 1,
+                visited,
+                collector,
+            ) {
+                all_ok = false;
+            }
+        }
+        return all_ok;
+    }
+
+    let producers = value_producers(ir, container_val);
+    if producers.is_empty() {
+        return false;
+    }
+
+    let mut all_complete = true;
+    for v in producers {
+        match &v.op {
+            IrOp::ArrayAlloc { elems, .. } => {
+                for elem in elems {
+                    match elem {
+                        IrArrayElem::Value(ev) => {
+                            trace_callable_value(
+                                ir,
+                                *ev,
+                                call_stack,
+                                depth + 1,
+                                None,
+                                0,
+                                collector,
+                            );
+                        }
+                        IrArrayElem::Spread(_) | IrArrayElem::Elision => {
+                            all_complete = false;
+                        }
+                    }
+                }
+            }
+            IrOp::ValueForward { source, .. }
+            | IrOp::AssignLocal { value: source, .. }
+            | IrOp::AssignSymbol { value: source, .. } => {
+                if !trace_container_elements_callable(
+                    ir,
+                    *source,
+                    call_stack,
+                    depth + 1,
+                    visited,
+                    collector,
+                ) {
+                    all_complete = false;
+                }
+            }
+            IrOp::ReadLocal { binding } => {
+                let writes = var_writes::resolve_reaching_writes_for_local(
+                    ir,
+                    v.id,
+                    *binding,
+                    collector.semantic,
+                    collector.syntax,
+                    collector.ir_provider,
+                );
+                if !writes.is_exhaustive || writes.entry_param_reaches || writes.writes.is_empty() {
+                    all_complete = false;
+                }
+                for write in writes.writes {
+                    if let VarWriteSource::Value(w_val) = write.source {
+                        if !trace_container_elements_callable(
+                            &write.scope_ir,
+                            w_val,
+                            call_stack,
+                            depth + 1,
+                            visited,
+                            collector,
+                        ) {
+                            all_complete = false;
+                        }
+                    } else {
+                        all_complete = false;
+                    }
+                }
+            }
+            IrOp::Call {
+                callee: inner_callee,
+                receiver: inner_recv,
+                args: inner_args,
+                ..
+            } => {
+                let Some(id_syn) = v
+                    .syntax
+                    .or_else(|| value_syntax_in_ir(ir, *inner_callee, collector.syntax))
+                else {
+                    all_complete = false;
+                    continue;
+                };
+                let Some(identity) = collector.semantic.declaration_identity(id_syn) else {
+                    all_complete = false;
+                    continue;
+                };
+                let Ok(Some(values_matched)) = collector
+                    .summary_index
+                    .resolve_values_summary(&identity, false)
+                else {
+                    all_complete = false;
+                    continue;
+                };
+                if values_matched.aspect.completeness != SummaryCompleteness::Complete {
+                    all_complete = false;
+                }
+                let mut matched_ret_elem = false;
+                for flow in &values_matched.aspect.flows {
+                    if flow.to == SummaryValueRef::Named(SummaryNamedValueRef::ReturnElement) {
+                        matched_ret_elem = true;
+                        match &flow.from {
+                            SummaryValueRef::Tagged(SummaryTaggedValueRef::CallbackReturn {
+                                callback_arg_index,
+                            }) => {
+                                if let Some(IrCallArg::Positional(cb_val)) =
+                                    inner_args.get(*callback_arg_index)
+                                {
+                                    if !trace_callback_return_callable(
+                                        ir,
+                                        *cb_val,
+                                        *inner_recv,
+                                        call_stack,
+                                        depth + 1,
+                                        visited,
+                                        collector,
+                                    ) {
+                                        all_complete = false;
+                                    }
+                                } else {
+                                    all_complete = false;
+                                }
+                            }
+                            other => {
+                                if !trace_summary_value_ref(
+                                    ir,
+                                    *inner_recv,
+                                    inner_args,
+                                    other,
+                                    call_stack,
+                                    depth + 1,
+                                    false,
+                                    collector,
+                                ) {
+                                    all_complete = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !matched_ret_elem {
+                    all_complete = false;
+                }
+            }
+            IrOp::Construct {
+                callee: inner_callee,
+                args: inner_args,
+                ..
+            } => {
+                let Some(id_syn) = v
+                    .syntax
+                    .or_else(|| value_syntax_in_ir(ir, *inner_callee, collector.syntax))
+                else {
+                    all_complete = false;
+                    continue;
+                };
+                let Some(identity) = collector.semantic.declaration_identity(id_syn) else {
+                    all_complete = false;
+                    continue;
+                };
+                let Ok(Some(values_matched)) = collector
+                    .summary_index
+                    .resolve_values_summary(&identity, true)
+                else {
+                    all_complete = false;
+                    continue;
+                };
+                if values_matched.aspect.completeness != SummaryCompleteness::Complete {
+                    all_complete = false;
+                }
+                let mut matched_ret_elem = false;
+                for flow in &values_matched.aspect.flows {
+                    if flow.to == SummaryValueRef::Named(SummaryNamedValueRef::ReturnElement)
+                        && let SummaryValueRef::Tagged(SummaryTaggedValueRef::CallbackParamArg {
+                            callback_arg_index,
+                            callback_param_index,
+                            arg_index,
+                        }) = &flow.from
+                    {
+                        matched_ret_elem = true;
+                        if let Some(IrCallArg::Positional(exec_val)) =
+                            inner_args.get(*callback_arg_index)
+                        {
+                            if !trace_executor_param_call_args(
+                                ir,
+                                *exec_val,
+                                *callback_param_index,
+                                *arg_index,
+                                depth + 1,
+                                collector,
+                            ) {
+                                all_complete = false;
+                            }
+                        } else {
+                            all_complete = false;
+                        }
+                    }
+                }
+                if !matched_ret_elem {
+                    all_complete = false;
+                }
+            }
+            _ => all_complete = false,
+        }
+    }
+    all_complete
+}
+
+fn trace_callback_return_callable(
+    outer_ir: &Arc<FunctionIr>,
+    cb_val: ValueId,
+    outer_recv: Option<ValueId>,
+    call_stack: &[CallFrame],
+    depth: usize,
+    visited: &mut FxHashSet<(FunctionIrId, ValueId)>,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    let Some(fn_syn) = value_producers(outer_ir, cb_val)
+        .into_iter()
+        .find_map(|v| match v.op {
+            IrOp::FunctionLiteral { syntax, .. } => Some(syntax),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let Ok(cb_ir) = collector.ir_provider.function_ir(fn_syn) else {
+        return false;
+    };
+    let mut all_ok = true;
+    let mut has_return = false;
+    for rv in &cb_ir.vertices {
+        if let IrOp::Return {
+            value: Some(ret_val),
+        } = rv.op
+        {
+            has_return = true;
+            // If the callback returns its first parameter (`x => x`), propagate outer receiver elements.
+            let returns_param0 = cb_ir
+                .parameters
+                .first()
+                .and_then(|p| p.binding)
+                .is_some_and(|b| {
+                    value_producers(&cb_ir, ret_val)
+                        .iter()
+                        .any(|pv| matches!(pv.op, IrOp::ReadLocal { binding } if binding == b))
+                });
+            if returns_param0 {
+                if let Some(recv_val) = outer_recv {
+                    if !trace_container_elements_callable(
+                        outer_ir,
+                        recv_val,
+                        call_stack,
+                        depth + 1,
+                        visited,
+                        collector,
+                    ) {
+                        all_ok = false;
+                    }
+                } else {
+                    all_ok = false;
+                }
+            } else {
+                trace_callable_value(&cb_ir, ret_val, &[], depth + 1, None, 0, collector);
+            }
+        }
+    }
+    has_return && all_ok
+}
+
+fn trace_executor_param_call_args(
+    outer_ir: &Arc<FunctionIr>,
+    exec_val: ValueId,
+    callback_param_index: usize,
+    arg_index: usize,
+    depth: usize,
+    collector: &mut TraceCollector<'_>,
+) -> bool {
+    let Some(fn_syn) = value_producers(outer_ir, exec_val)
+        .into_iter()
+        .find_map(|v| match v.op {
+            IrOp::FunctionLiteral { syntax, .. } => Some(syntax),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let Ok(exec_ir) = collector.ir_provider.function_ir(fn_syn) else {
+        return false;
+    };
+    let Some(param_binding) = exec_ir
+        .parameters
+        .get(callback_param_index)
+        .and_then(|p| p.binding)
+    else {
+        return false;
+    };
+    let mut param_vals: FxHashSet<ValueId> = FxHashSet::default();
+    for v in &exec_ir.vertices {
+        if let IrOp::ReadLocal { binding } = v.op
+            && binding == param_binding
+            && let Some(val) = v.value
+        {
+            param_vals.insert(val);
+        }
+    }
+    let mut called = false;
+    let mut all_ok = true;
+    for v in &exec_ir.vertices {
+        if let IrOp::Call { callee, args, .. } = &v.op
+            && param_vals.contains(callee)
+        {
+            called = true;
+            if let Some(IrCallArg::Positional(arg_val)) = args.get(arg_index) {
+                trace_callable_value(&exec_ir, *arg_val, &[], depth + 1, None, 0, collector);
+            } else {
+                all_ok = false;
+            }
+        }
+    }
+    called && all_ok
 }
 
 fn enrich_target_descriptor(
@@ -1951,7 +3487,8 @@ fn enrich_target_descriptor(
     if let Some(scope_syn) = raw.fn_scope_syntax
         && let Ok(target_ir) = ir_provider.function_ir(scope_syn)
     {
-        for (idx, &(arg_syn, is_spread)) in arg_syntaxes.iter().enumerate() {
+        let sliced_args = &arg_syntaxes[raw.args_offset.min(arg_syntaxes.len())..];
+        for (idx, &(arg_syn, is_spread)) in sliced_args.iter().enumerate() {
             if target_ir.parameters.is_empty() {
                 break;
             }
@@ -1965,7 +3502,7 @@ fn enrich_target_descriptor(
             };
             if let Some(param) = param_opt {
                 parameter_bindings.push(CallParameterBindingData {
-                    argument_index: idx,
+                    argument_index: idx + raw.args_offset,
                     argument_syntax: arg_syn,
                     parameter_name: Some(param.name.clone()),
                     parameter_decl_syntax: Some(param.syntax),
@@ -2036,6 +3573,19 @@ pub fn build_ir_call_graph(
     syntax: &dyn SyntaxCatalog,
     ir_provider: &dyn IrProvider,
 ) -> IrCallGraph {
+    let default_index = BehaviorSummaryIndex::default();
+    build_ir_call_graph_with_summaries(project_files, semantic, syntax, ir_provider, &default_index)
+}
+
+/// Indexes all call and construct sites across `project_files` using `summary_index`.
+#[must_use]
+pub fn build_ir_call_graph_with_summaries(
+    project_files: &[FileId],
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
+) -> IrCallGraph {
     let mut graph = IrCallGraph::default();
     let mut seen_call_syntaxes: FxHashSet<SyntaxId> = FxHashSet::default();
 
@@ -2061,7 +3611,12 @@ pub fn build_ir_call_graph(
                     continue;
                 };
 
-                let analyzed = analyze_call_vertex(call_syn, semantic, syntax, ir_provider);
+                let analyzed =
+                    analyze_call_vertex(call_syn, semantic, syntax, ir_provider, summary_index);
+                if let Some(conflict) = analyzed.outcome.conflict {
+                    graph.conflict = Some(conflict);
+                    return graph;
+                }
                 let site_idx = graph.sites.len();
                 let mut seen_decls = FxHashSet::default();
                 let mut seen_syms = FxHashSet::default();
@@ -2148,13 +3703,14 @@ pub fn find_callers_on_ir<S: BuildHasher>(
                 || (target_symbol.is_some() && t.symbol == target_symbol)
         });
         let parameter_bindings = matching_target.map_or_default(|t| t.parameter_bindings.clone());
-        evidence.push(EvidenceItem {
-            kind: "source",
-            message: "Matched call site invoking target declaration.".to_string(),
-            at: Some(site.location.clone()),
-            model_id: None,
-            declaration: target_summary.as_ref().and_then(|d| d.name.clone()),
-        });
+        evidence.push(EvidenceItem::simple(
+            "source",
+            "Matched call site invoking target declaration.".to_string(),
+            Some(site.location.clone()),
+        ));
+        if let Some(last) = evidence.last_mut() {
+            last.declaration = target_summary.as_ref().and_then(|d| d.name.clone());
+        }
         call_sites.push(CallerSiteData {
             call_syntax: site.call_syntax,
             location: site.location.clone(),

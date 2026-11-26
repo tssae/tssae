@@ -21,11 +21,13 @@ use tssae_analysis::{
         evaluate_branch_coverage,
     },
     ir::{FileIrEntry, FunctionIr, SnapshotIrCache},
+    summaries::BehaviorSummaryIndex,
 };
-use tssae_common::{BranchId, FileId, UnknownReason};
+use tssae_common::{BranchId, FileId, SummaryConfigPayload, UnknownReason};
 use tssae_tsrs_boundary::{
-    FileIdRegistry, FileSyntaxIndex, lower_scope_to_ir_with_index, normalize_cfg_scope_node,
-    normalize_function_node, resolve_enclosing_function,
+    FileIdRegistry, FileSyntaxIndex, ResolvedPackageInfo, collect_resolved_packages_for_program,
+    lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
+    resolve_enclosing_function,
 };
 
 use crate::calls_values::ProjectCallGraph;
@@ -67,6 +69,8 @@ struct RpcSuccessResponse<'a, T> {
 struct RpcErrorPayload<'a> {
     code: &'a str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a Value>,
 }
 
 #[derive(Serialize)]
@@ -79,11 +83,24 @@ struct RpcErrorResponse<'a> {
 pub struct RpcErr {
     pub code: &'static str,
     pub message: String,
+    pub details: Option<Value>,
 }
 
 impl RpcErr {
     pub const fn new(code: &'static str, message: String) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            details: None,
+        }
+    }
+
+    pub const fn with_details(code: &'static str, message: String, details: Value) -> Self {
+        Self {
+            code,
+            message,
+            details: Some(details),
+        }
     }
 }
 
@@ -119,6 +136,30 @@ struct SnapshotReleaseParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SnapshotSetSummariesParams {
+    snapshot_id: u64,
+    summaries: SummaryConfigPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotSetSummariesResult {
+    updated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPackagePayload {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_root: Option<String>,
+    pub project_dirs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueryBatchParams {
     snapshot_id: u64,
     project_id: String,
@@ -146,6 +187,7 @@ struct SnapshotOpenResult {
     projects: Vec<ProjectSummary>,
     workspace_source_files: Vec<String>,
     native_adapters: Vec<NativeAdapterObservation>,
+    resolved_packages: Vec<ResolvedPackagePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     engine_rss_bytes: Option<u64>,
 }
@@ -158,6 +200,7 @@ struct SnapshotUpdateResult {
     projects: Vec<ProjectSummary>,
     workspace_source_files: Vec<String>,
     native_adapters: Vec<NativeAdapterObservation>,
+    resolved_packages: Vec<ResolvedPackagePayload>,
     recomputed_projects: Vec<String>,
     reused_projects: Vec<String>,
     recomputed_files: Vec<String>,
@@ -320,6 +363,9 @@ pub struct SnapshotState {
     pub sourcemap_cache: SourceMapCache,
     pub native_adapters: NativeAdapterRegistry,
     pub native_fact_cache: crate::native_adapter::NativeFactCache,
+    pub resolved_package_versions: FxHashMap<String, Option<String>>,
+    pub summary_config: SummaryConfigPayload,
+    pub summary_index: Arc<BehaviorSummaryIndex>,
     pub next_handle_id: u64,
 }
 
@@ -717,6 +763,7 @@ impl EngineServer {
                     &Value::Null,
                     "INVALID_REQUEST",
                     format!("Invalid JSON request: {err}"),
+                    None,
                 );
             }
         };
@@ -733,6 +780,7 @@ impl EngineServer {
                             &request.id,
                             "SERIALIZATION_ERROR",
                             err.to_string(),
+                            None,
                         );
                     }
                 }
@@ -744,10 +792,10 @@ impl EngineServer {
                     metrics,
                 })
                 .unwrap_or_else(|err| {
-                    serialize_error(&request.id, "SERIALIZATION_ERROR", err.to_string())
+                    serialize_error(&request.id, "SERIALIZATION_ERROR", err.to_string(), None)
                 })
             }
-            Err(err) => serialize_error(&request.id, err.code, err.message),
+            Err(err) => serialize_error(&request.id, err.code, err.message, err.details.as_ref()),
         }
     }
 
@@ -769,6 +817,13 @@ impl EngineServer {
                 let parsed: SnapshotUpdateParams = serde_json::from_value(params)
                     .map_err(|err| RpcErr::new("INVALID_PARAMS", err.to_string()))?;
                 let result = self.update_snapshot(&parsed, observer)?;
+                serde_json::to_value(result)
+                    .map_err(|err| RpcErr::new("SERIALIZATION_ERROR", err.to_string()))
+            }
+            "snapshot.setSummaries" => {
+                let parsed: SnapshotSetSummariesParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErr::new("INVALID_PARAMS", err.to_string()))?;
+                let result = self.set_snapshot_summaries(parsed)?;
                 serde_json::to_value(result)
                     .map_err(|err| RpcErr::new("SERIALIZATION_ERROR", err.to_string()))
             }
@@ -805,6 +860,13 @@ impl EngineServer {
         let session = self.ensure_session(&cwd);
         let opened = open_projects_snapshot(&session, &cwd, &params.entries)
             .map_err(|err| RpcErr::new(err.code, err.message))?;
+        let (resolved_packages, resolved_package_versions) =
+            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data, &opened.summaries);
+        let summary_config = SummaryConfigPayload::default();
+        let summary_index = Arc::new(BehaviorSummaryIndex::from_config(
+            &summary_config,
+            &resolved_package_versions,
+        ));
 
         self.next_snapshot_id += 1;
         let snapshot_id = self.next_snapshot_id;
@@ -833,6 +895,9 @@ impl EngineServer {
                 sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),
+                resolved_package_versions,
+                summary_config,
+                summary_index,
                 next_handle_id: 0,
             },
         );
@@ -843,8 +908,29 @@ impl EngineServer {
             projects: opened.summaries,
             workspace_source_files: opened.workspace_source_files,
             native_adapters: native_adapter_observations,
+            resolved_packages,
             engine_rss_bytes: read_process_rss_bytes(),
         })
+    }
+
+    fn set_snapshot_summaries(
+        &mut self,
+        params: SnapshotSetSummariesParams,
+    ) -> Result<SnapshotSetSummariesResult, RpcErr> {
+        let Some(snapshot) = self.snapshots.get_mut(&params.snapshot_id) else {
+            return Err(RpcErr::new(
+                "STALE_SNAPSHOT",
+                format!("Snapshot {} is expired or unknown.", params.snapshot_id),
+            ));
+        };
+        let index = Arc::new(BehaviorSummaryIndex::from_config(
+            &params.summaries,
+            &snapshot.resolved_package_versions,
+        ));
+        snapshot.summary_config = params.summaries;
+        snapshot.summary_index = index;
+        snapshot.ir_call_graph_cache.clear();
+        Ok(SnapshotSetSummariesResult { updated: true })
     }
 
     #[expect(
@@ -871,6 +957,7 @@ impl EngineServer {
             old_snapshot_data,
             old_project_ids,
             old_native_adapters,
+            old_summary_config,
         ) = {
             let Some(old_state) = self.snapshots.get(&params.snapshot_id) else {
                 return Err(RpcErr::new(
@@ -886,6 +973,7 @@ impl EngineServer {
                 Arc::clone(&old_state.snapshot_data),
                 old_state.project_ids.clone(),
                 old_state.native_adapters.clone(),
+                old_state.summary_config.clone(),
             )
         };
 
@@ -934,6 +1022,13 @@ impl EngineServer {
         observer.record_ir_file_reuse(files_reused, files_invalidated);
         drop(old_state);
 
+        let (resolved_packages, resolved_package_versions) =
+            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data, &opened.summaries);
+        let summary_index = Arc::new(BehaviorSummaryIndex::from_config(
+            &old_summary_config,
+            &resolved_package_versions,
+        ));
+
         self.snapshots.insert(
             snapshot_id,
             SnapshotState {
@@ -959,6 +1054,9 @@ impl EngineServer {
                 sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),
+                resolved_package_versions,
+                summary_config: old_summary_config,
+                summary_index,
                 next_handle_id: 0,
             },
         );
@@ -969,6 +1067,7 @@ impl EngineServer {
             projects: opened.summaries,
             workspace_source_files: opened.workspace_source_files,
             native_adapters: native_adapter_observations,
+            resolved_packages,
             recomputed_projects: updated.recomputed_projects,
             reused_projects: updated.reused_projects,
             recomputed_files: updated.recomputed_files,
@@ -1355,6 +1454,89 @@ fn inherit_snapshot_ir_cache(
     })
 }
 
+fn collect_snapshot_resolved_packages(
+    cwd: &str,
+    snapshot_data: &SnapshotData,
+    projects: &[ProjectSummary],
+) -> (
+    Vec<ResolvedPackagePayload>,
+    FxHashMap<String, Option<String>>,
+) {
+    let mut project_dirs_by_program_addr: FxHashMap<usize, String> = FxHashMap::default();
+    let config_by_id: FxHashMap<&str, &str> = projects
+        .iter()
+        .map(|p| (p.project_id.as_str(), p.config_file.as_str()))
+        .collect();
+    for proj in snapshot_data.snapshot.project_collection.projects() {
+        let Some(prog) = proj.get_program() else {
+            continue;
+        };
+        let cfg_rel = relative_to_cwd(cwd, proj.config_file_name());
+        let dir = std::path::Path::new(&cfg_rel)
+            .parent()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".")
+            .to_string();
+        project_dirs_by_program_addr.insert(std::ptr::from_ref(prog) as usize, dir);
+    }
+
+    let mut merged: BTreeMap<(String, String), (ResolvedPackageInfo, BTreeSet<String>)> =
+        BTreeMap::new();
+    let mut versions: FxHashMap<String, Option<String>> = FxHashMap::default();
+
+    for proj in snapshot_data.snapshot.project_collection.projects() {
+        let Some(prog) = proj.get_program() else {
+            continue;
+        };
+        let proj_dir = project_dirs_by_program_addr
+            .get(&(std::ptr::from_ref(prog) as usize))
+            .cloned()
+            .unwrap_or_else(|| {
+                let cfg_rel = relative_to_cwd(cwd, proj.config_file_name());
+                let _ = config_by_id;
+                std::path::Path::new(&cfg_rel)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(".")
+                    .to_string()
+            });
+
+        for pkg in collect_resolved_packages_for_program(cwd, prog) {
+            if let Some(ver) = &pkg.version {
+                versions
+                    .entry(pkg.name.clone())
+                    .or_insert_with(|| Some(ver.clone()));
+            } else {
+                versions.entry(pkg.name.clone()).or_insert(None);
+            }
+            let key = (
+                pkg.name.clone(),
+                pkg.package_root.clone().unwrap_or_default(),
+            );
+            let entry = merged
+                .entry(key)
+                .or_insert_with(|| (pkg.clone(), BTreeSet::new()));
+            if entry.0.version.is_none() && pkg.version.is_some() {
+                entry.0.version = pkg.version;
+            }
+            entry.1.insert(proj_dir.clone());
+        }
+    }
+
+    let payloads = merged
+        .into_values()
+        .map(|(pkg, dirs)| ResolvedPackagePayload {
+            name: pkg.name,
+            version: pkg.version,
+            package_root: pkg.package_root,
+            project_dirs: dirs.into_iter().collect(),
+        })
+        .collect();
+    (payloads, versions)
+}
+
 fn read_process_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -1367,11 +1549,15 @@ fn read_process_rss_bytes() -> Option<u64> {
     None
 }
 
-fn serialize_error(id: &Value, code: &str, message: String) -> String {
+fn serialize_error(id: &Value, code: &str, message: String, details: Option<&Value>) -> String {
     serde_json::to_string(&RpcErrorResponse {
         id,
         ok: false,
-        error: RpcErrorPayload { code, message },
+        error: RpcErrorPayload {
+            code,
+            message,
+            details,
+        },
     })
     .unwrap_or_else(|_| {
         r#"{"id":null,"ok":false,"error":{"code":"SERIALIZATION_ERROR","message":"Failed to serialize error."}}"#.to_string()

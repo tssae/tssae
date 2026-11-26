@@ -41,6 +41,18 @@ export type EngineIrCacheMetrics = {
   readonly filesInvalidated: number;
 };
 
+export type EngineSummaryLookupMetrics = {
+  readonly lookups: number;
+  readonly hits: number;
+  readonly misses: number;
+  readonly hitsBySource: {
+    readonly local: number;
+    readonly package: number;
+    readonly community: number;
+    readonly builtin: number;
+  };
+};
+
 export type EngineRpcMetrics = {
   readonly durationMs: number;
   readonly encodeMs: number;
@@ -49,6 +61,7 @@ export type EngineRpcMetrics = {
   readonly steps?: readonly EngineStepMetrics[];
   readonly lowering?: EngineLoweringMetrics;
   readonly irCache?: EngineIrCacheMetrics;
+  readonly summaryLookup?: EngineSummaryLookupMetrics;
   readonly providerExtractions?: Readonly<
     Record<string, EngineProviderExtractionStats>
   >;

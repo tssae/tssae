@@ -13,8 +13,9 @@ pub mod syntax_view;
 
 pub use impl_resolution::{
     DeclarationProvenance, FacadeImplementationInput, FacadeImplementationOutcome,
-    FacadeImplementationTarget, FirstPartyResolutionSource, SourceMapCache,
-    is_first_party_source_file, is_first_party_workspace_path,
+    FacadeImplementationTarget, FirstPartyResolutionSource, ResolvedPackageInfo, SourceMapCache,
+    collect_resolved_packages_for_program, is_first_party_source_file,
+    is_first_party_workspace_path,
 };
 pub use ir_lower::{
     LoweredScope, lower_class_default_constructor_to_ir, lower_class_static_init_to_ir,

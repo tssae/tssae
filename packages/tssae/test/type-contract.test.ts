@@ -390,6 +390,33 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2339/u,
         },
+        {
+          name: "mayThrowSites cannot be read on implicitExceptions before narrowing",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.mayThrowSites;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "counterexamplePath cannot be read on implicitExceptions before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.counterexamplePath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on implicitExceptions before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

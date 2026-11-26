@@ -350,11 +350,20 @@ fn serves_list_branches_and_branch_coverage_statuses() {
     assert_eq!(results[2]["items"][0]["targetReachable"], json!(false));
     assert_eq!(results[3]["items"][0]["status"], json!("proved"));
     assert_eq!(results[3]["items"][0]["targetReachable"], json!(true));
-    assert_eq!(results[4]["items"][0]["status"], json!("inconclusive"));
-    assert_eq!(results[4]["items"][0]["targetReachable"], json!(true));
     assert_eq!(
-        results[4]["items"][0]["gaps"][0]["kind"],
-        json!("unmodeled-try-catch")
+        results[3]["items"][0]["implicitExceptions"]["status"],
+        json!("proved")
+    );
+    assert_eq!(results[4]["items"][0]["status"], json!("disproved"));
+    assert_eq!(results[4]["items"][0]["targetReachable"], json!(true));
+    assert!(
+        results[4]["items"][0]["counterexamplePath"]["steps"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(
+        results[4]["items"][0]["implicitExceptions"]["status"],
+        json!("proved")
     );
 
     finish_engine(child, stdin);

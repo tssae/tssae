@@ -7,8 +7,8 @@ pub use diagnostics::{
     TriStateOutcome, UnknownReason,
 };
 pub use handles::{
-    BranchId, FileId, FunctionIrId, InstanceId, LocalBindingId, LocalSyntaxId, SignatureId,
-    SymbolId, SyntaxId, TypeId, ValueId, VertexId,
+    BranchId, FileId, FinallyId, FunctionIrId, InstanceId, LocalBindingId, LocalSyntaxId,
+    SignatureId, SymbolId, SyntaxId, TypeId, ValueId, VertexId,
 };
 pub use model::{
     DeclarationSummaryData, SemanticModel, SignatureSummaryData, SyntaxCatalog, SyntaxNodeSummary,

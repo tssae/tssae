@@ -1,4 +1,8 @@
-import type { BranchCoverageItem, BranchEdgeInfo } from "./branch-coverage.ts";
+import type {
+  BranchCoverageItem,
+  BranchEdgeInfo,
+  ImplicitExceptionCoverageOutcome,
+} from "./branch-coverage.ts";
 import type {
   CallbackInvocationInfo,
   CleanupSiteInfo,
@@ -42,6 +46,7 @@ export type SelectableQueryResult =
   | ValuePropagationPath
   | ValuePropagationTargetResult
   | BranchCoverageItem
+  | ImplicitExceptionCoverageOutcome
   | BranchEdgeInfo
   | CallTargetsResult
   | CallTargetInfo

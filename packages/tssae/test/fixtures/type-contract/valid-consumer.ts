@@ -251,6 +251,15 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
         } else {
           void cov.targetReachable;
         }
+        if (cov.implicitExceptions.status === "disproved") {
+          void cov.implicitExceptions.mayThrowSites.length;
+          void cov.implicitExceptions.counterexamplePath.steps.length;
+        } else if (cov.implicitExceptions.status === "inconclusive") {
+          void cov.implicitExceptions.mayThrowSites.length;
+          void cov.implicitExceptions.gaps.length;
+        } else {
+          void cov.implicitExceptions.evidence.length;
+        }
       }
       await ctx.resolveInstances([recvSyn]);
     }

@@ -338,14 +338,17 @@ try {
   ]);
   assert.equal(covPositive[0]?.status, "proved");
   assert.equal(covPositive[0]?.targetReachable, true);
+  assert.equal(covPositive[0]?.implicitExceptions.status, "proved");
   assert.equal(covNegative[0]?.status, "disproved");
   assert.equal(covNegative[0]?.targetReachable, true);
+  assert.equal(covNegative[0]?.implicitExceptions.status, "proved");
   assert.ok(
     covNegative[0]?.status === "disproved" &&
       covNegative[0].counterexamplePath.steps.length > 0,
   );
   assert.equal(covDead[0]?.status, "proved");
   assert.equal(covDead[0]?.targetReachable, false);
+  assert.equal(covDead[0]?.implicitExceptions.status, "proved");
 
   // 3. Value propagation + retained object fields (positive & negative)
   const appVars = await ctx.findSyntax({

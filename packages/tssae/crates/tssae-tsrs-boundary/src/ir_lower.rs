@@ -11,11 +11,11 @@ use tssae_analysis::ir::{
     AssignOp, BinaryOp, BindingMutability, CfgVertex, DeclarationSemantics, ExplicitEdge,
     ExplicitEdgeKind, FunctionIr, IrArrayElem, IrBranchDirection, IrBranchKind, IrBranchRecord,
     IrCallArg, IrCallKind, IrLocalBinding, IrObjectProp, IrOp, IrParameter, IrPropKey, IrScopeKind,
-    LiteralKind, MemberVisibility, UnaryOp,
+    LiteralKind, MayThrowEdge, MayThrowReason, MemberVisibility, UnaryOp,
 };
 use tssae_common::{
-    BranchId, DiagnosticLocation, FunctionIrId, GapItem, LocalBindingId, LocalSyntaxId, SymbolId,
-    SyntaxId, UnknownReason, ValueId, VertexId,
+    BranchId, DiagnosticLocation, FinallyId, FunctionIrId, GapItem, LocalBindingId, LocalSyntaxId,
+    SymbolId, SyntaxId, UnknownReason, ValueId, VertexId,
 };
 
 use crate::semantic_facade::SemanticModelBridge;
@@ -145,7 +145,7 @@ pub fn lower_scope_to_ir(
             lowerer.collect_parameters(fn_node);
 
             let body_entry = if body.kind() == Kind::Block {
-                lowerer.lower_stmt(body, lowerer.normal_exit, None, None)
+                lowerer.lower_stmt(body, lowerer.normal_exit)
             } else {
                 let (expr_entry, expr_val) = lowerer.lower_expr_to(body, lowerer.normal_exit);
                 let _ = expr_val;
@@ -163,12 +163,11 @@ pub fn lower_scope_to_ir(
         } else {
             // Inside a local statement/block scope (such as a loop body), unlabeled break/continue
             // exit the local scope cleanly without requiring outer loop back-edges.
-            let entry_target = lowerer.lower_stmt(
-                scope_node,
-                lowerer.normal_exit,
-                Some(lowerer.normal_exit),
-                Some(lowerer.normal_exit),
-            );
+            lowerer.cf_frames.push(CfFrame::LocalScopeFallback {
+                target: lowerer.normal_exit,
+            });
+            let entry_target = lowerer.lower_stmt(scope_node, lowerer.normal_exit);
+            lowerer.cf_frames.pop();
             lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
         }
 
@@ -182,6 +181,47 @@ pub fn lower_scope_to_ir(
         ));
     }
     Ok(scope_ir)
+}
+
+#[derive(Clone, Copy)]
+enum AssignTargetPrefix {
+    Prop {
+        base: P<Node>,
+        assign_v: VertexId,
+    },
+    Element {
+        base: P<Node>,
+        arg: P<Node>,
+        assign_v: VertexId,
+    },
+    Other(P<Node>),
+}
+
+enum CfFrame {
+    Loop {
+        labels: Vec<String>,
+        break_target: VertexId,
+        continue_target: VertexId,
+    },
+    Switch {
+        break_target: VertexId,
+    },
+    Label {
+        name: String,
+        break_target: VertexId,
+    },
+    Catch {
+        entry: VertexId,
+    },
+    Finally {
+        id: FinallyId,
+        entry: VertexId,
+        normal_exit: VertexId,
+        trampolines: FxHashMap<VertexId, VertexId>,
+    },
+    LocalScopeFallback {
+        target: VertexId,
+    },
 }
 
 struct ScopeLowerer<'a> {
@@ -208,6 +248,9 @@ struct ScopeLowerer<'a> {
     expr_to_vertex: FxHashMap<LocalSyntaxId, VertexId>,
     expr_to_value: FxHashMap<LocalSyntaxId, ValueId>,
     branches: Vec<IrBranchRecord>,
+    cf_frames: Vec<CfFrame>,
+    active_finally_bodies: Vec<FinallyId>,
+    next_finally_id: u32,
     next_value_id: u32,
 }
 
@@ -267,6 +310,9 @@ impl<'a> ScopeLowerer<'a> {
             expr_to_vertex: FxHashMap::default(),
             expr_to_value: FxHashMap::default(),
             branches: Vec::new(),
+            cf_frames: Vec::new(),
+            active_finally_bodies: Vec::new(),
+            next_finally_id: 0,
             next_value_id: 0,
         }
     }
@@ -369,6 +415,7 @@ impl<'a> ScopeLowerer<'a> {
             op,
             explicit_edges: Vec::new(),
             may_throw_edge: None,
+            enclosing_finallies: self.active_finally_bodies.clone(),
         });
 
         if let Some(sid) = syntax {
@@ -481,44 +528,161 @@ impl<'a> ScopeLowerer<'a> {
         node_text(ident_node).and_then(|name| self.binding_by_name.get(&name).copied())
     }
 
-    fn lower_sequence(
-        &mut self,
-        statements: &[P<Node>],
-        mut next: VertexId,
-        break_to: Option<VertexId>,
-        continue_to: Option<VertexId>,
-    ) -> VertexId {
+    fn attach_may_throw(&mut self, vid: VertexId, node: P<Node>, reason: MayThrowReason) {
+        let target = self.current_exceptional_target();
+        let site_syntax = self.intern_node(node);
+        if let Some(v) = self.vertices.get_mut(vid.0 as usize) {
+            v.may_throw_edge = Some(MayThrowEdge {
+                target,
+                site_syntax,
+                reason,
+            });
+        }
+    }
+
+    fn wrap_with_finallies_above(&mut self, start_idx: usize, mut target: VertexId) -> VertexId {
+        for idx in start_idx..self.cf_frames.len() {
+            let (id, entry, normal_exit, cached) = match &self.cf_frames[idx] {
+                CfFrame::Finally {
+                    id,
+                    entry,
+                    normal_exit,
+                    trampolines,
+                } => (*id, *entry, *normal_exit, trampolines.get(&target).copied()),
+                CfFrame::Loop { .. }
+                | CfFrame::Switch { .. }
+                | CfFrame::Label { .. }
+                | CfFrame::Catch { .. }
+                | CfFrame::LocalScopeFallback { .. } => continue,
+            };
+            if let Some(tramp_v) = cached {
+                target = tramp_v;
+                continue;
+            }
+            let tramp_v = self.new_vertex(None, IrOp::NopMerge, None, false);
+            self.add_edge(
+                tramp_v,
+                entry,
+                ExplicitEdgeKind::FinallyEnter {
+                    finally_id: id,
+                    resume: target,
+                },
+            );
+            self.add_edge(
+                normal_exit,
+                target,
+                ExplicitEdgeKind::FinallyResume {
+                    finally_id: id,
+                    resume: target,
+                },
+            );
+            if let CfFrame::Finally { trampolines, .. } = &mut self.cf_frames[idx] {
+                trampolines.insert(target, tramp_v);
+            }
+            target = tramp_v;
+        }
+        target
+    }
+
+    fn current_exceptional_target(&mut self) -> VertexId {
+        for idx in (0..self.cf_frames.len()).rev() {
+            if let CfFrame::Catch { entry } = self.cf_frames[idx] {
+                return self.wrap_with_finallies_above(idx + 1, entry);
+            }
+        }
+        self.wrap_with_finallies_above(0, self.exceptional_exit)
+    }
+
+    fn resolve_return_target(&mut self) -> VertexId {
+        self.wrap_with_finallies_above(0, self.normal_exit)
+    }
+
+    fn resolve_break_target(&mut self, label: Option<&str>) -> Option<VertexId> {
+        for idx in (0..self.cf_frames.len()).rev() {
+            let matched = match &self.cf_frames[idx] {
+                CfFrame::Label { name, break_target } if label == Some(name.as_str()) => {
+                    Some(*break_target)
+                }
+                CfFrame::Loop {
+                    labels,
+                    break_target,
+                    ..
+                } if label.is_none_or(|lbl| labels.iter().any(|l| l == lbl)) => Some(*break_target),
+                CfFrame::Switch { break_target } if label.is_none() => Some(*break_target),
+                CfFrame::LocalScopeFallback { target } => Some(*target),
+                CfFrame::Label { .. }
+                | CfFrame::Loop { .. }
+                | CfFrame::Switch { .. }
+                | CfFrame::Catch { .. }
+                | CfFrame::Finally { .. } => None,
+            };
+            if let Some(target) = matched {
+                return Some(self.wrap_with_finallies_above(idx + 1, target));
+            }
+        }
+        None
+    }
+
+    fn resolve_continue_target(&mut self, label: Option<&str>) -> Option<VertexId> {
+        for idx in (0..self.cf_frames.len()).rev() {
+            let matched = match &self.cf_frames[idx] {
+                CfFrame::Loop {
+                    labels,
+                    continue_target,
+                    ..
+                } if label.is_none_or(|lbl| labels.iter().any(|l| l == lbl)) => {
+                    Some(*continue_target)
+                }
+                CfFrame::LocalScopeFallback { target } => Some(*target),
+                CfFrame::Loop { .. }
+                | CfFrame::Switch { .. }
+                | CfFrame::Label { .. }
+                | CfFrame::Catch { .. }
+                | CfFrame::Finally { .. } => None,
+            };
+            if let Some(target) = matched {
+                return Some(self.wrap_with_finallies_above(idx + 1, target));
+            }
+        }
+        None
+    }
+
+    fn lower_sequence(&mut self, statements: &[P<Node>], mut next: VertexId) -> VertexId {
         for &stmt_node in statements.iter().rev() {
-            next = self.lower_stmt(stmt_node, next, break_to, continue_to);
+            next = self.lower_stmt(stmt_node, next);
         }
         next
+    }
+
+    fn lower_stmt(&mut self, node: P<Node>, next: VertexId) -> VertexId {
+        self.lower_stmt_with_labels(node, next, Vec::new())
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "Exhaustive 353-variant tsrs_ast::Kind statement dispatcher."
     )]
-    fn lower_stmt(
+    fn lower_stmt_with_labels(
         &mut self,
         node: P<Node>,
         next: VertexId,
-        break_to: Option<VertexId>,
-        continue_to: Option<VertexId>,
+        mut pending_labels: Vec<String>,
     ) -> VertexId {
         match node.kind() {
             Kind::Block | Kind::ModuleBlock => {
                 let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
-                let first = self.lower_sequence(node.statements(), next, break_to, continue_to);
+                let first = self.lower_sequence(node.statements(), next);
                 self.add_edge(here, first, ExplicitEdgeKind::Fallthrough);
                 here
             }
-            Kind::IfStatement => self.lower_if(node, next, break_to, continue_to),
-            Kind::SwitchStatement => self.lower_switch(node, next, continue_to),
+            Kind::IfStatement => self.lower_if(node, next),
+            Kind::SwitchStatement => self.lower_switch(node, next),
             Kind::ReturnStatement => {
                 let expr_opt = node.as_return_statement().expression();
+                let return_target = self.resolve_return_target();
                 let ret_vid =
                     self.new_vertex(Some(node), IrOp::Return { value: None }, None, false);
-                self.add_edge(ret_vid, self.normal_exit, ExplicitEdgeKind::Return);
+                self.add_edge(ret_vid, return_target, ExplicitEdgeKind::Return);
                 if let Some(expr) = expr_opt {
                     let (expr_entry, expr_val) = self.lower_expr_to(expr, ret_vid);
                     if let Some(v) = self.vertices.get_mut(ret_vid.0 as usize) {
@@ -533,14 +697,11 @@ impl<'a> ScopeLowerer<'a> {
             }
             Kind::ThrowStatement => {
                 let expr = node.as_throw_statement().expression();
+                let throw_target = self.current_exceptional_target();
                 let dummy = ValueId(0);
                 let throw_vid =
                     self.new_vertex(Some(node), IrOp::Throw { exception: dummy }, None, false);
-                self.add_edge(
-                    throw_vid,
-                    self.exceptional_exit,
-                    ExplicitEdgeKind::ExplicitThrow,
-                );
+                self.add_edge(throw_vid, throw_target, ExplicitEdgeKind::ExplicitThrow);
                 let (expr_entry, expr_val) = self.lower_expr_to(expr, throw_vid);
                 if let Some(v) = self.vertices.get_mut(throw_vid.0 as usize) {
                     v.op = IrOp::Throw {
@@ -551,54 +712,21 @@ impl<'a> ScopeLowerer<'a> {
             }
             Kind::BreakStatement => {
                 let label = node.as_break_statement().label().and_then(node_text);
-                if label.is_none()
-                    && let Some(target) = break_to
-                {
-                    let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
-                    self.add_edge(here, target, ExplicitEdgeKind::Break { label: None });
-                    here
-                } else {
-                    let here = self.new_vertex(
-                        Some(node),
-                        IrOp::Unknown {
-                            reason: UnknownReason::UnmodeledJump,
-                            message:
-                                "Labeled or unstructured break statement is not precisely modeled."
-                                    .to_string(),
-                            location: self.loc(node),
-                            evaluated_children: Vec::new(),
-                        },
-                        None,
-                        false,
-                    );
-                    self.add_edge(here, next, ExplicitEdgeKind::Break { label });
-                    here
-                }
+                let target = self
+                    .resolve_break_target(label.as_deref())
+                    .unwrap_or(self.normal_exit);
+                let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+                self.add_edge(here, target, ExplicitEdgeKind::Break { label });
+                here
             }
             Kind::ContinueStatement => {
                 let label = node.as_continue_statement().label().and_then(node_text);
-                if label.is_none()
-                    && let Some(target) = continue_to
-                {
-                    let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
-                    self.add_edge(here, target, ExplicitEdgeKind::Continue { label: None });
-                    here
-                } else {
-                    let here = self.new_vertex(
-                        Some(node),
-                        IrOp::Unknown {
-                            reason: UnknownReason::UnmodeledJump,
-                            message: "Loop continue statements are not precisely modeled."
-                                .to_string(),
-                            location: self.loc(node),
-                            evaluated_children: Vec::new(),
-                        },
-                        None,
-                        false,
-                    );
-                    self.add_edge(here, next, ExplicitEdgeKind::Continue { label });
-                    here
-                }
+                let target = self
+                    .resolve_continue_target(label.as_deref())
+                    .unwrap_or(self.normal_exit);
+                let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+                self.add_edge(here, target, ExplicitEdgeKind::Continue { label });
+                here
             }
             Kind::ExpressionStatement => {
                 let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
@@ -613,28 +741,27 @@ impl<'a> ScopeLowerer<'a> {
                 self.lower_variable_decls(decls, next)
             }
             Kind::VariableDeclaration => self.lower_variable_decls(&[node], next),
-            Kind::TryStatement => self.lower_try_unknown(node, next, break_to, continue_to),
-            Kind::WhileStatement
-            | Kind::DoStatement
-            | Kind::ForStatement
-            | Kind::ForInStatement
-            | Kind::ForOfStatement => self.lower_loop_unknown(node, next),
+            Kind::TryStatement => self.lower_try(node, next),
+            Kind::WhileStatement => self.lower_while(node, next, pending_labels),
+            Kind::DoStatement => self.lower_do_while(node, next, pending_labels),
+            Kind::ForStatement => self.lower_for(node, next, pending_labels),
+            Kind::ForInStatement | Kind::ForOfStatement => {
+                self.lower_for_in_or_of(node, next, pending_labels)
+            }
             Kind::LabeledStatement => {
-                let unknown_v = self.new_vertex(
-                    Some(node),
-                    IrOp::Unknown {
-                        reason: UnknownReason::UnmodeledJump,
-                        message: "Labeled statements are not precisely modeled.".to_string(),
-                        location: self.loc(node),
-                        evaluated_children: Vec::new(),
-                    },
-                    None,
-                    false,
-                );
-                let inner = node.as_labeled_statement().statement();
-                let inner_entry = self.lower_stmt(inner, next, break_to, continue_to);
-                self.add_edge(unknown_v, inner_entry, ExplicitEdgeKind::Fallthrough);
-                unknown_v
+                let lbl = node.as_labeled_statement();
+                let label_name = node_text(lbl.label()).unwrap_or_default();
+                let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+                self.cf_frames.push(CfFrame::Label {
+                    name: label_name.clone(),
+                    break_target: next,
+                });
+                pending_labels.push(label_name);
+                let inner_entry =
+                    self.lower_stmt_with_labels(lbl.statement(), next, pending_labels);
+                self.cf_frames.pop();
+                self.add_edge(here, inner_entry, ExplicitEdgeKind::Fallthrough);
+                here
             }
             Kind::WithStatement => {
                 let unknown_v = self.new_vertex(
@@ -649,8 +776,7 @@ impl<'a> ScopeLowerer<'a> {
                     false,
                 );
                 let with_stmt = node.as_with_statement();
-                let body_entry =
-                    self.lower_stmt(with_stmt.statement(), next, break_to, continue_to);
+                let body_entry = self.lower_stmt(with_stmt.statement(), next);
                 let (expr_entry, expr_val) = self.lower_expr_to(with_stmt.expression(), body_entry);
                 if let Some(v) = self.vertices.get_mut(unknown_v.0 as usize)
                     && let IrOp::Unknown {
@@ -1046,19 +1172,13 @@ impl<'a> ScopeLowerer<'a> {
         }
     }
 
-    fn lower_if(
-        &mut self,
-        node: P<Node>,
-        next: VertexId,
-        break_to: Option<VertexId>,
-        continue_to: Option<VertexId>,
-    ) -> VertexId {
+    fn lower_if(&mut self, node: P<Node>, next: VertexId) -> VertexId {
         let if_stmt = node.as_if_statement();
         let cond = if_stmt.expression();
-        let then_entry = self.lower_stmt(if_stmt.then_statement(), next, break_to, continue_to);
-        let else_entry = if_stmt.else_statement().map_or(next, |else_node| {
-            self.lower_stmt(else_node, next, break_to, continue_to)
-        });
+        let then_entry = self.lower_stmt(if_stmt.then_statement(), next);
+        let else_entry = if_stmt
+            .else_statement()
+            .map_or(next, |else_node| self.lower_stmt(else_node, next));
 
         let cond_loc = self.loc(cond);
         let stmt_loc = self.loc(node);
@@ -1094,12 +1214,7 @@ impl<'a> ScopeLowerer<'a> {
         here
     }
 
-    fn lower_switch(
-        &mut self,
-        node: P<Node>,
-        next: VertexId,
-        continue_to: Option<VertexId>,
-    ) -> VertexId {
+    fn lower_switch(&mut self, node: P<Node>, next: VertexId) -> VertexId {
         let sw = node.as_switch_statement();
         let disc = sw.expression();
         let clauses = sw.case_block().as_case_block().clauses().nodes();
@@ -1114,17 +1229,18 @@ impl<'a> ScopeLowerer<'a> {
             false,
         );
 
+        self.cf_frames.push(CfFrame::Switch { break_target: next });
         let mut fallthrough = next;
         let mut has_default = false;
         let mut clause_entries = Vec::with_capacity(clauses.len());
         for &clause in clauses.iter().rev() {
             has_default |= clause.kind() == Kind::DefaultClause;
-            let body_entry =
-                self.lower_sequence(clause.statements(), fallthrough, Some(next), continue_to);
+            let body_entry = self.lower_sequence(clause.statements(), fallthrough);
             self.record_syntax_vertex(clause, body_entry);
             clause_entries.push((clause, body_entry));
             fallthrough = body_entry;
         }
+        self.cf_frames.pop();
         clause_entries.reverse();
 
         for (clause, body_entry) in clause_entries {
@@ -1271,85 +1387,272 @@ impl<'a> ScopeLowerer<'a> {
         cont
     }
 
-    fn lower_try_unknown(
+    fn lower_try(&mut self, node: P<Node>, next: VertexId) -> VertexId {
+        let try_stmt = node.as_try_statement();
+        let has_finally = try_stmt.finally_block().is_some();
+
+        let try_normal_cont = if let Some(fb) = try_stmt.finally_block() {
+            let fid = FinallyId(self.next_finally_id);
+            self.next_finally_id = self.next_finally_id.saturating_add(1);
+            self.active_finally_bodies.push(fid);
+            let finally_entry = self.new_vertex(None, IrOp::NopMerge, None, false);
+            let finally_normal_exit = self.new_vertex(None, IrOp::NopMerge, None, false);
+            let f_body = self.lower_stmt(fb, finally_normal_exit);
+            self.add_edge(finally_entry, f_body, ExplicitEdgeKind::Fallthrough);
+            self.active_finally_bodies.pop();
+
+            let frame_idx = self.cf_frames.len();
+            self.cf_frames.push(CfFrame::Finally {
+                id: fid,
+                entry: finally_entry,
+                normal_exit: finally_normal_exit,
+                trampolines: FxHashMap::default(),
+            });
+            self.wrap_with_finallies_above(frame_idx, next)
+        } else {
+            next
+        };
+
+        let try_entry = if let Some(catch_node) = try_stmt.catch_clause() {
+            let cc = catch_node.as_catch_clause();
+            let block_entry = self.lower_stmt(cc.block(), try_normal_cont);
+            let catch_entry = cc.variable_declaration().map_or(block_entry, |var_decl| {
+                self.lower_catch_param(var_decl, block_entry)
+            });
+            self.record_syntax_vertex(catch_node, catch_entry);
+            self.cf_frames.push(CfFrame::Catch { entry: catch_entry });
+            let entry = self.lower_stmt(try_stmt.try_block(), try_normal_cont);
+            self.cf_frames.pop();
+            entry
+        } else {
+            self.lower_stmt(try_stmt.try_block(), try_normal_cont)
+        };
+
+        if has_finally {
+            self.cf_frames.pop();
+        }
+
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+        self.add_edge(here, try_entry, ExplicitEdgeKind::Fallthrough);
+        here
+    }
+
+    fn lower_catch_param(&mut self, var_decl: P<Node>, cont: VertexId) -> VertexId {
+        let name_node = var_decl.name();
+        let binding = if let Some(nn) = name_node
+            && nn.kind() == Kind::Identifier
+        {
+            let name = node_text(nn).unwrap_or_default();
+            Some(self.register_binding(&name, BindingMutability::CatchBinding, var_decl))
+        } else {
+            None
+        };
+        let bind_v = self.new_vertex(Some(var_decl), IrOp::CatchParamBind { binding }, None, true);
+        let after_defaults = name_node.map_or(cont, |nn| {
+            self.record_syntax_vertex(nn, bind_v);
+            self.lower_binding_defaults(nn, cont)
+        });
+        self.add_edge(bind_v, after_defaults, ExplicitEdgeKind::Fallthrough);
+        bind_v
+    }
+
+    fn lower_while(&mut self, node: P<Node>, next: VertexId, labels: Vec<String>) -> VertexId {
+        let w = node.as_while_statement();
+        let cond = w.expression();
+        let cond_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let loop_back = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(loop_back, cond_head, ExplicitEdgeKind::LoopBack);
+
+        self.cf_frames.push(CfFrame::Loop {
+            labels,
+            break_target: next,
+            continue_target: cond_head,
+        });
+        let body_entry = self.lower_stmt(w.statement(), loop_back);
+        self.cf_frames.pop();
+
+        let (true_gate, false_gate) = self.emit_loop_branch_gates(node, cond, body_entry, next);
+        let cond_entry = self.lower_bool_expr(cond, true_gate, false_gate);
+        self.add_edge(cond_head, cond_entry, ExplicitEdgeKind::Fallthrough);
+
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+        self.add_edge(here, cond_head, ExplicitEdgeKind::Fallthrough);
+        here
+    }
+
+    fn lower_do_while(&mut self, node: P<Node>, next: VertexId, labels: Vec<String>) -> VertexId {
+        let d = node.as_do_statement();
+        let cond = d.expression();
+        let body_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let cond_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let loop_back = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(loop_back, body_head, ExplicitEdgeKind::LoopBack);
+
+        self.cf_frames.push(CfFrame::Loop {
+            labels,
+            break_target: next,
+            continue_target: cond_head,
+        });
+        let body_entry = self.lower_stmt(d.statement(), cond_head);
+        self.cf_frames.pop();
+        self.add_edge(body_head, body_entry, ExplicitEdgeKind::Fallthrough);
+
+        let (true_gate, false_gate) = self.emit_loop_branch_gates(node, cond, loop_back, next);
+        let cond_entry = self.lower_bool_expr(cond, true_gate, false_gate);
+        self.add_edge(cond_head, cond_entry, ExplicitEdgeKind::Fallthrough);
+
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+        self.add_edge(here, body_head, ExplicitEdgeKind::Fallthrough);
+        here
+    }
+
+    fn lower_for(&mut self, node: P<Node>, next: VertexId, labels: Vec<String>) -> VertexId {
+        let f = node.as_for_statement();
+        let cond_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let incr_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let loop_back = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(loop_back, cond_head, ExplicitEdgeKind::LoopBack);
+
+        let incr_entry = f.incrementor().map_or(loop_back, |incr| {
+            let (entry, _) = self.lower_expr_to(incr, loop_back);
+            entry
+        });
+        self.add_edge(incr_head, incr_entry, ExplicitEdgeKind::Fallthrough);
+
+        self.cf_frames.push(CfFrame::Loop {
+            labels,
+            break_target: next,
+            continue_target: incr_head,
+        });
+        let body_entry = self.lower_stmt(f.statement(), incr_head);
+        self.cf_frames.pop();
+
+        if let Some(cond) = f.condition() {
+            let (true_gate, false_gate) = self.emit_loop_branch_gates(node, cond, body_entry, next);
+            let cond_entry = self.lower_bool_expr(cond, true_gate, false_gate);
+            self.add_edge(cond_head, cond_entry, ExplicitEdgeKind::Fallthrough);
+        } else {
+            self.add_edge(cond_head, body_entry, ExplicitEdgeKind::Fallthrough);
+        }
+
+        let start = f
+            .initializer()
+            .map_or(cond_head, |init| self.lower_stmt(init, cond_head));
+
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+        self.add_edge(here, start, ExplicitEdgeKind::Fallthrough);
+        here
+    }
+
+    fn lower_for_in_or_of(
         &mut self,
         node: P<Node>,
         next: VertexId,
-        break_to: Option<VertexId>,
-        continue_to: Option<VertexId>,
+        labels: Vec<String>,
     ) -> VertexId {
-        let unknown_v = self.new_vertex(
-            Some(node),
-            IrOp::Unknown {
-                reason: UnknownReason::UnmodeledTryCatch,
-                message: "Control flow through try/catch/finally is not precisely modeled."
-                    .to_string(),
-                location: self.loc(node),
-                evaluated_children: Vec::new(),
-            },
-            None,
-            false,
-        );
-        let try_stmt = node.as_try_statement();
-        let after_try = try_stmt
-            .finally_block()
-            .map_or(next, |fb| self.lower_stmt(fb, next, break_to, continue_to));
-        let try_entry = self.lower_stmt(try_stmt.try_block(), after_try, break_to, continue_to);
-        self.add_edge(unknown_v, try_entry, ExplicitEdgeKind::Fallthrough);
+        let f = node.as_for_in_or_of_statement();
+        let is_async = f.await_modifier().is_some();
+        let iterable_expr = f.expression();
+        let lhs = f.initializer();
 
-        if let Some(catch_clause) = try_stmt.catch_clause() {
-            let catch_entry = self.lower_stmt(
-                catch_clause.as_catch_clause().block(),
-                after_try,
-                break_to,
-                continue_to,
-            );
-            self.add_edge(unknown_v, catch_entry, ExplicitEdgeKind::Fallthrough);
+        let iter_head = self.new_vertex(None, IrOp::NopMerge, None, false);
+        let loop_back = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(loop_back, iter_head, ExplicitEdgeKind::LoopBack);
+
+        self.cf_frames.push(CfFrame::Loop {
+            labels,
+            break_target: next,
+            continue_target: iter_head,
+        });
+        let body_entry = self.lower_stmt(f.statement(), loop_back);
+        self.cf_frames.pop();
+
+        let step_val = self.alloc_value();
+        let lhs_entry = if lhs.kind() == Kind::VariableDeclarationList {
+            self.lower_stmt(lhs, body_entry)
+        } else {
+            let (target_base, assign_v) =
+                self.prepare_assign_target(lhs, lhs, AssignOp::Assign, step_val, body_entry);
+            self.lower_assign_target_prefix(target_base, assign_v)
+        };
+
+        let (true_gate, false_gate) =
+            self.emit_loop_branch_gates(node, iterable_expr, lhs_entry, next);
+
+        let iter_val = self.alloc_value();
+        let next_v = self.new_vertex(
+            Some(node),
+            IrOp::IteratorNext {
+                iterator: iter_val,
+                is_async,
+            },
+            Some(step_val),
+            true,
+        );
+        self.attach_may_throw(next_v, node, MayThrowReason::IteratorStep);
+        self.add_edge(next_v, true_gate, ExplicitEdgeKind::Fallthrough);
+        self.add_edge(next_v, false_gate, ExplicitEdgeKind::Fallthrough);
+        self.add_edge(iter_head, next_v, ExplicitEdgeKind::Fallthrough);
+
+        let init_v = self.new_vertex(
+            Some(node),
+            IrOp::IteratorInit {
+                iterable: iter_val,
+                is_async,
+            },
+            Some(iter_val),
+            true,
+        );
+        self.attach_may_throw(init_v, iterable_expr, MayThrowReason::IteratorStep);
+        self.add_edge(init_v, iter_head, ExplicitEdgeKind::Fallthrough);
+
+        let (expr_entry, expr_val) = self.lower_expr_to(iterable_expr, init_v);
+        if let Some(v) = self.vertices.get_mut(init_v.0 as usize)
+            && let IrOp::IteratorInit { iterable, .. } = &mut v.op
+        {
+            *iterable = expr_val;
         }
-        unknown_v
+
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
+        self.add_edge(here, expr_entry, ExplicitEdgeKind::Fallthrough);
+        here
     }
 
-    fn lower_loop_unknown(&mut self, node: P<Node>, next: VertexId) -> VertexId {
-        let unknown_v = self.new_vertex(
-            Some(node),
-            IrOp::Unknown {
-                reason: UnknownReason::UnmodeledLoop,
-                message: "Control flow through loops is not precisely modeled.".to_string(),
-                location: self.loc(node),
-                evaluated_children: Vec::new(),
-            },
+    fn emit_loop_branch_gates(
+        &mut self,
+        stmt_node: P<Node>,
+        cond_node: P<Node>,
+        body_entry: VertexId,
+        exit_next: VertexId,
+    ) -> (VertexId, VertexId) {
+        let cond_loc = self.loc(cond_node);
+        let stmt_loc = self.loc(stmt_node);
+        let true_branch = self.push_branch(
+            IrBranchKind::Loop,
+            IrBranchDirection::True,
+            cond_node,
+            cond_loc.clone(),
+            stmt_loc.clone(),
             None,
-            false,
+        );
+        let false_branch = self.push_branch(
+            IrBranchKind::Loop,
+            IrBranchDirection::False,
+            cond_node,
+            cond_loc,
+            stmt_loc,
+            None,
         );
 
-        let mut children = Vec::new();
-        node.for_each_child(&mut |child| {
-            children.push(child);
-            false
-        });
-
-        let mut body_cont = next;
-        for &child in children.iter().rev() {
-            if is_function_like_declaration(Some(child))
-                || matches!(child.kind(), Kind::ClassDeclaration | Kind::ClassExpression)
-                || is_type_node(child)
-            {
-                continue;
-            }
-            body_cont = if tsrs_ast::is_statement(child) {
-                self.lower_stmt(child, body_cont, None, None)
-            } else {
-                let (e, _) = self.lower_expr_to(child, body_cont);
-                e
-            };
-        }
-
-        self.add_edge(unknown_v, body_cont, ExplicitEdgeKind::Fallthrough);
-        // Unmodeled loops can execute 0 times and exit directly to `next`.
-        if body_cont != next {
-            self.add_edge(unknown_v, next, ExplicitEdgeKind::Fallthrough);
-        }
-        unknown_v
+        let true_gate = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(true_gate, body_entry, ExplicitEdgeKind::Branch(true_branch));
+        let false_gate = self.new_vertex(None, IrOp::NopMerge, None, false);
+        self.add_edge(
+            false_gate,
+            exit_next,
+            ExplicitEdgeKind::Branch(false_branch),
+        );
+        (true_gate, false_gate)
     }
 
     #[expect(
@@ -1374,7 +1677,7 @@ impl<'a> ScopeLowerer<'a> {
             {
                 let operand = node.as_prefix_unary_expression().operand();
                 let entry = self.lower_bool_expr(operand, on_false, on_true);
-                self.record_syntax_vertex(node, entry);
+                self.alias_expr_vertex(node, operand, entry);
                 entry
             }
             Kind::BinaryExpression => {
@@ -1817,9 +2120,11 @@ impl<'a> ScopeLowerer<'a> {
         let short_gate = self.new_vertex(None, IrOp::NopMerge, None, false);
         self.add_edge(short_gate, on_false, ExplicitEdgeKind::Branch(short_branch));
 
-        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, true);
+        let out_val = self.alloc_value();
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, Some(out_val), true);
         let left_entry = self.lower_bool_expr(left, cont_gate, short_gate);
         self.add_edge(here, left_entry, ExplicitEdgeKind::Fallthrough);
+        self.bind_expr_maps(node, here, out_val);
         here
     }
 
@@ -1860,9 +2165,11 @@ impl<'a> ScopeLowerer<'a> {
             ExplicitEdgeKind::Branch(cont_branch),
         );
 
-        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, true);
+        let out_val = self.alloc_value();
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, Some(out_val), true);
         let left_entry = self.lower_bool_expr(left, short_gate, cont_gate);
         self.add_edge(here, left_entry, ExplicitEdgeKind::Fallthrough);
+        self.bind_expr_maps(node, here, out_val);
         here
     }
 
@@ -1901,9 +2208,11 @@ impl<'a> ScopeLowerer<'a> {
             ExplicitEdgeKind::Branch(false_branch),
         );
 
-        let here = self.new_vertex(Some(node), IrOp::NopMerge, None, true);
+        let out_val = self.alloc_value();
+        let here = self.new_vertex(Some(node), IrOp::NopMerge, Some(out_val), true);
         let cond_entry = self.lower_bool_expr(cond, true_gate, false_gate);
         self.add_edge(here, cond_entry, ExplicitEdgeKind::Fallthrough);
+        self.bind_expr_maps(node, here, out_val);
         here
     }
 
@@ -2099,29 +2408,29 @@ impl<'a> ScopeLowerer<'a> {
             Kind::ObjectLiteralExpression => self.lower_object_literal(node, next),
             Kind::ArrayLiteralExpression => self.lower_array_literal(node, next),
             Kind::YieldExpression => {
+                let y = node.as_yield_expression();
+                let is_delegate = y.asterisk_token().is_some();
                 let val = self.alloc_value();
                 let here = self.new_vertex(
                     Some(node),
-                    IrOp::Unknown {
-                        reason: UnknownReason::UnmodeledGenerator,
-                        message: "Generator yield control flow is not precisely modeled."
-                            .to_string(),
-                        location: self.loc(node),
-                        evaluated_children: Vec::new(),
+                    IrOp::Yield {
+                        value: None,
+                        is_delegate,
                     },
                     Some(val),
                     true,
                 );
+                if is_delegate {
+                    self.attach_may_throw(here, node, MayThrowReason::Yield);
+                }
                 self.add_edge(here, next, ExplicitEdgeKind::Fallthrough);
                 self.bind_expr_maps(node, here, val);
-                if let Some(inner) = node.as_yield_expression().expression() {
+                if let Some(inner) = y.expression() {
                     let (inner_entry, inner_val) = self.lower_expr_to(inner, here);
                     if let Some(v) = self.vertices.get_mut(here.0 as usize)
-                        && let IrOp::Unknown {
-                            evaluated_children, ..
-                        } = &mut v.op
+                        && let IrOp::Yield { value, .. } = &mut v.op
                     {
-                        evaluated_children.push(inner_val);
+                        *value = Some(inner_val);
                     }
                     (inner_entry, val)
                 } else {
@@ -2130,28 +2439,17 @@ impl<'a> ScopeLowerer<'a> {
             }
             Kind::AwaitExpression => {
                 let val = self.alloc_value();
-                let here = self.new_vertex(
-                    Some(node),
-                    IrOp::Unknown {
-                        reason: UnknownReason::UnmodeledAwait,
-                        message: "Async await suspension control flow is not precisely modeled."
-                            .to_string(),
-                        location: self.loc(node),
-                        evaluated_children: Vec::new(),
-                    },
-                    Some(val),
-                    true,
-                );
+                let here =
+                    self.new_vertex(Some(node), IrOp::Await { promise: val }, Some(val), true);
+                self.attach_may_throw(here, node, MayThrowReason::Await);
                 self.add_edge(here, next, ExplicitEdgeKind::Fallthrough);
                 self.bind_expr_maps(node, here, val);
                 let inner = node.as_await_expression().expression();
                 let (inner_entry, inner_val) = self.lower_expr_to(inner, here);
                 if let Some(v) = self.vertices.get_mut(here.0 as usize)
-                    && let IrOp::Unknown {
-                        evaluated_children, ..
-                    } = &mut v.op
+                    && let IrOp::Await { promise } = &mut v.op
                 {
-                    evaluated_children.push(inner_val);
+                    *promise = inner_val;
                 }
                 (inner_entry, val)
             }
@@ -2630,6 +2928,9 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        if matches!(bin_op, BinaryOp::In | BinaryOp::InstanceOf) {
+            self.attach_may_throw(v, node, MayThrowReason::DynamicOperator);
+        }
         self.add_edge(v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, v, out_val);
         let (right_entry, right_val) = self.lower_expr_to(bin.right(), v);
@@ -2691,7 +2992,7 @@ impl<'a> ScopeLowerer<'a> {
         next: VertexId,
     ) -> (VertexId, ValueId) {
         let out_val = self.alloc_value();
-        let assign_v = self.build_assign_target_vertex(node, left, op, out_val, next);
+        let (target_base, assign_v) = self.prepare_assign_target(node, left, op, out_val, next);
         let (right_entry, right_val) = self.lower_expr_to(right, assign_v);
         if let Some(vert) = self.vertices.get_mut(assign_v.0 as usize) {
             if let IrOp::AssignLocal { value, .. } = &mut vert.op {
@@ -2702,8 +3003,126 @@ impl<'a> ScopeLowerer<'a> {
                 *value = right_val;
             }
         }
-        let (lhs_entry, _) = self.lower_expr_to(left, right_entry);
+        let lhs_entry = self.lower_assign_target_prefix(target_base, right_entry);
         (lhs_entry, out_val)
+    }
+
+    fn prepare_assign_target(
+        &mut self,
+        node: P<Node>,
+        left: P<Node>,
+        op: AssignOp,
+        out_val: ValueId,
+        next: VertexId,
+    ) -> (AssignTargetPrefix, VertexId) {
+        if left.kind() == Kind::PropertyAccessExpression {
+            let pa = left.as_property_access_expression();
+            let base = pa.expression();
+            let name_node = pa.name();
+            let key_name = node_text(name_node).unwrap_or_default();
+            let key = if name_node.kind() == Kind::PrivateIdentifier {
+                IrPropKey::PrivateIdent(key_name)
+            } else {
+                IrPropKey::Named(key_name)
+            };
+            let is_super = base.kind() == Kind::SuperKeyword;
+            let assign_v = self.new_vertex(
+                Some(node),
+                IrOp::PropWrite {
+                    object: out_val,
+                    key,
+                    op,
+                    value: out_val,
+                    is_super,
+                },
+                Some(out_val),
+                true,
+            );
+            self.attach_may_throw(assign_v, node, MayThrowReason::PropertyAccess);
+            self.add_edge(assign_v, next, ExplicitEdgeKind::Fallthrough);
+            self.bind_expr_maps(node, assign_v, out_val);
+            self.bind_expr_maps(left, assign_v, out_val);
+            return (AssignTargetPrefix::Prop { base, assign_v }, assign_v);
+        }
+
+        if left.kind() == Kind::ElementAccessExpression {
+            let ea = left.as_element_access_expression();
+            let base = ea.expression();
+            let arg = ea.argument_expression();
+            let is_super = base.kind() == Kind::SuperKeyword;
+            let static_name = prop_key_text(arg);
+            let assign_v = self.new_vertex(
+                Some(node),
+                IrOp::PropWrite {
+                    object: out_val,
+                    key: IrPropKey::Computed {
+                        key: out_val,
+                        static_name,
+                    },
+                    op,
+                    value: out_val,
+                    is_super,
+                },
+                Some(out_val),
+                true,
+            );
+            self.attach_may_throw(assign_v, node, MayThrowReason::PropertyAccess);
+            self.add_edge(assign_v, next, ExplicitEdgeKind::Fallthrough);
+            self.bind_expr_maps(node, assign_v, out_val);
+            self.bind_expr_maps(left, assign_v, out_val);
+            return (
+                AssignTargetPrefix::Element {
+                    base,
+                    arg,
+                    assign_v,
+                },
+                assign_v,
+            );
+        }
+
+        let assign_v = self.build_assign_target_vertex(node, left, op, out_val, next);
+        (AssignTargetPrefix::Other(left), assign_v)
+    }
+
+    fn lower_assign_target_prefix(
+        &mut self,
+        prefix: AssignTargetPrefix,
+        cont: VertexId,
+    ) -> VertexId {
+        match prefix {
+            AssignTargetPrefix::Prop { base, assign_v } => {
+                let (base_entry, base_val) = self.lower_expr_to(base, cont);
+                if let Some(vert) = self.vertices.get_mut(assign_v.0 as usize)
+                    && let IrOp::PropWrite { object, .. } = &mut vert.op
+                {
+                    *object = base_val;
+                }
+                base_entry
+            }
+            AssignTargetPrefix::Element {
+                base,
+                arg,
+                assign_v,
+            } => {
+                let (arg_entry, arg_val) = self.lower_expr_to(arg, cont);
+                let (base_entry, base_val) = self.lower_expr_to(base, arg_entry);
+                if let Some(vert) = self.vertices.get_mut(assign_v.0 as usize)
+                    && let IrOp::PropWrite {
+                        object,
+                        key: IrPropKey::Computed { key, .. },
+                        ..
+                    } = &mut vert.op
+                {
+                    *object = base_val;
+                    *key = arg_val;
+                }
+                base_entry
+            }
+            AssignTargetPrefix::Other(left) => {
+                let (lhs_entry, _) = self.lower_expr_to(left, cont);
+                lhs_entry
+            }
+        }
     }
 
     fn build_assign_target_vertex(
@@ -2772,6 +3191,7 @@ impl<'a> ScopeLowerer<'a> {
                     Some(out_val),
                     true,
                 );
+                this.attach_may_throw(read_v, node, MayThrowReason::PropertyAccess);
                 this.add_edge(read_v, join, ExplicitEdgeKind::Fallthrough);
                 read_v
             });
@@ -2787,6 +3207,7 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        self.attach_may_throw(read_v, node, MayThrowReason::PropertyAccess);
         self.add_edge(read_v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, read_v, out_val);
         let (base_entry, base_val) = self.lower_expr_to(base, read_v);
@@ -2821,6 +3242,7 @@ impl<'a> ScopeLowerer<'a> {
                     Some(out_val),
                     true,
                 );
+                this.attach_may_throw(read_v, node, MayThrowReason::PropertyAccess);
                 this.add_edge(read_v, join, ExplicitEdgeKind::Fallthrough);
                 let (arg_entry, arg_val) = this.lower_expr_to(arg, read_v);
                 if let Some(vert) = this.vertices.get_mut(read_v.0 as usize)
@@ -2848,6 +3270,7 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        self.attach_may_throw(read_v, node, MayThrowReason::PropertyAccess);
         self.add_edge(read_v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, read_v, out_val);
         let (arg_entry, arg_val) = self.lower_expr_to(arg, read_v);
@@ -2894,6 +3317,7 @@ impl<'a> ScopeLowerer<'a> {
                         Some(out_val),
                         true,
                     );
+                    this.attach_may_throw(call_v, node, MayThrowReason::Call);
                     this.add_edge(call_v, join, ExplicitEdgeKind::Fallthrough);
                     let (args_entry, arg_vals) = this.lower_call_args(args_nodes, call_v);
                     if let Some(vert) = this.vertices.get_mut(call_v.0 as usize)
@@ -2917,6 +3341,7 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        self.attach_may_throw(call_v, node, MayThrowReason::Call);
         self.add_edge(call_v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, call_v, out_val);
         let (args_entry, arg_vals) = self.lower_call_args(args_nodes, call_v);
@@ -2948,6 +3373,7 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        self.attach_may_throw(new_v, node, MayThrowReason::Construct);
         self.add_edge(new_v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, new_v, out_val);
         let (args_entry, arg_vals) = self.lower_call_args(args_nodes, new_v);
@@ -2975,6 +3401,7 @@ impl<'a> ScopeLowerer<'a> {
             Some(out_val),
             true,
         );
+        self.attach_may_throw(call_v, node, MayThrowReason::Call);
         self.add_edge(call_v, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, call_v, out_val);
         let (tmpl_entry, tmpl_val) = self.lower_expr_to(tt.template(), call_v);
@@ -3298,6 +3725,7 @@ const fn empty_vertex(id: VertexId, op: IrOp) -> CfgVertex {
         op,
         explicit_edges: Vec::new(),
         may_throw_edge: None,
+        enclosing_finallies: Vec::new(),
     }
 }
 

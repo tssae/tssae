@@ -686,11 +686,32 @@ pub fn is_project_source_file(program: &Program, sf: P<SourceFile>) -> bool {
         && !program.is_source_from_project_reference(path)
 }
 
+fn safe_token_pos_of_node(node: P<Node>, sf: P<SourceFile>) -> u32 {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if n.pos().source_offset().is_some() {
+            return get_token_pos_of_node(n, sf, false);
+        }
+        cur = n.parent();
+    }
+    0
+}
+
 /// Computes the 1-based UTF-16 line/column and byte span for `node` within `sf`.
 #[must_use]
 pub fn node_location(sf: P<SourceFile>, rel_file: &str, node: P<Node>) -> DiagnosticLocation {
-    let start = get_token_pos_of_node(node, sf, false);
-    let end = node.end().source_offset().unwrap_or(start).max(start);
+    let mut anchor = node;
+    while anchor.pos().source_offset().is_none()
+        && let Some(parent) = anchor.parent()
+    {
+        anchor = parent;
+    }
+    let start = if anchor.pos().source_offset().is_some() {
+        get_token_pos_of_node(anchor, sf, false)
+    } else {
+        0
+    };
+    let end = anchor.end().source_offset().unwrap_or(start).max(start);
     span_location(sf, rel_file, start, end)
 }
 
@@ -1081,7 +1102,7 @@ fn collect_matching_nodes(
 
     if let Some(kind_label) = kind_label_opt {
         let matches_text = text_filter.is_empty() || {
-            let tok_start = get_token_pos_of_node(node, sf, false);
+            let tok_start = safe_token_pos_of_node(node, sf);
             let tok_end = full_end.max(tok_start);
             let s_idx = usize::try_from(tok_start).unwrap_or(0);
             let e_idx = usize::try_from(tok_end).unwrap_or(s_idx);
@@ -1221,7 +1242,7 @@ fn collect_ast_spans(
         | Kind::TemplateMiddle
         | Kind::TemplateTail
         | Kind::RegularExpressionLiteral => {
-            let start = get_token_pos_of_node(node, sf, false).min(text_len);
+            let start = safe_token_pos_of_node(node, sf).min(text_len);
             let end = node
                 .end()
                 .source_offset()
@@ -1237,7 +1258,7 @@ fn collect_ast_spans(
             return;
         }
         Kind::JsxText | Kind::JsxTextAllWhiteSpaces => {
-            let start = get_token_pos_of_node(node, sf, false).min(text_len);
+            let start = safe_token_pos_of_node(node, sf).min(text_len);
             let end = node
                 .end()
                 .source_offset()
@@ -1255,7 +1276,7 @@ fn collect_ast_spans(
             return;
         }
         Kind::JsxExpression if node.as_jsx_expression().expression.is_none() => {
-            let start = get_token_pos_of_node(node, sf, false).min(text_len);
+            let start = safe_token_pos_of_node(node, sf).min(text_len);
             let end = node
                 .end()
                 .source_offset()

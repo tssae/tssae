@@ -16,8 +16,8 @@ use tssae_analysis::ir::{
     MayThrowEdge, MayThrowReason, MemberVisibility, TypeGuardSemantics, UnaryOp,
 };
 use tssae_common::{
-    BranchId, DiagnosticLocation, FinallyId, FunctionIrId, GapItem, LocalBindingId, LocalSyntaxId,
-    SyntaxId, UnknownReason, ValueId, VertexId,
+    BranchId, DiagnosticLocation, FileId, FinallyId, FunctionIrId, GapItem, LocalBindingId,
+    LocalSyntaxId, SyntaxId, UnknownReason, ValueId, VertexId,
 };
 
 use crate::semantic_facade::SemanticModelBridge;
@@ -106,11 +106,6 @@ pub fn lower_scope_to_ir(
 ///
 /// # Errors
 /// Returns a [`GapItem`] if the scope node has no source file, has no body, or fails invariant checks.
-#[expect(
-    clippy::too_many_lines,
-    clippy::significant_drop_tightening,
-    reason = "Coordinates scope normalization, constructor field/super injection, and validation."
-)]
 pub fn lower_scope_to_ir_with_index(
     cwd: &str,
     program: &'static Program,
@@ -159,84 +154,18 @@ pub fn lower_scope_to_ir_with_index(
             Some(idx) => SemanticModelBridge::with_file_index(cwd, program, checker, idx),
             None => SemanticModelBridge::new(cwd, program, checker),
         };
-        let mut lowerer = ScopeLowerer::new(
+        lower_validated_scope_inner(
             sf,
             &rel_file,
-            &bridge,
+            Some(&bridge),
             scope_node,
+            normalized_fn,
+            is_static_block,
+            is_source_file,
             scope_location,
             local_scope,
             file_index,
-        );
-
-        if let Some(fn_node) = normalized_fn {
-            let body = fn_node.body().ok_or_else(|| {
-                GapItem::from_reason(
-                    UnknownReason::MissingFunctionBody,
-                    "Function declaration has no body to analyze.".to_string(),
-                    Some(lowerer.scope_location.clone()),
-                )
-            })?;
-
-            lowerer.type_guard = bridge.type_guard_for_function(fn_node);
-            lowerer.collect_parameters(fn_node);
-            lowerer.preregister_body_locals(body);
-            lowerer.captured_bindings = lowerer.collect_own_captured_bindings(fn_node);
-
-            let enclosing_class = if fn_node.kind() == Kind::Constructor {
-                fn_node
-                    .parent()
-                    .filter(|p| matches!(p.kind(), Kind::ClassDeclaration | Kind::ClassExpression))
-            } else {
-                None
-            };
-            let ctor_has_super =
-                enclosing_class.is_some_and(class_has_extends) && subtree_contains_super_call(body);
-            lowerer.active_ctor_class = if ctor_has_super {
-                enclosing_class
-            } else {
-                None
-            };
-
-            let mut body_entry = if body.kind() == Kind::Block {
-                lowerer.lower_stmt(body, lowerer.normal_exit)
-            } else {
-                let (expr_entry, _) = lowerer.lower_expr_to(body, lowerer.normal_exit);
-                expr_entry
-            };
-            lowerer.active_ctor_class = None;
-
-            if let Some(class_node) = enclosing_class
-                && !ctor_has_super
-            {
-                body_entry =
-                    lowerer.lower_class_instance_init(class_node, Some(fn_node), body_entry);
-            }
-
-            let start = lowerer.lower_function_parameters(fn_node, body_entry);
-            lowerer.add_edge(lowerer.entry, start, ExplicitEdgeKind::Fallthrough);
-        } else if is_static_block {
-            let block = scope_node.as_class_static_block_declaration().body();
-            lowerer.preregister_body_locals(block);
-            let entry_target = lowerer.lower_stmt(block, lowerer.normal_exit);
-            lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
-        } else if is_source_file {
-            lowerer.preregister_body_locals(sf.as_node());
-            let entry_target = lowerer.lower_sequence(sf.statements().nodes(), lowerer.normal_exit);
-            lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
-        } else {
-            // Inside a local statement/block scope (such as a loop body), unlabeled break/continue
-            // exit the local scope cleanly without requiring outer loop back-edges.
-            lowerer.preregister_body_locals(scope_node);
-            lowerer.cf_frames.push(CfFrame::LocalScopeFallback {
-                target: lowerer.normal_exit,
-            });
-            let entry_target = lowerer.lower_stmt(scope_node, lowerer.normal_exit);
-            lowerer.cf_frames.pop();
-            lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
-        }
-
-        lowerer.finish()
+        )?
     };
     if let Err(msg) = scope_ir.ir.validate_invariants() {
         return Err(GapItem::from_reason(
@@ -246,6 +175,101 @@ pub fn lower_scope_to_ir_with_index(
         ));
     }
     Ok(scope_ir)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Internal helper shared between full semantic lowering and syntax-indexed lowering."
+)]
+fn lower_validated_scope_inner(
+    sf: P<SourceFile>,
+    rel_file: &str,
+    bridge: Option<&SemanticModelBridge<'_>>,
+    scope_node: P<Node>,
+    normalized_fn: Option<P<Node>>,
+    is_static_block: bool,
+    is_source_file: bool,
+    scope_location: DiagnosticLocation,
+    local_scope: u32,
+    file_index: Option<&FileSyntaxIndex>,
+) -> Result<LoweredScope, GapItem> {
+    let mut lowerer = ScopeLowerer::new(
+        sf,
+        rel_file,
+        bridge,
+        scope_node,
+        scope_location,
+        local_scope,
+        file_index,
+    );
+
+    if let Some(fn_node) = normalized_fn {
+        let body = fn_node.body().ok_or_else(|| {
+            GapItem::from_reason(
+                UnknownReason::MissingFunctionBody,
+                "Function declaration has no body to analyze.".to_string(),
+                Some(lowerer.scope_location.clone()),
+            )
+        })?;
+
+        lowerer.type_guard = bridge.and_then(|b| b.type_guard_for_function(fn_node));
+        lowerer.collect_parameters(fn_node);
+        lowerer.preregister_body_locals(body);
+        lowerer.captured_bindings = lowerer.collect_own_captured_bindings(fn_node);
+
+        let enclosing_class = if fn_node.kind() == Kind::Constructor {
+            fn_node
+                .parent()
+                .filter(|p| matches!(p.kind(), Kind::ClassDeclaration | Kind::ClassExpression))
+        } else {
+            None
+        };
+        let ctor_has_super =
+            enclosing_class.is_some_and(class_has_extends) && subtree_contains_super_call(body);
+        lowerer.active_ctor_class = if ctor_has_super {
+            enclosing_class
+        } else {
+            None
+        };
+
+        let mut body_entry = if body.kind() == Kind::Block {
+            lowerer.lower_stmt(body, lowerer.normal_exit)
+        } else {
+            let (expr_entry, _) = lowerer.lower_expr_to(body, lowerer.normal_exit);
+            expr_entry
+        };
+        lowerer.active_ctor_class = None;
+
+        if let Some(class_node) = enclosing_class
+            && !ctor_has_super
+        {
+            body_entry = lowerer.lower_class_instance_init(class_node, Some(fn_node), body_entry);
+        }
+
+        let start = lowerer.lower_function_parameters(fn_node, body_entry);
+        lowerer.add_edge(lowerer.entry, start, ExplicitEdgeKind::Fallthrough);
+    } else if is_static_block {
+        let block = scope_node.as_class_static_block_declaration().body();
+        lowerer.preregister_body_locals(block);
+        let entry_target = lowerer.lower_stmt(block, lowerer.normal_exit);
+        lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
+    } else if is_source_file {
+        lowerer.preregister_body_locals(sf.as_node());
+        let entry_target = lowerer.lower_sequence(sf.statements().nodes(), lowerer.normal_exit);
+        lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
+    } else {
+        // Inside a local statement/block scope (such as a loop body), unlabeled break/continue
+        // exit the local scope cleanly without requiring outer loop back-edges.
+        lowerer.preregister_body_locals(scope_node);
+        lowerer.cf_frames.push(CfFrame::LocalScopeFallback {
+            target: lowerer.normal_exit,
+        });
+        let entry_target = lowerer.lower_stmt(scope_node, lowerer.normal_exit);
+        lowerer.cf_frames.pop();
+        lowerer.add_edge(lowerer.entry, entry_target, ExplicitEdgeKind::Fallthrough);
+    }
+
+    Ok(lowerer.finish())
 }
 
 /// Summarizes a `ClassDeclaration` or `ClassExpression` into [`ClassIr`], preserving field modifiers,
@@ -385,7 +409,7 @@ pub fn lower_class_static_init_to_ir(
         let mut lowerer = ScopeLowerer::new(
             sf,
             &rel_file,
-            &bridge,
+            Some(&bridge),
             class_node,
             scope_location,
             local_scope,
@@ -463,7 +487,7 @@ pub fn lower_class_default_constructor_to_ir(
         let mut lowerer = ScopeLowerer::new(
             sf,
             &rel_file,
-            &bridge,
+            Some(&bridge),
             class_node,
             scope_location,
             local_scope,
@@ -549,11 +573,12 @@ enum CfFrame {
     },
 }
 
-struct ScopeLowerer<'a> {
+struct ScopeLowerer<'a, 'b> {
     sf: P<SourceFile>,
     rel_file: &'a str,
-    bridge: &'a SemanticModelBridge<'a>,
+    bridge: Option<&'a SemanticModelBridge<'b>>,
     file_index: Option<&'a FileSyntaxIndex>,
+    next_fallback_local_id: u32,
     root_node: P<Node>,
     scope_kind: IrScopeKind,
     scope_location: DiagnosticLocation,
@@ -584,11 +609,11 @@ struct ScopeLowerer<'a> {
     next_value_id: u32,
 }
 
-impl<'a> ScopeLowerer<'a> {
+impl<'a, 'b> ScopeLowerer<'a, 'b> {
     fn new(
         sf: P<SourceFile>,
         rel_file: &'a str,
-        bridge: &'a SemanticModelBridge<'a>,
+        bridge: Option<&'a SemanticModelBridge<'b>>,
         root_node: P<Node>,
         scope_location: DiagnosticLocation,
         local_scope: u32,
@@ -616,12 +641,16 @@ impl<'a> ScopeLowerer<'a> {
 
         let scope_kind = classify_scope_kind(root_node);
         let decl_semantics = extract_decl_semantics(root_node);
+        let next_fallback_local_id = file_index
+            .and_then(|idx| u32::try_from(idx.local_to_node.len()).ok())
+            .unwrap_or(0);
 
         Self {
             sf,
             rel_file,
             bridge,
             file_index,
+            next_fallback_local_id,
             root_node,
             scope_kind,
             scope_location,
@@ -677,15 +706,7 @@ impl<'a> ScopeLowerer<'a> {
             }
         }
 
-        let root_syntax = self
-            .node_to_syntax
-            .get(&self.root_node)
-            .copied()
-            .unwrap_or_else(|| {
-                self.bridge
-                    .intern_syntax(self.root_node)
-                    .unwrap_or(SyntaxId(0))
-            });
+        let root_syntax = self.intern_node(self.root_node);
         let file = root_syntax.file_id();
         let ir = FunctionIr {
             id: FunctionIrId {
@@ -725,8 +746,13 @@ impl<'a> ScopeLowerer<'a> {
         let sid = self
             .file_index
             .and_then(|idx| idx.syntax_id_for_node(node))
-            .or_else(|| self.bridge.intern_syntax(node))
-            .unwrap_or(SyntaxId(0));
+            .or_else(|| self.bridge.and_then(|b| b.intern_syntax(node)))
+            .unwrap_or_else(|| {
+                let file_id = self.file_index.map_or(FileId(0), |idx| idx.file_id);
+                let local = LocalSyntaxId(self.next_fallback_local_id);
+                self.next_fallback_local_id = self.next_fallback_local_id.saturating_add(1);
+                SyntaxId::from_parts(file_id, local)
+            });
         self.node_to_syntax.insert(node, sid);
         self.syntax_to_node.insert(sid, node);
         sid
@@ -924,7 +950,10 @@ impl<'a> ScopeLowerer<'a> {
             return existing;
         }
         let sid = self.intern_node(decl_node);
-        let raw_symbol = self.bridge.symbol_for_node_raw(decl_node);
+        let raw_symbol = self
+            .bridge
+            .and_then(|b| b.symbol_for_node_raw(decl_node))
+            .or_else(|| decl_node.symbol());
         if let Some(sym) = raw_symbol
             && let Some(&existing) = self.binding_by_raw_symbol.get(&sym)
         {
@@ -950,7 +979,7 @@ impl<'a> ScopeLowerer<'a> {
     }
 
     fn resolve_binding(&self, ident_node: P<Node>) -> Option<LocalBindingId> {
-        if let Some(sym) = self.bridge.symbol_for_node_raw(ident_node)
+        if let Some(sym) = self.bridge.and_then(|b| b.symbol_for_node_raw(ident_node))
             && let Some(&id) = self.binding_by_raw_symbol.get(&sym)
         {
             return Some(id);
@@ -1077,28 +1106,36 @@ impl<'a> ScopeLowerer<'a> {
         None
     }
 
-    fn lower_sequence(&mut self, statements: &[P<Node>], next: VertexId) -> VertexId {
-        if statements.is_empty() {
+    fn lower_sequence(&mut self, statements: &[P<Node>], mut next: VertexId) -> VertexId {
+        if let Some(using_idx) = statements.iter().position(|&stmt| {
+            stmt.kind() == Kind::VariableStatement
+                && tsrs_ast::get_combined_node_flags(
+                    stmt.as_variable_statement().declaration_list(),
+                )
+                .intersects(NodeFlags::Using)
+        }) {
+            let using_stmt = statements[using_idx];
+            let decl_list = using_stmt.as_variable_statement().declaration_list();
+            let flags = tsrs_ast::get_combined_node_flags(decl_list);
+            let is_async = flags.contains(NodeFlags::AwaitUsing);
+            let decls = decl_list
+                .as_variable_declaration_list()
+                .declarations()
+                .nodes();
+            let using_entry =
+                self.lower_using_decls(decls, is_async, &statements[using_idx + 1..], next);
+            self.record_syntax_vertex(using_stmt, using_entry);
+            next = using_entry;
+            for &stmt in statements[..using_idx].iter().rev() {
+                next = self.lower_stmt(stmt, next);
+            }
             return next;
         }
-        let stmt = statements[0];
-        let rest = &statements[1..];
-        if stmt.kind() == Kind::VariableStatement {
-            let decl_list = stmt.as_variable_statement().declaration_list();
-            let flags = tsrs_ast::get_combined_node_flags(decl_list);
-            if flags.intersects(NodeFlags::Using) {
-                let is_async = flags.contains(NodeFlags::AwaitUsing);
-                let decls = decl_list
-                    .as_variable_declaration_list()
-                    .declarations()
-                    .nodes();
-                let entry = self.lower_using_decls(decls, is_async, rest, next);
-                self.record_syntax_vertex(stmt, entry);
-                return entry;
-            }
+
+        for &stmt in statements.iter().rev() {
+            next = self.lower_stmt(stmt, next);
         }
-        let rest_entry = self.lower_sequence(rest, next);
-        self.lower_stmt(stmt, rest_entry)
+        next
     }
 
     fn lower_using_decls(
@@ -2108,7 +2145,10 @@ impl<'a> ScopeLowerer<'a> {
                     );
                     self.attach_may_throw(rest_v, elem, MayThrowReason::PropertyAccess);
                     self.add_edge(rest_v, next_entry, ExplicitEdgeKind::Fallthrough);
-                    cont = rest_v;
+                    cont = be.initializer().map_or(rest_v, |err_init| {
+                        let (init_entry, _) = self.lower_expr_to(err_init, rest_v);
+                        init_entry
+                    });
                     continue;
                 }
 
@@ -2262,7 +2302,10 @@ impl<'a> ScopeLowerer<'a> {
                     );
                     self.attach_may_throw(rest_v, elem, MayThrowReason::IteratorStep);
                     self.add_edge(rest_v, target_entry, ExplicitEdgeKind::Fallthrough);
-                    cont = rest_v;
+                    cont = be.initializer().map_or(rest_v, |err_init| {
+                        let (init_entry, _) = self.lower_expr_to(err_init, rest_v);
+                        init_entry
+                    });
                 } else {
                     let raw_elem_val = self.alloc_value();
                     let after_next = if let Some(default_expr) = be.initializer() {
@@ -2707,9 +2750,54 @@ impl<'a> ScopeLowerer<'a> {
             *iterable = expr_val;
         }
 
+        let start_entry = self.lower_for_head_initializers(lhs, expr_entry);
         let here = self.new_vertex(Some(node), IrOp::NopMerge, None, false);
-        self.add_edge(here, expr_entry, ExplicitEdgeKind::Fallthrough);
+        self.add_edge(here, start_entry, ExplicitEdgeKind::Fallthrough);
         here
+    }
+
+    fn lower_for_head_initializers(&mut self, lhs: P<Node>, mut cont: VertexId) -> VertexId {
+        if lhs.kind() != Kind::VariableDeclarationList {
+            return cont;
+        }
+        let decls = lhs.as_variable_declaration_list().declarations().nodes();
+        for &decl in decls.iter().rev() {
+            let Some(head_init) = decl.as_variable_declaration().initializer() else {
+                continue;
+            };
+            if let Some(nn) = decl.name()
+                && nn.kind() == Kind::Identifier
+            {
+                let mutability = classify_decl_mutability(decl);
+                let name = node_text(nn).unwrap_or_default();
+                let binding = self.register_binding(&name, mutability, decl);
+                let dummy = ValueId(0);
+                let assign_v = self.new_vertex(
+                    Some(decl),
+                    IrOp::AssignLocal {
+                        target: binding,
+                        op: AssignOp::Assign,
+                        value: dummy,
+                        is_init: true,
+                    },
+                    Some(dummy),
+                    true,
+                );
+                self.add_edge(assign_v, cont, ExplicitEdgeKind::Fallthrough);
+                let (ie, iv) = self.lower_expr_to(head_init, assign_v);
+                if let Some(v) = self.vertices.get_mut(assign_v.0 as usize)
+                    && let IrOp::AssignLocal { value, .. } = &mut v.op
+                {
+                    *value = iv;
+                    v.value = Some(iv);
+                }
+                cont = ie;
+            } else {
+                let (ie, _) = self.lower_expr_to(head_init, cont);
+                cont = ie;
+            }
+        }
+        cont
     }
 
     fn emit_loop_branch_gates(
@@ -3327,7 +3415,7 @@ impl<'a> ScopeLowerer<'a> {
         reason = "Exhaustive 353-variant tsrs_ast::Kind expression dispatcher."
     )]
     fn lower_expr_to(&mut self, node: P<Node>, next: VertexId) -> (VertexId, ValueId) {
-        if is_type_node(node) {
+        if is_non_runtime_type_node(node) {
             let val = self.alloc_value();
             let v = self.new_vertex(
                 Some(node),
@@ -4318,7 +4406,7 @@ impl<'a> ScopeLowerer<'a> {
 
             let setter_kind = self
                 .bridge
-                .has_set_accessor(target)
+                .is_some_and(|b| b.has_set_accessor(target))
                 .then_some(ImplicitAccessorKind::Setter);
             let write_v = self.new_vertex(
                 Some(node),
@@ -4349,7 +4437,7 @@ impl<'a> ScopeLowerer<'a> {
 
             let getter_kind = self
                 .bridge
-                .has_get_accessor(target)
+                .is_some_and(|b| b.has_get_accessor(target))
                 .then_some(ImplicitAccessorKind::Getter);
             let read_val = self.alloc_value();
             let read_v = self.new_vertex(
@@ -5005,7 +5093,7 @@ impl<'a> ScopeLowerer<'a> {
             let is_super = base.kind() == Kind::SuperKeyword;
             let implicit_call_kind = self
                 .bridge
-                .has_set_accessor(left)
+                .is_some_and(|b| b.has_set_accessor(left))
                 .then_some(ImplicitAccessorKind::Setter);
             let setter_call_v = if implicit_call_kind == Some(ImplicitAccessorKind::Setter) {
                 let cv = self.new_vertex(
@@ -5224,7 +5312,7 @@ impl<'a> ScopeLowerer<'a> {
         let out_val = self.alloc_value();
         let implicit_call_kind = self
             .bridge
-            .has_get_accessor(node)
+            .is_some_and(|b| b.has_get_accessor(node))
             .then_some(ImplicitAccessorKind::Getter);
 
         let build_read = |this: &mut Self, after_read: VertexId| -> (VertexId, VertexId, ValueId) {
@@ -5427,9 +5515,11 @@ impl<'a> ScopeLowerer<'a> {
         };
 
         let call_after = if call_kind == IrCallKind::SuperCall
-            && let Some(class_node) = self.active_ctor_class
+            && let Some(class_node) = self.active_ctor_class.take()
         {
-            self.lower_class_instance_init(class_node, Some(self.root_node), next)
+            let init_entry = self.lower_class_instance_init(class_node, Some(self.root_node), next);
+            self.active_ctor_class = Some(class_node);
+            init_entry
         } else {
             next
         };
@@ -5774,7 +5864,11 @@ impl<'a> ScopeLowerer<'a> {
             } else if prop_kind == Kind::ShorthandPropertyAssignment {
                 let sp = prop.as_shorthand_property_assignment();
                 let name_node = sp.name();
-                let (entry, val_id) = self.lower_expr_to(name_node, cont);
+                let after_name = sp.object_assignment_initializer().map_or(cont, |err_init| {
+                    let (init_entry, _) = self.lower_expr_to(err_init, cont);
+                    init_entry
+                });
+                let (entry, val_id) = self.lower_expr_to(name_node, after_name);
                 cont = entry;
                 self.record_syntax_vertex(prop, cont);
                 lowered_props.push(IrObjectProp::KeyValue {
@@ -6108,6 +6202,9 @@ impl<'a> ScopeLowerer<'a> {
         self.bind_expr_maps(node, v, out_val);
         self.record_syntax_vertex(opening, v);
         self.record_syntax_vertex(closing, v);
+        if closing.kind() == Kind::JsxClosingElement {
+            self.bind_jsx_closing_tag_maps(closing.as_jsx_closing_element().tag_name(), v, out_val);
+        }
 
         let (children_entry, child_vals) = self.lower_jsx_children(jsx.children().nodes(), v);
         let (props_entry, props, tag_name, tag_expr) =
@@ -6126,6 +6223,22 @@ impl<'a> ScopeLowerer<'a> {
             *cs = child_vals;
         }
         (props_entry, out_val)
+    }
+
+    fn bind_jsx_closing_tag_maps(&mut self, tag_node: P<Node>, vid: VertexId, val: ValueId) {
+        let tk = tag_node.kind();
+        if tk == Kind::PropertyAccessExpression {
+            self.bind_expr_maps(tag_node, vid, val);
+            let base = tag_node.as_property_access_expression().expression();
+            self.bind_jsx_closing_tag_maps(base, vid, val);
+        } else if matches!(
+            tk,
+            Kind::ThisKeyword | Kind::SuperKeyword | Kind::Identifier
+        ) {
+            self.bind_expr_maps(tag_node, vid, val);
+        } else {
+            self.record_syntax_vertex(tag_node, vid);
+        }
     }
 
     fn lower_jsx_self_closing(&mut self, node: P<Node>, next: VertexId) -> (VertexId, ValueId) {
@@ -6274,12 +6387,12 @@ impl<'a> ScopeLowerer<'a> {
         closure_root: P<Node>,
         out: &mut FxHashMap<LocalBindingId, CapturedBinding>,
     ) {
-        if is_type_node(node) {
+        if is_non_runtime_type_node(node) {
             return;
         }
         if node.kind() == Kind::Identifier
             && is_value_ident_usage(node)
-            && let Some(sym) = self.bridge.symbol_for_node_raw(node)
+            && let Some(sym) = self.bridge.and_then(|b| b.symbol_for_node_raw(node))
             && let Some(&outer_id) = self.binding_by_raw_symbol.get(&sym)
         {
             let is_write = is_ident_write_site(node);
@@ -6330,12 +6443,12 @@ impl<'a> ScopeLowerer<'a> {
         fn_end: u32,
         out: &mut FxHashMap<P<Node>, CapturedBinding>,
     ) {
-        if is_type_node(node) {
+        if is_non_runtime_type_node(node) {
             return;
         }
         if node.kind() == Kind::Identifier
             && is_value_ident_usage(node)
-            && let Some(sym) = self.bridge.symbol_for_node_raw(node)
+            && let Some(sym) = self.bridge.and_then(|b| b.symbol_for_node_raw(node))
             && let Some(decl) = sym
                 .value_declaration()
                 .or_else(|| sym.declarations().first().copied())
@@ -6420,7 +6533,7 @@ impl<'a> ScopeLowerer<'a> {
         for &child in children.iter().rev() {
             if is_function_like_declaration(Some(child))
                 || matches!(child.kind(), Kind::ClassDeclaration | Kind::ClassExpression)
-                || is_type_node(child)
+                || is_non_runtime_type_node(child)
             {
                 continue;
             }
@@ -6457,6 +6570,10 @@ impl<'a> ScopeLowerer<'a> {
         }
         (cont, out_val)
     }
+}
+
+fn is_non_runtime_type_node(node: P<Node>) -> bool {
+    node.kind() != Kind::ExpressionWithTypeArguments && is_type_node(node)
 }
 
 const fn empty_vertex(id: VertexId, op: IrOp) -> CfgVertex {

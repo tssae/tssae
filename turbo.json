@@ -22,6 +22,11 @@
     "//#fix": {
       "tags": ["work:repair"]
     },
+    "//#perf": {
+      "dependsOn": ["@tssae/acceptance#perf"],
+      "cache": false,
+      "tags": ["work:on-demand"]
+    },
     "//#format:check": {
       "outputs": [],
       "tags": ["quality:light"]

@@ -33,6 +33,52 @@
       "cache": false,
       "tags": ["work:repair"]
     },
+    "perf": {
+      "dependsOn": ["build", "^build", "//#toolchain:prepare"],
+      "passThroughEnv": [
+        "INIT_CWD",
+        "TSSAE_PERF_CWD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "XDG_CACHE_HOME",
+        "CARGO_NET_OFFLINE",
+        "TSSAE_ACCEPTANCE_PACK_DIR",
+        "TSSAE_PERF_CACHE_DIR",
+        "TSSAE_CORPUS_CACHE_DIR",
+        "TSSAE_CORPUS_HOST_MIRROR_DIR"
+      ],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:on-demand"]
+    },
+    "perf:gate": {
+      "dependsOn": ["build", "^build", "//#toolchain:prepare", "test:e2e"],
+      "passThroughEnv": [
+        "INIT_CWD",
+        "TSSAE_PERF_CWD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "XDG_CACHE_HOME",
+        "CARGO_NET_OFFLINE",
+        "TSSAE_ACCEPTANCE_PACK_DIR",
+        "TSSAE_PERF_CACHE_DIR",
+        "TSSAE_CORPUS_CACHE_DIR",
+        "TSSAE_CORPUS_HOST_MIRROR_DIR"
+      ],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "cache": false,
+      "tags": ["quality:heavy"]
+    },
     "test": {
       "dependsOn": ["@tssae/test-hosts#build", "^typecheck"],
       "inputs": ["$TURBO_DEFAULT$"],

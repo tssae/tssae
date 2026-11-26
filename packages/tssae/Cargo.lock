@@ -968,6 +968,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tssae-analysis"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "tssae-common",
+]
+
+[[package]]
+name = "tssae-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tssae-engine"
 version = "0.1.0"
 dependencies = [
@@ -987,6 +1004,24 @@ dependencies = [
  "tsrs_scanner",
  "tsrs_vfs",
  "tssae-adapter-api",
+ "tssae-common",
+ "tssae-tsrs-boundary",
+]
+
+[[package]]
+name = "tssae-tsrs-boundary"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tsrs_ast",
+ "tsrs_checker",
+ "tsrs_compiler",
+ "tsrs_core",
+ "tsrs_scanner",
+ "tssae-analysis",
+ "tssae-common",
 ]
 
 [[package]]

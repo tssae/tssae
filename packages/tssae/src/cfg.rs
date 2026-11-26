@@ -1,60 +1,11 @@
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
 use tsrs_ast::{Kind, Node, SourceFile, is_function_like_declaration, is_type_node};
 use tsrs_core::P;
 
 use crate::serve::{SourceLocation, node_location, slice_source_text};
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GapItem {
-    pub kind: &'static str,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub at: Option<SourceLocation>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvidenceItem {
-    pub kind: &'static str,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub at: Option<SourceLocation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<String>,
-}
-
-impl EvidenceItem {
-    pub const fn simple(kind: &'static str, message: String, at: Option<SourceLocation>) -> Self {
-        Self {
-            kind,
-            message,
-            at,
-            model_id: None,
-            declaration: None,
-        }
-    }
-
-    pub const fn model(
-        message: String,
-        at: Option<SourceLocation>,
-        model_id: String,
-        declaration: String,
-    ) -> Self {
-        Self {
-            kind: "model",
-            message,
-            at,
-            model_id: Some(model_id),
-            declaration: Some(declaration),
-        }
-    }
-}
+pub use tssae_common::{EvidenceItem, GapItem};
 
 #[derive(Clone)]
 pub struct BranchDescriptor {

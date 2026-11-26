@@ -78,6 +78,11 @@ export type ValuePropagationStepKind =
   | "propertyRead"
   | "destructure"
   | "restDestructure"
+  | "arrayElement"
+  | "spread"
+  | "forOfElement"
+  | "closureCapture"
+  | "summaryFlow"
   | "conditionalBranch"
   | "alias";
 
@@ -102,11 +107,26 @@ export type ValuePropagationPath = {
 export type ValuePropagationTargetResult = {
   readonly from: ValueEndpoint;
   readonly to: ValueEndpoint;
-  readonly reachable: boolean;
-  readonly paths: readonly ValuePropagationPath[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly status: "proved";
+      readonly paths: readonly [
+        ValuePropagationPath,
+        ...ValuePropagationPath[],
+      ];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly partialPaths?: readonly ValuePropagationPath[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 export type ValuePropagationOptions = {
   readonly propagation?: ValuePropagationMode;
@@ -165,7 +185,6 @@ export type ValuePropagationResult = {
   readonly propagation: ValuePropagationMode;
   readonly results: readonly ValuePropagationTargetResult[];
   readonly reachableTargets: readonly ValueEndpoint[];
-  readonly gaps: readonly Gap[];
 };
 
 export type CallTargetsResult = {
@@ -254,16 +273,27 @@ type RawValuePropagationPath = {
 type RawValuePropagationTargetRow = {
   readonly from: string;
   readonly to: string;
-  readonly reachable: boolean;
-  readonly paths: readonly RawValuePropagationPath[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly status: "proved";
+      readonly paths: readonly RawValuePropagationPath[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly partialPaths?: readonly RawValuePropagationPath[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 type RawValuePropagationResult = {
   readonly propagation: ValuePropagationMode;
   readonly results: readonly RawValuePropagationTargetRow[];
-  readonly gaps: readonly Gap[];
 };
 
 type EngineBatchResult = {
@@ -711,7 +741,6 @@ export function createCallsValuesQueries(deps: {
           propagation,
           results: [],
           reachableTargets: [],
-          gaps: [],
         };
       }
 
@@ -766,36 +795,74 @@ export function createCallsValuesQueries(deps: {
             if (!raw) {
               throw new Error("Engine omitted valuePropagation result.");
             }
+            const mapPaths = (
+              rawPaths: readonly RawValuePropagationPath[],
+              fromRef: ValueEndpoint,
+              toRef: ValueEndpoint,
+            ): readonly ValuePropagationPath[] =>
+              rawPaths.map((p) =>
+                registerProvenance(
+                  {
+                    from: endpointByHandle.get(p.from) ?? fromRef,
+                    to: endpointByHandle.get(p.to) ?? toRef,
+                    steps: p.steps,
+                    evidence: p.evidence,
+                    sourcePath: p.sourcePath,
+                    omittedProperties: p.omittedProperties,
+                  },
+                  p.evidence,
+                ),
+              );
+
             const results: ValuePropagationTargetResult[] = raw.results.map(
               (row) => {
                 const fromRef = endpointByHandle.get(row.from)!;
                 const toRef = endpointByHandle.get(row.to)!;
+                if (row.status === "proved") {
+                  const mappedPaths = mapPaths(row.paths, fromRef, toRef);
+                  const [firstPath, ...restPaths] = mappedPaths;
+                  if (!firstPath) {
+                    throw new Error(
+                      "Engine returned proved valuePropagation result with no paths.",
+                    );
+                  }
+                  const targetResult: ValuePropagationTargetResult = {
+                    from: fromRef,
+                    to: toRef,
+                    status: "proved",
+                    paths: [firstPath, ...restPaths],
+                    evidence: row.evidence,
+                  };
+                  return registerProvenance(targetResult, row.evidence);
+                }
+                if (row.status === "disproved") {
+                  const targetResult: ValuePropagationTargetResult = {
+                    from: fromRef,
+                    to: toRef,
+                    status: "disproved",
+                    evidence: row.evidence,
+                  };
+                  return registerProvenance(targetResult, row.evidence);
+                }
+                const partialPaths = row.partialPaths
+                  ? mapPaths(row.partialPaths, fromRef, toRef)
+                  : undefined;
                 const targetResult: ValuePropagationTargetResult = {
                   from: fromRef,
                   to: toRef,
-                  reachable: row.reachable,
-                  paths: row.paths.map((p) =>
-                    registerProvenance(
-                      {
-                        from: endpointByHandle.get(p.from) ?? fromRef,
-                        to: endpointByHandle.get(p.to) ?? toRef,
-                        steps: p.steps,
-                        evidence: p.evidence,
-                        sourcePath: p.sourcePath,
-                        omittedProperties: p.omittedProperties,
-                      },
-                      p.evidence,
-                    ),
-                  ),
-                  evidence: row.evidence,
+                  status: "inconclusive",
+                  ...(partialPaths !== undefined && partialPaths.length > 0
+                    ? { partialPaths }
+                    : {}),
                   gaps: row.gaps,
+                  evidence: row.evidence,
                 };
                 return registerProvenance(targetResult, row.evidence);
               },
             );
             const reachableSet = new Set<ValueEndpoint>();
             for (const row of results) {
-              if (row.reachable) {
+              if (row.status === "proved") {
                 reachableSet.add(row.to);
               }
             }
@@ -803,14 +870,17 @@ export function createCallsValuesQueries(deps: {
               propagation: raw.propagation,
               results,
               reachableTargets: [...reachableSet],
-              gaps: raw.gaps,
             };
           });
         cache.valueCache.set(cacheKey, promise);
       }
 
       const result = await promise;
-      recordGaps(result.gaps);
+      for (const row of result.results) {
+        if (row.status === "inconclusive") {
+          recordGaps(row.gaps);
+        }
+      }
       if (onQueryCompleted) {
         onQueryCompleted(
           "valuePropagation",

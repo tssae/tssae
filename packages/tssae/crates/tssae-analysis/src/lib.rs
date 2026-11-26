@@ -8,6 +8,7 @@ pub mod call_resolution;
 pub mod class_overrides;
 pub mod ir;
 pub mod summaries;
+pub mod value_propagation;
 pub mod var_writes;
 
 pub use ir::IrProvider;

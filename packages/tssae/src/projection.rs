@@ -23,12 +23,12 @@ use crate::call_effects::{
     CallEffectsRow, EffectsModelInput, InstanceCleanupScopeRow, run_call_effects,
     run_instance_cleanup,
 };
-use crate::calls_values::{ValuePropagationResultPayload, run_value_propagation};
 use crate::instance_identity::{
     InstanceModelInput, InstanceProjectionRow, InstanceResolutionRow, InstanceSelect,
     run_project_instances, run_resolve_instances,
 };
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
+use crate::ir_values::{ValuePropagationResultPayload, run_value_propagation};
 use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
 use crate::package_impl::{ImplementationResolutionRow, run_resolve_implementations};
@@ -1111,6 +1111,7 @@ fn execute_value_propagation_step(
         from,
         to,
         lookup_files,
+        observer,
     )?;
     observer.record_step(
         "valuePropagation",

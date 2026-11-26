@@ -234,7 +234,16 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
               ) {
                 void firstCallee.gaps.length;
               }
-              void prop.results[0]?.reachable;
+              const firstProp = prop.results[0];
+              if (firstProp !== undefined) {
+                if (firstProp.status === "proved") {
+                  void firstProp.paths[0].steps.length;
+                } else if (firstProp.status === "inconclusive") {
+                  void firstProp.gaps.length;
+                } else {
+                  void firstProp.evidence.length;
+                }
+              }
             }
           }
         }

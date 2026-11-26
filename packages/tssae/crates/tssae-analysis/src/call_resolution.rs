@@ -503,7 +503,7 @@ fn collect_arg_syntaxes(
     out
 }
 
-fn value_syntax_in_ir(
+pub(crate) fn value_syntax_in_ir(
     ir: &FunctionIr,
     val: ValueId,
     syntax: &dyn SyntaxCatalog,
@@ -581,6 +581,16 @@ fn resolve_implicit_getter_call(
             );
             return;
         }
+        if let Some(local_prop) = resolve_local_object_property(ir, recv, member_name, &[])
+            && !local_prop.values.is_empty()
+        {
+            for (prop_ir, prop_val, _) in local_prop.values {
+                trace_callable_value(&prop_ir, prop_val, &[], 0, None, 0, collector);
+            }
+            if local_prop.is_exhaustive && !collector.targets.is_empty() {
+                return;
+            }
+        }
         resolve_member_call(
             ir,
             recv,
@@ -592,6 +602,27 @@ fn resolve_implicit_getter_call(
             0,
             collector,
         );
+        if collector.targets.is_empty()
+            && let Some(decl) = collector
+                .semantic
+                .resolve_declaration(collector.call_syntax)
+        {
+            let before_complete = collector.is_complete;
+            collector.gaps.clear();
+            collector.seen_gaps.clear();
+            collector.is_complete = true;
+            emit_resolved_declaration(
+                &decl,
+                Some(collector.call_syntax),
+                false,
+                None,
+                0,
+                collector,
+            );
+            if collector.targets.is_empty() {
+                collector.is_complete = before_complete;
+            }
+        }
     }
 }
 
@@ -3771,7 +3802,7 @@ pub fn find_callers_on_ir<S: BuildHasher>(
     }
 }
 
-fn prop_key_static_name(key: &IrPropKey) -> Option<&str> {
+pub(crate) fn prop_key_static_name(key: &IrPropKey) -> Option<&str> {
     match key {
         IrPropKey::Named(name) | IrPropKey::PrivateIdent(name) => Some(name.as_str()),
         IrPropKey::Computed { static_name, .. } => static_name.as_deref(),
@@ -4064,6 +4095,7 @@ mod tests {
                 name: "f".to_string(),
                 syntax: param_syn,
                 binding: Some(b0),
+                raw_value: None,
                 is_rest: false,
                 has_default: false,
             }],
@@ -4249,6 +4281,7 @@ mod tests {
                 name: "b".to_string(),
                 syntax: recv_syn,
                 binding: Some(b0),
+                raw_value: None,
                 is_rest: false,
                 has_default: false,
             }],

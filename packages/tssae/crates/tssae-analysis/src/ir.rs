@@ -138,6 +138,7 @@ pub struct ClassIr {
 pub struct IrParameter {
     pub name: String,
     pub binding: Option<LocalBindingId>,
+    pub raw_value: Option<ValueId>,
     pub syntax: SyntaxId,
     pub has_default: bool,
     pub is_rest: bool,

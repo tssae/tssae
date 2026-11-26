@@ -765,8 +765,9 @@ try {
     from: getUserBriefSyn.ref,
     to: [briefParseResolved.arguments[0]],
   });
-  const propPath = propResult.results[0]?.paths[0];
-  assert.ok(propResult.results[0]?.reachable && propPath);
+  const propRow = propResult.results[0];
+  assert.ok(propRow?.status === "proved");
+  const propPath = propRow.paths[0];
   const retained = resolveRetainedObjectFields(
     { fields: briefProj.value.projectedColumns },
     propPath,

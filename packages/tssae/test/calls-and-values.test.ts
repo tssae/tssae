@@ -290,21 +290,34 @@ void describe("tssae call graph and value propagation", () => {
             ],
           });
 
-          deliveredReachable = propRes.results[0]!.reachable;
-          deliveredEvidenceFiles = propRes.results[0]!.evidence.map(
-            (e) => e.at?.file,
-          ).filter((f): f is string => f !== undefined);
+          const deliveredRow = propRes.results[0]!;
+          deliveredReachable = deliveredRow.status === "proved";
+          deliveredEvidenceFiles = deliveredRow.evidence
+            .map((e) => e.at?.file)
+            .filter((f): f is string => f !== undefined);
           deliveredStepKinds =
-            propRes.results[0]!.paths[0]?.steps.map((s) => s.kind) ?? [];
-          extractedReachable = propRes.results[1]!.reachable;
-          withoutSecretReachable = propRes.results[2]!.reachable;
-          extraReachable = propRes.results[3]!.reachable;
-          isolatedAReachable = propRes.results[4]!.reachable;
-          isolatedBReachable = propRes.results[5]!.reachable;
-          templatedReachable = propRes.results[6]!.reachable;
-          overwrittenReachable = propRes.results[7]!.reachable;
-          mixedReachable = propRes.results[8]!.reachable;
-          mixedGapKinds = propRes.results[8]!.gaps.map((g) => g.kind);
+            deliveredRow.status === "proved"
+              ? (deliveredRow.paths[0]?.steps.map((s) => s.kind) ?? [])
+              : [];
+          extractedReachable = propRes.results[1]!.status === "proved";
+          withoutSecretReachable = propRes.results[2]!.status === "proved";
+          extraReachable = propRes.results[3]!.status === "proved";
+          isolatedAReachable = propRes.results[4]!.status === "proved";
+          isolatedBReachable = propRes.results[5]!.status === "proved";
+          templatedReachable = propRes.results[6]!.status === "proved";
+          overwrittenReachable = propRes.results[7]!.status === "proved";
+          const mixedRow = propRes.results[8]!;
+          mixedReachable = mixedRow.status === "proved";
+          mixedGapKinds =
+            mixedRow.status === "inconclusive"
+              ? mixedRow.gaps.map((g) => g.kind)
+              : [];
+
+          assert.equal(propRes.results[2]!.status, "disproved");
+          assert.equal(propRes.results[3]!.status, "disproved");
+          assert.equal(propRes.results[5]!.status, "disproved");
+          assert.equal(propRes.results[6]!.status, "disproved");
+          assert.equal(propRes.results[7]!.status, "disproved");
 
           // Rest destructuring on opaque object: opaque -> restRow
           const opaqueOrigin = varInitOf("opaque");
@@ -314,7 +327,7 @@ void describe("tssae call graph and value propagation", () => {
             from: opaqueOrigin,
             to: [restRowIdent],
           });
-          restRowReachable = opaqueProp.results[0]!.reachable;
+          restRowReachable = opaqueProp.results[0]!.status === "proved";
         } finally {
           await session.close();
         }
@@ -343,7 +356,7 @@ void describe("tssae call graph and value propagation", () => {
         assert.equal(overwrittenReachable, false);
         assert.equal(restRowReachable, true);
         assert.equal(mixedReachable, true);
-        assert.ok(mixedGapKinds.includes("dynamic-callee"));
+        assert.deepEqual(mixedGapKinds, []);
       },
     );
   });
@@ -422,12 +435,18 @@ void describe("tssae call graph and value propagation", () => {
             to: [relayedRes!.declaration!, boxedRes!.declaration!],
           });
 
-          relayedReachable = prop.results[0]!.reachable;
-          relayedFiles = prop.results[0]!.evidence.map(
-            (e) => e.at?.file,
-          ).filter((f): f is string => f !== undefined);
-          boxedReachable = prop.results[1]!.reachable;
-          boxedGapKinds = prop.results[1]!.gaps.map((g) => g.kind);
+          const relayedRow = prop.results[0]!;
+          const boxedRow = prop.results[1]!;
+          relayedReachable = relayedRow.status === "proved";
+          relayedFiles = relayedRow.evidence
+            .map((e) => e.at?.file)
+            .filter((f): f is string => f !== undefined);
+          boxedReachable = boxedRow.status === "proved";
+          assert.equal(boxedRow.status, "inconclusive");
+          boxedGapKinds =
+            boxedRow.status === "inconclusive"
+              ? boxedRow.gaps.map((g) => g.kind)
+              : [];
         } finally {
           await session.close();
         }
@@ -442,7 +461,7 @@ void describe("tssae call graph and value propagation", () => {
           `Expected workspace file in evidence, got ${relayedFiles.join(", ")}`,
         );
         assert.equal(boxedReachable, false);
-        assert.ok(boxedGapKinds.includes("missing-function-body"));
+        assert.ok(boxedGapKinds.includes("missing-behavior-summary"));
       },
     );
   });
@@ -503,7 +522,7 @@ void describe("tssae call graph and value propagation", () => {
             targetDecl,
             callRef: resolvedCall.call,
             originInit,
-            reachable: prop.results[0]?.reachable ?? false,
+            reachable: prop.results[0]?.status === "proved",
           };
         };
 
@@ -612,7 +631,7 @@ void describe("tssae call graph and value propagation", () => {
                 from: secretInit,
                 to: [safeRes!.declaration!],
               });
-              reachable = prop.results[0]?.reachable ?? false;
+              reachable = prop.results[0]?.status === "proved";
             }
             return { reachable, gaps };
           } finally {
@@ -958,19 +977,29 @@ void describe("tssae call graph and value propagation", () => {
             lookupFiles: [],
           });
           propagation.scoped = scopedPropagation.results.map(
-            (row) => row.reachable,
+            (row) => row.status === "proved",
           );
           propagation.full = fullPropagation.results.map(
-            (row) => row.reachable,
+            (row) => row.status === "proved",
           );
           propagation.empty = emptyPropagation.results.map(
-            (row) => row.reachable,
+            (row) => row.status === "proved",
           );
-          propagationGaps.scoped = scopedPropagation.gaps.map(
-            (gap) => gap.kind,
+          propagationGaps.scoped = scopedPropagation.results.flatMap((row) =>
+            row.status === "inconclusive"
+              ? row.gaps.map((gap) => gap.kind)
+              : [],
           );
-          propagationGaps.full = fullPropagation.gaps.map((gap) => gap.kind);
-          propagationGaps.empty = emptyPropagation.gaps.map((gap) => gap.kind);
+          propagationGaps.full = fullPropagation.results.flatMap((row) =>
+            row.status === "inconclusive"
+              ? row.gaps.map((gap) => gap.kind)
+              : [],
+          );
+          propagationGaps.empty = emptyPropagation.results.flatMap((row) =>
+            row.status === "inconclusive"
+              ? row.gaps.map((gap) => gap.kind)
+              : [],
+          );
         } finally {
           await session.close();
         }

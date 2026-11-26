@@ -105,17 +105,17 @@ pub enum CallTargetsRow {
     },
 }
 
-struct SnapshotIrEnv<'a> {
-    semantic: SemanticModelBridge<'a>,
+pub struct SnapshotIrEnv<'a> {
+    pub semantic: SemanticModelBridge<'a>,
     ir_cache: &'a tssae_analysis::ir::SnapshotIrCache,
     sf_by_file_id: FxHashMap<FileId, P<SourceFile>>,
     rel_paths_by_file_id: FxHashMap<FileId, String>,
-    project_files: Vec<FileId>,
-    summary_stats: Cell<SummaryLookupStats>,
+    pub project_files: Vec<FileId>,
+    pub summary_stats: Cell<SummaryLookupStats>,
 }
 
 impl<'a> SnapshotIrEnv<'a> {
-    fn from_snapshot(
+    pub fn from_snapshot(
         snapshot: &'a mut SnapshotState,
         program: &'static Program,
         workspace_programs: &'a [&'static Program],

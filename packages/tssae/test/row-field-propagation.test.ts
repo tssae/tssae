@@ -91,16 +91,16 @@ void describe("tssae structured member & rest-destructuring propagation", () => 
 
           for (const [idx, entry] of tagAndArg.entries()) {
             const res = withMembers.results[idx]!;
-            const path = res.paths[0];
+            const path = res.status === "proved" ? res.paths[0] : undefined;
             observedByTag.set(
               entry.tag,
               path
-                ? { reachable: res.reachable, path }
-                : { reachable: res.reachable },
+                ? { reachable: res.status === "proved", path }
+                : { reachable: res.status === "proved" },
             );
             defaultModeReachable.set(
               entry.tag,
-              defaultOnly.results[idx]!.reachable,
+              defaultOnly.results[idx]!.status === "proved",
             );
           }
 

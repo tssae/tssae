@@ -894,6 +894,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             self.parameters.push(IrParameter {
                 name,
                 binding,
+                raw_value: None,
                 syntax: sid,
                 has_default: param_data.initializer().is_some(),
                 is_rest: param_data.dot_dot_dot_token().is_some(),
@@ -2409,7 +2410,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
     }
 
     fn lower_function_parameters(&mut self, fn_node: P<Node>, mut cont: VertexId) -> VertexId {
-        for &param in fn_node.parameters().iter().rev() {
+        for (param_idx, &param) in fn_node.parameters().iter().enumerate().rev() {
             let param_data = param.as_parameter_declaration();
             let name_node = param.name();
             let init_opt = param_data.initializer();
@@ -2426,6 +2427,9 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             }
 
             let raw_param_val = self.alloc_value();
+            if let Some(ir_param) = self.parameters.get_mut(param_idx) {
+                ir_param.raw_value = Some(raw_param_val);
+            }
             if let Some(init) = init_opt {
                 if is_pattern && let Some(nn) = name_node {
                     let placeholder = self.alloc_value();

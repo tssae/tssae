@@ -54,11 +54,17 @@ import type {
   SyntaxLookupSelection,
   TypeProjectionSelection,
 } from "./projection.ts";
+import type {
+  SummaryConflictDetails,
+  SummaryDiscoverySource,
+  SummaryOptions,
+} from "./summaries.ts";
 
 export type TssaeErrorCode =
   | "INVALID_CONFIG"
   | "PROJECT_LOAD_ERROR"
   | "FACT_CONFLICT"
+  | "SUMMARY_CONFLICT"
   | "STALE_REFERENCE"
   | "CROSS_PROJECT_REFERENCE"
   | "STALE_SNAPSHOT"
@@ -91,17 +97,24 @@ export type FactConflictDetails = {
 export class TssaeError extends Error {
   readonly code: TssaeErrorCode;
   readonly conflict?: FactConflictDetails;
+  readonly summaryConflict?: SummaryConflictDetails;
 
   constructor(
     code: TssaeErrorCode,
     message: string,
-    options?: ErrorOptions & { readonly conflict?: FactConflictDetails },
+    options?: ErrorOptions & {
+      readonly conflict?: FactConflictDetails;
+      readonly summaryConflict?: SummaryConflictDetails;
+    },
   ) {
     super(message, options);
     this.name = "TssaeError";
     this.code = code;
     if (options?.conflict !== undefined) {
       this.conflict = options.conflict;
+    }
+    if (options?.summaryConflict !== undefined) {
+      this.summaryConflict = options.summaryConflict;
     }
   }
 }
@@ -234,10 +247,12 @@ export type DiagnosticLocation = {
 };
 
 export type Evidence = {
-  readonly kind: "source" | "type" | "note" | "model";
+  readonly kind: "source" | "type" | "note" | "model" | "summary";
   readonly message: string;
   readonly at?: DiagnosticLocation;
   readonly modelId?: string;
+  readonly summaryId?: string;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly declaration?: string;
 };
 
@@ -496,6 +511,7 @@ export type OpenProjectOptions = {
   readonly projects?: readonly string[];
   readonly models?: readonly Model[];
   readonly adapters?: readonly ConfiguredAdapter[];
+  readonly summaries?: SummaryOptions;
   readonly additionalInputs?: readonly string[];
   /** Directory used to resolve adapter package names; defaults to `cwd`. */
   readonly adapterResolutionRoot?: string;
@@ -524,6 +540,7 @@ export type SessionUpdateOptions = {
   readonly adapterResolutionRoot?: string;
   readonly models?: readonly Model[];
   readonly adapters?: readonly ConfiguredAdapter[];
+  readonly summaries?: SummaryOptions;
   readonly entries?: readonly string[];
   readonly additionalInputs?: readonly string[];
   readonly observe?: ObserveMode | ObserveOptions;

@@ -66,6 +66,13 @@ import {
 import { createProjectionQueries, validateProgramRefs } from "./projection.ts";
 import { buildFileOrigins, resolveProjectEntries } from "./projects.ts";
 import {
+  discoverAndLoadSummaries,
+  normalizeSummaryOptions,
+  type NormalizedSummaryOptions,
+  type ResolvedPackageSummary,
+  type SummaryConfigPayload,
+} from "./summaries.ts";
+import {
   TssaeError,
   makeProgramRef,
   type CommentKind,
@@ -99,6 +106,7 @@ type EngineOpenResult = {
   readonly projects: readonly ProjectSummary[];
   readonly workspaceSourceFiles: readonly string[];
   readonly nativeAdapters: readonly NativeAdapterObservation[];
+  readonly resolvedPackages?: readonly ResolvedPackageSummary[];
   readonly engineRssBytes?: number;
 };
 
@@ -116,6 +124,7 @@ type NormalizedSessionConfig = {
   readonly models: readonly Model[];
   readonly adapters: readonly LibraryAdapter[];
   readonly adapterPackages: readonly string[];
+  readonly summaries: NormalizedSummaryOptions;
   readonly additionalInputs: readonly string[];
 };
 
@@ -249,6 +258,7 @@ function normalizeOpenOptions(
       (adapter): adapter is string => typeof adapter === "string",
     ),
   );
+  const summaries = normalizeSummaryOptions(options.summaries);
   const additionalInputs = validateAdditionalInputPaths(
     options.additionalInputs,
   );
@@ -260,6 +270,7 @@ function normalizeOpenOptions(
     models,
     adapters,
     adapterPackages,
+    summaries,
     additionalInputs,
   };
 }
@@ -479,6 +490,10 @@ function resolveNextConfig(
         ),
       )
     : current.adapterPackages;
+  const summaries =
+    options?.summaries !== undefined
+      ? normalizeSummaryOptions(options.summaries)
+      : current.summaries;
   const additionalInputs =
     options?.additionalInputs !== undefined
       ? validateAdditionalInputPaths(options.additionalInputs)
@@ -495,6 +510,7 @@ function resolveNextConfig(
       models,
       adapters,
       adapterPackages,
+      summaries,
       additionalInputs,
     };
   }
@@ -504,6 +520,7 @@ function resolveNextConfig(
     models,
     adapters,
     adapterPackages,
+    summaries,
     additionalInputs,
   };
 }
@@ -561,6 +578,12 @@ function collectInvalidatedBy(
     stableSerialize(nextConfig.adapterPackages)
   ) {
     reasons.push("adapterPackages");
+  }
+  if (
+    stableSerialize(prevConfig.summaries) !==
+    stableSerialize(nextConfig.summaries)
+  ) {
+    reasons.push("summaries");
   }
   return reasons;
 }
@@ -631,6 +654,11 @@ export async function openProject(
 
   const client = new EngineClient();
   let openResult: EngineOpenResult;
+  let currentSummaryPayload: SummaryConfigPayload;
+  let currentSummaryFiles: readonly {
+    readonly filePath: string;
+    readonly packId: string;
+  }[];
   try {
     openResult = await client.request<EngineOpenResult>(
       "snapshot.open",
@@ -641,6 +669,23 @@ export async function openProject(
       },
       buildRpcRequestOptions(options.observe, options.onRpcMetrics),
     );
+    const discovered = await discoverAndLoadSummaries({
+      cwd: absCwd,
+      projectConfigFiles: openResult.projects.map((p) => p.configFile),
+      resolvedPackages: openResult.resolvedPackages ?? [],
+      options: normalizedConfig.summaries,
+    });
+    currentSummaryPayload = discovered.payload;
+    currentSummaryFiles = discovered.registeredFiles;
+    if (
+      currentSummaryPayload.packs.length > 0 ||
+      !currentSummaryPayload.enableBuiltin
+    ) {
+      await client.request("snapshot.setSummaries", {
+        snapshotId: openResult.snapshotId,
+        summaries: currentSummaryPayload,
+      });
+    }
   } catch (err) {
     await client.close();
     throw err;
@@ -692,6 +737,10 @@ export async function openProject(
       readonly filePath: string;
       readonly source: AdditionalInputSource;
     }[],
+    summaryFiles: readonly {
+      readonly filePath: string;
+      readonly packId: string;
+    }[],
   ) {
     const registry = createAdditionalInputRegistry({ cwd: absCwd });
     for (const filePath of configInputs) {
@@ -703,6 +752,12 @@ export async function openProject(
     for (const item of dynamic) {
       registry.registerAdditionalInput(item.filePath, item.source);
     }
+    for (const item of summaryFiles) {
+      registry.registerAdditionalInput(item.filePath, {
+        kind: "summary",
+        id: item.packId,
+      });
+    }
     return registry;
   }
 
@@ -710,6 +765,7 @@ export async function openProject(
     normalizedConfig.additionalInputs,
     explicitRegistrations,
     dynamicRegistrations,
+    currentSummaryFiles,
   );
 
   const dynamicRegistrar: AdditionalInputRegistrar = {
@@ -1755,15 +1811,37 @@ export async function openProject(
         ),
       );
 
+      const discovered = await discoverAndLoadSummaries({
+        cwd: absCwd,
+        projectConfigFiles: updated.projects.map((p) => p.configFile),
+        resolvedPackages: updated.resolvedPackages ?? [],
+        options: nextConfig.summaries,
+      });
+      const summariesChanged =
+        stableSerialize(discovered.payload) !==
+        stableSerialize(currentSummaryPayload);
+      if (summariesChanged) {
+        await client.request("snapshot.setSummaries", {
+          snapshotId: updated.snapshotId,
+          summaries: discovered.payload,
+        });
+      }
+
       const invalidatedBy = collectInvalidatedBy(
         normalizedConfig,
         nextConfig,
         updateOptions,
         changedAdditionalFiles,
       );
+      const effectiveInvalidatedBy =
+        summariesChanged && !invalidatedBy.includes("summaries")
+          ? [...invalidatedBy, "summaries"]
+          : invalidatedBy;
       const updatedFileOrigins = buildFileOrigins(updated.projects);
 
       normalizedConfig = nextConfig;
+      currentSummaryPayload = discovered.payload;
+      currentSummaryFiles = discovered.registeredFiles;
       adapterResolutionRoot = nextAdapterResolutionRoot;
       packageResolution = nextPackageResolution;
       activeAdapters = nextActiveAdapters;
@@ -1787,6 +1865,7 @@ export async function openProject(
         nextConfig.additionalInputs,
         explicitRegistrations,
         dynamicRegistrations,
+        currentSummaryFiles,
       );
       const updatedAdditionalInputs = sessionRegistry.listAdditionalInputs();
 
@@ -1796,7 +1875,7 @@ export async function openProject(
         recomputedFiles: updated.recomputedFiles,
         reusedFiles: updated.reusedFiles,
         removedFiles: updated.removedFiles,
-        invalidatedBy,
+        invalidatedBy: effectiveInvalidatedBy,
       };
 
       return {

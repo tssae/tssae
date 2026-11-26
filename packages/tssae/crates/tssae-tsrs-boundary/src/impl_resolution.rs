@@ -7,8 +7,8 @@ use std::{
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use tsrs_ast::{
-    Kind, Node, SourceFile, Symbol, SymbolFlags, get_source_file_of_node,
-    is_function_like_declaration,
+    Kind, ModifierFlags, Node, SourceFile, Symbol, SymbolFlags, get_combined_modifier_flags,
+    get_source_file_of_node, is_function_like_declaration,
 };
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, tspath};
@@ -18,7 +18,7 @@ use tsrs_sourcemap::{
     DocumentPosition, DocumentPositionMapper, ECMALineInfo, Host as SourceMapHost,
     create_ecma_line_info, get_document_position_mapper,
 };
-use tssae_common::{DiagnosticLocation, EvidenceItem, GapItem, UnknownReason};
+use tssae_common::{DeclarationIdentity, DiagnosticLocation, EvidenceItem, GapItem, UnknownReason};
 
 use crate::semantic_facade::{SemanticFacade, resolve_symbol_for_node};
 use crate::syntax_view::{
@@ -80,6 +80,113 @@ pub enum FacadeImplementationOutcome {
 pub struct DeclarationProvenance {
     pub package_name: Option<String>,
     pub export_name: Option<String>,
+}
+
+/// Resolved external or workspace package metadata collected from a `Program`'s actual imports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedPackageInfo {
+    pub name: String,
+    pub version: Option<String>,
+    pub package_root: Option<String>,
+}
+
+/// Collects packages actually resolved by `program` from project source files (never scanning `node_modules`).
+#[must_use]
+pub fn collect_resolved_packages_for_program(
+    cwd: &str,
+    program: &'static Program,
+) -> Vec<ResolvedPackageInfo> {
+    let mut by_key: FxHashMap<(String, String), ResolvedPackageInfo> = FxHashMap::default();
+    let mut seen_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+
+    for &sf in program.get_source_files() {
+        if program.is_source_file_default_library(sf.path())
+            || program.is_source_file_from_external_library(sf)
+            || normalize_path(sf.file_name()).contains("/node_modules/")
+            || !is_first_party_workspace_path(cwd, sf.file_name())
+        {
+            continue;
+        }
+        for &imp in sf.imports() {
+            let Some(spec_text) = string_literal_text(imp) else {
+                continue;
+            };
+            if !is_bare_package_specifier(&spec_text) {
+                continue;
+            }
+            let Some(resolved) = program.get_resolved_module_from_module_specifier(sf, imp) else {
+                continue;
+            };
+            if !resolved.is_resolved() {
+                continue;
+            }
+            let norm_file = normalize_path(resolved.resolved_file_name);
+            let is_pkg = resolved.is_external_library_import
+                || !resolved.package_id.name.is_empty()
+                || norm_file.contains("/node_modules/");
+            if !is_pkg {
+                continue;
+            }
+
+            let pkg_info = find_package_info(program, resolved.resolved_file_name, None);
+            let pkg_root = pkg_info
+                .as_ref()
+                .map(|(dir, _)| normalize_path(dir))
+                .filter(|dir| !dir.is_empty());
+            let info_fields = pkg_info
+                .as_ref()
+                .and_then(|(_, entry)| entry.as_ref())
+                .and_then(|entry| entry.contents);
+
+            let pkg_name = if !resolved.package_id.name.is_empty() {
+                resolved.package_id.name.to_string()
+            } else if let Some(name) = info_fields.and_then(|c| c.get().fields.name.get_value()) {
+                name.clone()
+            } else {
+                split_package_specifier(&spec_text).0
+            };
+            if pkg_name.is_empty() {
+                continue;
+            }
+
+            let pkg_version = if resolved.package_id.version.is_empty() {
+                info_fields
+                    .and_then(|c| c.get().fields.version.get_value())
+                    .cloned()
+            } else {
+                Some(resolved.package_id.version.to_string())
+            };
+
+            seen_names.insert(pkg_name.clone());
+            let key = (pkg_name.clone(), pkg_root.clone().unwrap_or_default());
+            by_key.entry(key).or_insert(ResolvedPackageInfo {
+                name: pkg_name,
+                version: pkg_version,
+                package_root: pkg_root,
+            });
+        }
+    }
+
+    for name in program.resolved_package_names().keys() {
+        if !seen_names.contains(name.as_str()) {
+            by_key.insert(
+                (name.clone(), String::new()),
+                ResolvedPackageInfo {
+                    name: name.clone(),
+                    version: None,
+                    package_root: None,
+                },
+            );
+        }
+    }
+
+    let mut out: Vec<ResolvedPackageInfo> = by_key.into_values().collect();
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.package_root.cmp(&b.package_root))
+    });
+    out
 }
 
 /// Snapshot-scoped cache of parsed `.d.ts.map` / inline source-map mappers.
@@ -1256,4 +1363,305 @@ impl SemanticFacade<'_> {
         }
         FirstPartyResolutionSource::CurrentProject
     }
+
+    /// Extracts canonical [`DeclarationIdentity`] (package, version, export subpath, module, member paths)
+    /// for behavior summary matching.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Normalizes package provenance, stdlib wrapper interfaces, and class/namespace member chains in one pass."
+    )]
+    pub fn extract_declaration_identity(&mut self, node: P<Node>) -> Option<DeclarationIdentity> {
+        let is_construct_site = node.kind() == Kind::NewExpression;
+        let expr_for_prov = if matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
+            node.expression().map(unwrap_expr_wrappers)
+        } else if node.kind() == Kind::TaggedTemplateExpression {
+            Some(unwrap_expr_wrappers(
+                node.as_tagged_template_expression().tag(),
+            ))
+        } else {
+            Some(unwrap_expr_wrappers(node))
+        };
+
+        let resolved = resolve_symbol_for_node(self.checker_mut(), node);
+        let sig_decl = if matches!(
+            node.kind(),
+            Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression
+        ) {
+            let sig = self.checker_mut().get_resolved_signature_exported(node);
+            if crate::semantic_facade::is_unresolved_signature(self.checker_mut(), sig) {
+                None
+            } else {
+                sig.declaration()
+                    .or_else(|| sig.target().and_then(|t| t.declaration()))
+            }
+        } else {
+            None
+        };
+
+        let decl_node = if is_construct_site {
+            sig_decl
+                .filter(|d| d.kind() == Kind::ConstructSignature)
+                .or(resolved.primary_decl)
+                .or(Some(node))?
+        } else {
+            resolved.primary_decl.or(sig_decl).or(Some(node))?
+        };
+        let decl_sf = get_source_file_of_node(decl_node)?;
+        let is_default_library = self
+            .program()
+            .is_source_file_default_library(decl_sf.path());
+
+        let prov = expr_for_prov
+            .and_then(|e| find_provenance_for_expr(self.checker_mut(), e, true))
+            .or_else(|| {
+                resolved.symbol.and_then(|s| {
+                    trace_symbol_package_provenance(self.checker_mut(), s, None, true)
+                })
+            });
+
+        let (package_name, package_version, export_path, module_path) = if is_default_library {
+            (None, None, None, None)
+        } else {
+            let decl_file_norm = normalize_path(decl_sf.file_name());
+            let is_external_file = self.program().is_source_file_from_external_library(decl_sf)
+                || decl_file_norm.contains("/node_modules/")
+                || !is_first_party_workspace_path(self.cwd(), decl_sf.file_name());
+            let has_bare_prov = prov
+                .as_ref()
+                .is_some_and(|p| is_bare_package_specifier(&p.specifier_text));
+            let is_curr_proj_source =
+                crate::syntax_view::is_project_source_file(self.program(), decl_sf)
+                    && !has_bare_prov;
+
+            if is_external_file || has_bare_prov || !is_curr_proj_source {
+                let pkg_info = find_package_info(self.program(), decl_sf.file_name(), None);
+                let info_fields = pkg_info
+                    .as_ref()
+                    .and_then(|(_, entry)| entry.as_ref())
+                    .and_then(|entry| entry.contents);
+                let pkg_from_info = info_fields
+                    .and_then(|c| c.get().fields.name.get_value())
+                    .cloned();
+                let ver_from_info = info_fields
+                    .and_then(|c| c.get().fields.version.get_value())
+                    .cloned();
+                let (spec_pkg, spec_export) = prov
+                    .as_ref()
+                    .filter(|p| is_bare_package_specifier(&p.specifier_text))
+                    .map_or((None, None), |p| {
+                        let (pkg, exp) = split_package_specifier(&p.specifier_text);
+                        (Some(pkg), Some(exp))
+                    });
+                let final_pkg = pkg_from_info.or(spec_pkg);
+                let rel_mod = is_first_party_workspace_path(self.cwd(), decl_sf.file_name())
+                    .then(|| normalize_path(&relative_to_cwd(self.cwd(), decl_sf.file_name())));
+                (final_pkg, ver_from_info, spec_export, rel_mod)
+            } else {
+                let rel_mod = normalize_path(&relative_to_cwd(self.cwd(), decl_sf.file_name()));
+                (None, None, None, Some(rel_mod))
+            }
+        };
+
+        let mut member_paths: Vec<Vec<String>> = Vec::new();
+        let mut is_instance_member = false;
+        let mut push_path = |path: Vec<String>| {
+            if !path.is_empty() && !member_paths.contains(&path) {
+                member_paths.push(path);
+            }
+        };
+
+        match decl_node.kind() {
+            Kind::MethodSignature
+            | Kind::MethodDeclaration
+            | Kind::GetAccessor
+            | Kind::SetAccessor
+            | Kind::PropertySignature
+            | Kind::PropertyDeclaration => {
+                if let Some(member_name) = extract_member_name_for_summary(decl_node) {
+                    let is_static =
+                        get_combined_modifier_flags(decl_node).intersects(ModifierFlags::Static);
+                    let (containers, in_type_literal) = collect_container_chain(decl_node);
+
+                    if is_default_library && containers.len() == 1 {
+                        match containers[0].as_str() {
+                            "CallableFunction" | "NewableFunction" => {
+                                is_instance_member = true;
+                                push_path(vec![
+                                    "Function".to_string(),
+                                    "prototype".to_string(),
+                                    member_name.clone(),
+                                ]);
+                                push_path(vec!["Function".to_string(), member_name.clone()]);
+                            }
+                            "ArrayConstructor" => {
+                                is_instance_member = false;
+                                push_path(vec!["Array".to_string(), member_name.clone()]);
+                            }
+                            "PromiseConstructor" => {
+                                is_instance_member = false;
+                                push_path(vec!["Promise".to_string(), member_name.clone()]);
+                            }
+                            "ObjectConstructor" => {
+                                is_instance_member = false;
+                                push_path(vec!["Object".to_string(), member_name.clone()]);
+                            }
+                            "MapConstructor" => {
+                                is_instance_member = false;
+                                push_path(vec!["Map".to_string(), member_name.clone()]);
+                            }
+                            "SetConstructor" => {
+                                is_instance_member = false;
+                                push_path(vec!["Set".to_string(), member_name.clone()]);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !containers.is_empty() {
+                        if !is_static && !in_type_literal {
+                            is_instance_member = true;
+                            let mut proto_path = containers.clone();
+                            proto_path.push("prototype".to_string());
+                            proto_path.push(member_name.clone());
+                            push_path(proto_path);
+                        }
+                        let mut direct_path = containers;
+                        direct_path.push(member_name);
+                        push_path(direct_path);
+                    }
+                }
+            }
+            Kind::ConstructSignature | Kind::Constructor => {
+                let (mut containers, _) = collect_container_chain(decl_node);
+                if is_default_library && containers.as_slice() == ["PromiseConstructor"] {
+                    containers = vec!["Promise".to_string()];
+                }
+                if !containers.is_empty() {
+                    let mut ctor_path = containers.clone();
+                    ctor_path.push("constructor".to_string());
+                    push_path(ctor_path);
+                    push_path(containers);
+                }
+            }
+            Kind::ClassDeclaration | Kind::ClassExpression => {
+                let mut chain = collect_namespace_chain(decl_node);
+                if let Some(name) = decl_node.name().and_then(node_text).or_else(|| {
+                    resolved
+                        .symbol
+                        .map(|s| s.name().to_string())
+                        .filter(|n| !matches!(n.as_str(), "__class" | "unknown"))
+                }) {
+                    chain.push(name);
+                    let mut ctor_path = chain.clone();
+                    ctor_path.push("constructor".to_string());
+                    push_path(ctor_path);
+                    push_path(chain);
+                }
+            }
+            _ => {
+                let mut ns_chain = collect_namespace_chain(decl_node);
+                let decl_name = decl_node.name().and_then(node_text).or_else(|| {
+                    resolved
+                        .symbol
+                        .map(|s| s.name().to_string())
+                        .filter(|n| !matches!(n.as_str(), "__function" | "__class" | "unknown"))
+                });
+                if let Some(name) = decl_name {
+                    if is_construct_site {
+                        let mut ctor_path = ns_chain.clone();
+                        ctor_path.push(name.clone());
+                        ctor_path.push("constructor".to_string());
+                        push_path(ctor_path);
+                    }
+                    ns_chain.push(name);
+                    push_path(ns_chain);
+                }
+                if let Some(exp_name) = prov.as_ref().and_then(|p| p.export_name.as_ref()) {
+                    if is_construct_site {
+                        push_path(vec![exp_name.clone(), "constructor".to_string()]);
+                    }
+                    push_path(vec![exp_name.clone()]);
+                }
+            }
+        }
+
+        if member_paths.is_empty() {
+            return None;
+        }
+
+        Some(DeclarationIdentity {
+            package_name,
+            package_version,
+            export_path,
+            module_path,
+            is_default_library,
+            member_paths,
+            is_instance_member,
+        })
+    }
+}
+
+fn extract_member_name_for_summary(member: P<Node>) -> Option<String> {
+    let name_node = member.name()?;
+    if name_node.kind() == Kind::ComputedPropertyName {
+        if let Some(expr) = name_node.expression()
+            && let Some(raw) = node_text(expr)
+        {
+            let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact == "Symbol.dispose" {
+                return Some("[Symbol.dispose]".to_string());
+            }
+            if compact == "Symbol.asyncDispose" {
+                return Some("[Symbol.asyncDispose]".to_string());
+            }
+        }
+        return prop_key_text(name_node);
+    }
+    if name_node.kind() == Kind::PrivateIdentifier {
+        return node_text(name_node);
+    }
+    prop_key_text(name_node).or_else(|| node_text(name_node))
+}
+
+fn collect_namespace_chain(node: P<Node>) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut cur = node.parent();
+    while let Some(parent) = cur {
+        if parent.kind() == Kind::ModuleDeclaration
+            && let Some(name) = parent.name().and_then(node_text)
+        {
+            chain.push(name);
+        }
+        cur = parent.parent();
+    }
+    chain.reverse();
+    chain
+}
+
+fn collect_container_chain(member: P<Node>) -> (Vec<String>, bool) {
+    let mut chain = Vec::new();
+    let mut in_type_literal = false;
+    let mut cur = member.parent();
+    while let Some(parent) = cur {
+        match parent.kind() {
+            Kind::TypeLiteral => {
+                in_type_literal = true;
+            }
+            Kind::ClassDeclaration
+            | Kind::ClassExpression
+            | Kind::InterfaceDeclaration
+            | Kind::ModuleDeclaration
+            | Kind::TypeAliasDeclaration
+            | Kind::EnumDeclaration
+            | Kind::VariableDeclaration => {
+                if let Some(name) = parent.name().and_then(node_text) {
+                    chain.push(name);
+                }
+            }
+            _ => {}
+        }
+        cur = parent.parent();
+    }
+    chain.reverse();
+    (chain, in_type_literal)
 }

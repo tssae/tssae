@@ -8,7 +8,8 @@ import { TssaeError } from "./types.ts";
 export type AdditionalInputSource =
   | { readonly kind: "config" }
   | { readonly kind: "rule"; readonly id: string }
-  | { readonly kind: "adapter"; readonly id: string };
+  | { readonly kind: "adapter"; readonly id: string }
+  | { readonly kind: "summary"; readonly id: string };
 
 /** Deduplicated additional input entry with its normalized relative path, digest, and all declaration sources. */
 export type AdditionalInputEntry = {
@@ -100,7 +101,8 @@ function sourceKey(source: AdditionalInputSource): string {
 function sourceKindRank(kind: AdditionalInputSource["kind"]): number {
   if (kind === "config") return 0;
   if (kind === "adapter") return 1;
-  return 2;
+  if (kind === "summary") return 2;
+  return 3;
 }
 
 function compareSources(

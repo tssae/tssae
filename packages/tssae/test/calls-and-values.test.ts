@@ -1089,6 +1089,10 @@ void describe("tssae call graph and value propagation", () => {
             "  return [fnA, fnB].map((f) => f());",
             "}",
             "",
+            "export function plainCallbackNoFallback(cb: () => number): number {",
+            "  return cb();",
+            "}",
+            "",
           ].join("\n"),
         },
       },
@@ -1122,6 +1126,7 @@ void describe("tssae call graph and value propagation", () => {
           const arrDestructCall = await resolveByPrefix("secondFn()");
           const forOfCall = await resolveByPrefix("itemFn()");
           const mapCbCall = await resolveByPrefix("f()");
+          const plainCbCall = await resolveByPrefix("cb()");
 
           // Verify both `fn()` call sites explicitly by line number
           const allCallsResolved = await ctx.resolveCalls(
@@ -1151,6 +1156,7 @@ void describe("tssae call graph and value propagation", () => {
             arrRes,
             forOfRes,
             mapCbRes,
+            plainCbRes,
           ] = await ctx.calleesOf([
             closedCall,
             openCall,
@@ -1161,6 +1167,7 @@ void describe("tssae call graph and value propagation", () => {
             arrDestructCall,
             forOfCall,
             mapCbCall,
+            plainCbCall,
           ]);
 
           // 1. Polymorphic overrides: unexported ClosedBase -> complete with [10, 20]; exported OpenBase -> incomplete with [30, 40] + gap
@@ -1219,12 +1226,24 @@ void describe("tssae call graph and value propagation", () => {
             ["fnA", "fnB"],
           );
 
-          // 5. [fnA, fnB].map(f => f()) must NOT report fnA or parameter signature
-          assert.equal(mapCbRes!.completeness, "incomplete");
-          assert.deepEqual(mapCbRes!.targets, []);
+          // 5. [fnA, fnB].map(f => f()) uses the built-in Array.prototype.map summary,
+          // while an unsummarized callback parameter cb() still yields no signature fallback.
+          assert.equal(mapCbRes!.completeness, "complete");
+          assert.deepEqual(
+            mapCbRes!.resolvedTargets.map((t) => t.name),
+            ["fnA", "fnB"],
+          );
           assert.ok(
-            mapCbRes!.completeness === "incomplete" &&
-              mapCbRes!.gaps.some((g) => g.kind === "dynamic-callee"),
+            mapCbRes!.evidence.some(
+              (ev) => ev.kind === "summary" && ev.summarySource === "builtin",
+            ),
+          );
+
+          assert.equal(plainCbRes!.completeness, "incomplete");
+          assert.deepEqual(plainCbRes!.targets, []);
+          assert.ok(
+            plainCbRes!.completeness === "incomplete" &&
+              plainCbRes!.gaps.some((g) => g.kind === "dynamic-callee"),
           );
 
           // Verify callersOf on OpenSub.run includes open.run() & exact.run() and is incomplete due to open hierarchy

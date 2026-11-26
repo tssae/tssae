@@ -1073,11 +1073,12 @@ fn execute_call_graph_step(
             checker,
             targets,
             lookup_files,
+            observer,
         )?;
         observer.record_step("callersOf", step_start, items.len(), Vec::new());
         Ok(StepResult::CallersOf { items })
     } else {
-        let items = run_callees_of(snapshot, project_id, program, checker, targets)?;
+        let items = run_callees_of(snapshot, project_id, program, checker, targets, observer)?;
         observer.record_step("calleesOf", step_start, items.len(), Vec::new());
         Ok(StepResult::CalleesOf { items })
     }

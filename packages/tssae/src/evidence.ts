@@ -34,6 +34,7 @@ import type {
   ProjectedSyntaxLookupRow,
   SyntaxLookupSelection,
 } from "./projection.ts";
+import type { BehaviorSummaryPack } from "./summaries.ts";
 import type {
   DiagnosticLocation,
   Evidence,
@@ -67,6 +68,7 @@ export type SelectableQueryResult =
   | ProjectedCallResolutionRow<CallProjectionSelection>
   | ProjectedInstanceRow<InstanceProjectionSelection>
   | Model
+  | BehaviorSummaryPack
   | FactResult;
 
 /** Item accepted in `basis` lists to supply selected provenance or explicit evidence. */
@@ -107,6 +109,10 @@ export function normalizeEvidenceItem(item: Evidence): Evidence {
     message: item.message,
     ...(item.at !== undefined ? { at: normalizeLocation(item.at) } : {}),
     ...(item.modelId !== undefined ? { modelId: item.modelId } : {}),
+    ...(item.summaryId !== undefined ? { summaryId: item.summaryId } : {}),
+    ...(item.summarySource !== undefined
+      ? { summarySource: item.summarySource }
+      : {}),
     ...(item.declaration !== undefined
       ? { declaration: item.declaration }
       : {}),
@@ -129,6 +135,8 @@ function evidenceKey(item: Evidence): string {
       ? `${loc.file}:${loc.start}:${loc.end}:${loc.line}:${loc.column}:${loc.endLine}:${loc.endColumn}`
       : null,
     item.modelId ?? null,
+    item.summaryId ?? null,
+    item.summarySource ?? null,
     item.declaration ?? null,
   ]);
 }
@@ -187,7 +195,8 @@ function isEvidenceItem(value: unknown): value is Evidence {
     (candidate.kind === "source" ||
       candidate.kind === "type" ||
       candidate.kind === "note" ||
-      candidate.kind === "model") &&
+      candidate.kind === "model" ||
+      candidate.kind === "summary") &&
     typeof candidate.message === "string"
   );
 }

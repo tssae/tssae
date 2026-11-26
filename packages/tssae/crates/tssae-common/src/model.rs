@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::diagnostics::{DiagnosticLocation, EvidenceItem, GapItem};
 use crate::handles::{FileId, SignatureId, SymbolId, SyntaxId, TypeId};
+use crate::summaries::{DeclarationIdentity, SummarySource};
 
 /// Pure syntactic summary of an AST node exposed across the boundary layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,4 +196,8 @@ pub trait SemanticModel {
         call_site_syntax: Option<SyntaxId>,
     ) -> ImplementationFact;
     fn check_call_missing_package_gap(&self, call_syntax: SyntaxId) -> Option<GapItem>;
+    fn declaration_identity(&self, _syntax: SyntaxId) -> Option<DeclarationIdentity> {
+        None
+    }
+    fn record_summary_lookup(&self, _source: Option<SummarySource>) {}
 }

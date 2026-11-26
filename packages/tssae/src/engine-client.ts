@@ -7,6 +7,7 @@ import {
 
 import { engineExecutablePath } from "./binary.ts";
 import type { EngineCallIoMetrics, EngineRpcMetrics } from "./observation.ts";
+import type { SummaryConflictDetails } from "./summaries.ts";
 import { TssaeError, type ObserveMode, type TssaeErrorCode } from "./types.ts";
 
 export type EngineObserveRequest = {
@@ -33,6 +34,7 @@ type RpcResponse =
       readonly error: {
         readonly code: string;
         readonly message: string;
+        readonly details?: unknown;
       };
     };
 
@@ -55,6 +57,7 @@ function mapEngineErrorCode(code: string): TssaeErrorCode {
     case "NATIVE_ADAPTER_LOAD":
     case "NATIVE_ADAPTER_EXTRACT":
     case "FACT_CONFLICT":
+    case "SUMMARY_CONFLICT":
       return code;
     default:
       return "ENGINE_ERROR";
@@ -120,10 +123,18 @@ export class EngineClient {
       if (parsed.ok) {
         call.resolve(parsed.result);
       } else {
+        const mappedCode = mapEngineErrorCode(parsed.error.code);
         call.reject(
           new TssaeError(
-            mapEngineErrorCode(parsed.error.code),
+            mappedCode,
             parsed.error.message,
+            mappedCode === "SUMMARY_CONFLICT" &&
+              parsed.error.details !== undefined
+              ? {
+                  summaryConflict: parsed.error
+                    .details as SummaryConflictDetails,
+                }
+              : undefined,
           ),
         );
       }

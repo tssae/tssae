@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { withAcceptanceHost } from "@tssae/acceptance";
+import { linkNodeModulesPackage } from "@tssae/test-hosts";
 
 const fixtureTsconfig = JSON.stringify(
   {
@@ -27,6 +28,7 @@ const jsxAmbientSource = `declare namespace JSX {
 `;
 
 const sourcesTs = `import { createExternalResource } from "decl-only-ext";
+import { dtsOnlyWorkspaceOp } from "@ws/dts-only";
 
 export type RowPayload = {
   readonly id: number;
@@ -60,6 +62,10 @@ export function createConnection(label: string): LocalConnection {
 
 export function createWrappedExternal(name: string) {
   return createExternalResource(name);
+}
+
+export function callWorkspaceDtsOnly(value: string): string {
+  return dtsOnlyWorkspaceOp(value);
 }
 `;
 
@@ -233,6 +239,7 @@ try {
   const connACallSyn = appCalls.find((c) => c.text === 'createConnection("A")');
   const connBCallSyn = appCalls.find((c) => c.text === 'createConnection("B")');
   const extCallSyn = sourceCalls.find((c) => c.text.startsWith("createExternalResource("));
+  const wsDtsCallSyn = sourceCalls.find((c) => c.text.startsWith("dtsOnlyWorkspaceOp("));
   const loadRowDeclSyn = sourceDecls.find((d) => d.text.includes("function loadRow"));
   const uncalledDeclSyn = sourceDecls.find((d) => d.text.includes("function uncalledHelper"));
   const acceptRowCallSyn = appCalls.find((c) => c.text.startsWith("acceptPublicRow("));
@@ -245,6 +252,7 @@ try {
       connACallSyn &&
       connBCallSyn &&
       extCallSyn &&
+      wsDtsCallSyn &&
       loadRowDeclSyn &&
       uncalledDeclSyn &&
       acceptRowCallSyn &&
@@ -260,8 +268,11 @@ try {
   const [loadRowResolved, acceptRowResolved, connAResolved] = resolvedAppCalls;
   assert.ok(loadRowResolved?.call && acceptRowResolved?.call && connAResolved?.call);
 
-  const [extCallResolved] = await ctx.resolveCalls([extCallSyn.ref]);
-  assert.ok(extCallResolved?.call);
+  const [extCallResolved, wsDtsCallResolved] = await ctx.resolveCalls([
+    extCallSyn.ref,
+    wsDtsCallSyn.ref,
+  ]);
+  assert.ok(extCallResolved?.call && wsDtsCallResolved?.call);
 
   // Chain CallRef -> calleesOf -> DeclarationRef -> callersOf
   const [loadRowCallees] = await ctx.calleesOf([loadRowResolved.call]);
@@ -433,12 +444,16 @@ try {
   const implResults = await ctx.resolveImplementations([
     extCallResolved.call,
     connAResolved.call,
+    wsDtsCallResolved.call,
   ]);
-  const [extImpl, localImpl] = implResults;
-  assert.equal(extImpl?.status, "declaration-only");
-  assert.ok((extImpl?.gaps.length ?? 0) > 0);
-  assert.equal(localImpl?.status, "source");
-  assert.deepEqual(localImpl?.gaps, []);
+  const [extImpl, localImpl, wsDtsImpl] = implResults;
+  assert.equal(extImpl?.status, "external");
+  assert.equal(extImpl?.packageName, "decl-only-ext");
+  assert.equal(localImpl?.status, "resolved");
+  assert.equal(localImpl?.implementation.resolutionSource, "current-project");
+  assert.equal(localImpl?.implementation.file, "src/sources.ts");
+  assert.equal(wsDtsImpl?.status, "inconclusive");
+  assert.ok((wsDtsImpl?.gaps.length ?? 0) > 0);
   assert.ok(observedGaps.length > 0);
   assert.ok(observedQueries.some((q) => q.op === "resolveImplementations"));
   assert.ok(observedRpc.some((m) => m.isQueryBatch && m.engineMetrics !== undefined));
@@ -497,7 +512,9 @@ try {
         isSameInstance(instA.instance, instB.instance),
       ],
       extImplStatus: extImpl?.status,
-      extGapKinds: extImpl?.gaps.map((g) => g.kind),
+      wsDtsImplStatus: wsDtsImpl?.status,
+      wsDtsGapKinds: wsDtsImpl?.gaps.map((g) => g.kind),
+      wsDtsGapMessages: wsDtsImpl?.gaps.map((g) => g.message),
       scannedDirectiveRules: directives.map((d) => d.ruleId),
     }) + "\\n",
   );
@@ -554,6 +571,27 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
         "node_modules/decl-only-ext/index.d.ts",
         "export declare function createExternalResource(name: string): { readonly name: string };\n",
       );
+      host.writeText(
+        "packages/ws-dts/package.json",
+        JSON.stringify(
+          {
+            name: "@ws/dts-only",
+            version: "1.0.0",
+            types: "./dist/index.d.ts",
+          },
+          null,
+          2,
+        ),
+      );
+      host.writeText(
+        "packages/ws-dts/dist/index.d.ts",
+        "export declare function dtsOnlyWorkspaceOp(value: string): string;\n",
+      );
+      linkNodeModulesPackage(
+        host.hostDir,
+        "@ws/dts-only",
+        host.resolvePath("packages/ws-dts"),
+      );
 
       const tscFixture = await host.runTsc("tsconfig.json");
       assert.equal(
@@ -585,7 +623,9 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
         readonly propRetained: readonly string[];
         readonly sameInstance: readonly boolean[];
         readonly extImplStatus: string;
-        readonly extGapKinds: readonly string[];
+        readonly wsDtsImplStatus: string;
+        readonly wsDtsGapKinds: readonly string[];
+        readonly wsDtsGapMessages: readonly string[];
         readonly scannedDirectiveRules: readonly string[];
       };
 
@@ -597,8 +637,12 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
       ]);
       assert.deepEqual(summary.propRetained, ["id", "name"]);
       assert.deepEqual(summary.sameInstance, [true, false]);
-      assert.equal(summary.extImplStatus, "declaration-only");
-      assert.ok(summary.extGapKinds.length > 0);
+      assert.equal(summary.extImplStatus, "external");
+      assert.equal(summary.wsDtsImplStatus, "inconclusive");
+      assert.ok(summary.wsDtsGapKinds.includes("missing-source-file"));
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /project references/i);
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /customConditions/);
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /declarationMap/);
       assert.deepEqual(summary.scannedDirectiveRules, [
         "demo/guarded",
         "demo/block",

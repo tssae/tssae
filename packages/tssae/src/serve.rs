@@ -32,13 +32,13 @@ use crate::native_adapter::{
     NativeAdapterObservation, NativeAdapterPackageInput, NativeAdapterRegistry, NativeAdapterStatus,
 };
 use crate::observe::{EngineRpcMetrics, ObserveCollector, ObserveRequestConfig, elapsed_ms};
-use crate::package_impl::PackageImplCache;
 use crate::projection::{QueryStep, execute_query_batch};
 pub use crate::projection::{SourceLocation, node_location, slice_source_text};
 use crate::projects::{
     ProjectSummary, UpdateSnapshotInput, normalize_path, open_projects_snapshot, relative_to_cwd,
     release_tsrs_snapshot, update_projects_snapshot,
 };
+use tssae_tsrs_boundary::SourceMapCache;
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -306,13 +306,24 @@ pub struct SnapshotState {
     pub ir_cache: FxHashMap<(String, P<Node>), Result<Arc<LoweredScope>, GapItem>>,
     pub call_graph_cache: FxHashMap<String, Arc<ProjectCallGraph>>,
     pub field_write_index: FxHashMap<String, Arc<FieldWriteIndex>>,
-    pub package_impl_cache: PackageImplCache,
+    pub sourcemap_cache: SourceMapCache,
     pub native_adapters: NativeAdapterRegistry,
     pub native_fact_cache: crate::native_adapter::NativeFactCache,
     pub next_handle_id: u64,
 }
 
 impl SnapshotState {
+    #[must_use]
+    pub fn workspace_programs(&self) -> Vec<&'static tsrs_compiler::Program> {
+        self.snapshot_data
+            .snapshot
+            .project_collection
+            .projects()
+            .iter()
+            .filter_map(|proj| proj.get_program())
+            .collect()
+    }
+
     fn alloc_handle(&mut self, prefix: &str, project_id: &str, payload: HandlePayload) -> String {
         self.next_handle_id += 1;
         let id = format!("{prefix}:{}:{}", self.snapshot_id, self.next_handle_id);
@@ -750,7 +761,7 @@ impl EngineServer {
                 ir_cache: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
-                package_impl_cache: PackageImplCache::default(),
+                sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),
                 next_handle_id: 0,
@@ -856,7 +867,7 @@ impl EngineServer {
                 ir_cache: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
-                package_impl_cache: PackageImplCache::default(),
+                sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),
                 next_handle_id: 0,

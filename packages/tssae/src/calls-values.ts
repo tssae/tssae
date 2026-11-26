@@ -3,7 +3,11 @@ import { performance } from "node:perf_hooks";
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { registerProvenance } from "./evidence.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
-import type { ResolvedImplementationTarget } from "./package-impl.ts";
+import {
+  mapRawImplementationTarget,
+  type RawResolvedImplementationTarget,
+  type ResolvedImplementationTarget,
+} from "./package-impl.ts";
 import { validateProgramRefs } from "./projection.ts";
 import {
   makeProgramRef,
@@ -194,7 +198,7 @@ type RawCallTargetInfo = {
   readonly name: string | null;
   readonly location: DiagnosticLocation | null;
   readonly isExternal: boolean;
-  readonly implementation?: ResolvedImplementationTarget | null;
+  readonly implementation?: RawResolvedImplementationTarget | null;
   readonly parameterBindings: readonly RawParameterBinding[];
   readonly returnExpressions: readonly string[];
 };
@@ -535,7 +539,17 @@ export function createCallsValuesQueries(deps: {
                   location: target.location,
                   isExternal: target.isExternal,
                   ...(target.implementation !== undefined
-                    ? { implementation: target.implementation }
+                    ? {
+                        implementation:
+                          target.implementation !== null
+                            ? mapRawImplementationTarget(
+                                target.implementation,
+                                sessionToken,
+                                projectId,
+                                snapshotId,
+                              )
+                            : null,
+                      }
                     : {}),
                   parameterBindings: mapBindings(
                     target.parameterBindings,
@@ -575,7 +589,7 @@ export function createCallsValuesQueries(deps: {
                 ) {
                   targetEvidence.push({
                     kind: "source",
-                    message: `Resolved ${mappedTarget.implementation.resolutionMode} implementation '${mappedTarget.implementation.file}' for '${mappedTarget.name ?? "<anonymous>"}'`,
+                    message: `Resolved ${mappedTarget.implementation.resolutionSource} implementation '${mappedTarget.implementation.file}' for '${mappedTarget.name ?? "<anonymous>"}'`,
                     at: mappedTarget.implementation.location,
                     ...(mappedTarget.name !== null
                       ? { declaration: mappedTarget.name }

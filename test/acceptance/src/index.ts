@@ -54,3 +54,67 @@ export {
   type VerifyHostResolutionOptions,
   type VerifyInstalledNativeLibraryOptions,
 } from "./verify.ts";
+export {
+  prepareBaselineArtifact,
+  readRepoHeadState,
+  resolveBaselineRevision,
+  resolvePerfCacheDir,
+  resolveRepoRoot,
+  type ResolvedRevision,
+} from "./perf/baseline.ts";
+export { runPerfCli } from "./perf/cli.ts";
+export {
+  DEFAULT_SCENARIOS,
+  formatPerfCliUsage,
+  parsePerfCliArgs,
+  type PerfCliOptions,
+} from "./perf/cli-args.ts";
+export {
+  CORPUS_PROFILES,
+  materializeCorpus,
+  resolveCorpusCacheDir,
+  type MaterializeCorpusOptions,
+} from "./perf/corpus.ts";
+export {
+  SCENARIO_LABELS,
+  formatPerfMarkdownReport,
+  formatPerfTableReport,
+  writePerfReportFiles,
+} from "./perf/report.ts";
+export {
+  buildPairedSamplingSchedule,
+  runPerfAbBenchmark,
+  type RunPerfAbOptions,
+  type VersionSide,
+} from "./perf/runner.ts";
+export {
+  DEFAULT_PERF_BUDGET,
+  buildAttributionReport,
+  computeP50,
+  computeP95,
+  computeRelativeDelta,
+  evaluateScenarioBudget,
+  summarizeScenarioSamples,
+  type BudgetEvaluationInput,
+  type BudgetEvaluationResult,
+} from "./perf/stats.ts";
+export type {
+  AttributionReport,
+  BaselineArtifact,
+  CorpusProfileId,
+  CorpusProfileSpec,
+  EngineStepAttribution,
+  MaterializedCorpus,
+  ObserveModeName,
+  ObserveOverheadEntry,
+  PerfBudgetConfig,
+  PerfEnvironmentInfo,
+  PerfReport,
+  PerfScenarioId,
+  QueryAttribution,
+  SampleEngineStepRecord,
+  SampleQueryRecord,
+  ScenarioComparison,
+  ScenarioStats,
+  WorkerRunSample,
+} from "./perf/types.ts";

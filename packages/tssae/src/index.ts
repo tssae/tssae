@@ -132,10 +132,9 @@ export type {
   TypeSummary,
 } from "./projection.ts";
 export type {
+  FirstPartyResolutionSource,
   ImplementationResolutionResult,
-  ImplementationStatus,
   ImplementationTargetRef,
-  PackageResolutionMode,
   ResolvedImplementationTarget,
 } from "./package-impl.ts";
 export type {

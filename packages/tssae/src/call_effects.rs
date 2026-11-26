@@ -666,7 +666,6 @@ struct EffectsEngine<'a> {
     checker: &'a mut CheckerHandle,
     instance_models: Vec<InstanceModelInput>,
     models: &'a [EffectsModelInput],
-    package_impl_cache: crate::package_impl::PackageImplCache,
     cleanup_index: Option<CleanupProjectIndex>,
     cleanup_index_enabled: bool,
 }
@@ -697,7 +696,6 @@ impl<'a> EffectsEngine<'a> {
         let cleanup_index_enabled =
             build_cleanup_index && (has_registration_models || has_slot_models);
         let instance_models = to_instance_models(models);
-        let package_impl_cache = snapshot.package_impl_cache.clone();
         Self {
             snapshot,
             project_id,
@@ -707,7 +705,6 @@ impl<'a> EffectsEngine<'a> {
             checker,
             instance_models,
             models,
-            package_impl_cache,
             cleanup_index: None,
             cleanup_index_enabled,
         }
@@ -740,7 +737,6 @@ impl<'a> EffectsEngine<'a> {
             lookup_files: self.lookup_files,
             call_graph: None,
             field_index: None,
-            package_impl_cache: self.package_impl_cache.clone(),
             models: &self.instance_models,
         };
         resolver.resolve_with_stack(expr, call_stack).origins
@@ -771,7 +767,6 @@ impl<'a> EffectsEngine<'a> {
             lookup_files: self.lookup_files,
             call_graph: None,
             field_index: None,
-            package_impl_cache: self.package_impl_cache.clone(),
             models: &self.instance_models,
         }
         .resolve_with_stack(expr, call_stack);

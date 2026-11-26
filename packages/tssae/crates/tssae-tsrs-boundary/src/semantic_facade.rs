@@ -245,8 +245,17 @@ impl<'a> SemanticFacade<'a> {
     }
 
     #[must_use]
+    pub const fn cwd(&self) -> &'a str {
+        self.cwd
+    }
+
+    #[must_use]
     pub const fn program(&self) -> &'static Program {
         self.program
+    }
+
+    pub(crate) const fn checker_mut(&mut self) -> &mut CheckerHandle {
+        self.checker
     }
 
     /// Returns `true` when `sf` belongs to the analyzed project rather than libs, external deps, or references.
@@ -919,10 +928,10 @@ impl SemanticModel for SemanticModelBridge<'_> {
     }
 }
 
-struct ResolvedDeclarationNodes {
-    primary_decl: Option<P<Node>>,
-    all_decls: Vec<P<Node>>,
-    symbol: Option<P<Symbol>>,
+pub(crate) struct ResolvedDeclarationNodes {
+    pub(crate) primary_decl: Option<P<Node>>,
+    pub(crate) all_decls: Vec<P<Node>>,
+    pub(crate) symbol: Option<P<Symbol>>,
 }
 
 fn is_error_or_unresolved_type(ty: P<Type>) -> bool {
@@ -994,7 +1003,7 @@ fn summarize_type(
     }
 }
 
-fn unwrap_aliased_symbol(checker: &mut CheckerHandle, mut sym: P<Symbol>) -> P<Symbol> {
+pub(crate) fn unwrap_aliased_symbol(checker: &mut CheckerHandle, mut sym: P<Symbol>) -> P<Symbol> {
     let mut seen = Vec::new();
     while sym.flags().intersects(SymbolFlags::Alias) && !seen.contains(&sym) {
         seen.push(sym);
@@ -1007,7 +1016,7 @@ fn unwrap_aliased_symbol(checker: &mut CheckerHandle, mut sym: P<Symbol>) -> P<S
     sym
 }
 
-fn is_unresolved_signature(checker: &mut CheckerHandle, sig: P<Signature>) -> bool {
+pub(crate) fn is_unresolved_signature(checker: &mut CheckerHandle, sig: P<Signature>) -> bool {
     if sig == checker.get_unknown_signature() {
         return true;
     }
@@ -1022,7 +1031,10 @@ fn is_unresolved_signature(checker: &mut CheckerHandle, sig: P<Signature>) -> bo
     false
 }
 
-fn resolve_symbol_for_node(checker: &mut CheckerHandle, node: P<Node>) -> ResolvedDeclarationNodes {
+pub(crate) fn resolve_symbol_for_node(
+    checker: &mut CheckerHandle,
+    node: P<Node>,
+) -> ResolvedDeclarationNodes {
     if matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
         let sig = checker.get_resolved_signature_exported(node);
         let sig_decl = if is_unresolved_signature(checker, sig) {

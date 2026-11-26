@@ -16,11 +16,10 @@ use crate::calls_values::{
     pick_preferred_impl_decl, prop_key_text, resolve_call_targets,
     resolve_property_in_object_literal, scoped_project_cache_key, unwrap_expr_wrappers,
 };
+use tssae_tsrs_boundary::{FacadeImplementationOutcome, is_first_party_source_file};
+
 use crate::cfg::{EvidenceItem, GapItem, resolve_enclosing_function};
-use crate::package_impl::{
-    PackageImplCache, PackageImplLookup, check_call_missing_package_gap,
-    resolve_impl_for_call_target,
-};
+use crate::package_impl::{check_call_missing_package_gap, resolve_first_party_for_call_target};
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{RpcErr, SnapshotState, SourceLocation, node_location};
 
@@ -763,7 +762,6 @@ pub struct InstanceResolver<'a> {
     pub lookup_files: Option<&'a [String]>,
     pub(crate) call_graph: Option<Arc<ProjectCallGraph>>,
     pub(crate) field_index: Option<Arc<FieldWriteIndex>>,
-    pub package_impl_cache: PackageImplCache,
     pub models: &'a [InstanceModelInput],
 }
 
@@ -1658,8 +1656,10 @@ impl InstanceResolver<'_> {
             for target in outcome.targets {
                 let has_source_body = target.fn_node.is_some_and(|fn_node| {
                     fn_node.body().is_some()
-                        && !get_source_file_of_node(fn_node)
-                            .is_some_and(|sf| sf.is_declaration_file())
+                        && get_source_file_of_node(fn_node).is_some_and(|sf| {
+                            !sf.is_declaration_file()
+                                && is_first_party_source_file(self.cwd, self.program, sf)
+                        })
                 });
                 let sub = if has_source_body {
                     let fn_node = target.fn_node.expect("checked has_source_body");
@@ -1673,18 +1673,22 @@ impl InstanceResolver<'_> {
                         active,
                     )
                 } else {
-                    match resolve_impl_for_call_target(
-                        &self.package_impl_cache,
+                    let workspace_programs = self.snapshot.workspace_programs();
+                    let sourcemap_cache = self.snapshot.sourcemap_cache.clone();
+                    match resolve_first_party_for_call_target(
                         self.cwd,
                         self.program,
                         self.checker,
-                        call_node,
+                        &workspace_programs,
+                        &sourcemap_cache,
                         Some(target.decl_node),
-                        target.fn_node,
+                        call_node,
                     ) {
-                        PackageImplLookup::ResolvedExternal { fn_node, .. }
-                        | PackageImplLookup::SourceBody { fn_node, .. } => self
-                            .enter_source_function(
+                        FacadeImplementationOutcome::Resolved(impl_target)
+                            if impl_target.fn_node.is_some() =>
+                        {
+                            let fn_node = impl_target.fn_node.expect("checked is_some");
+                            self.enter_source_function(
                                 call_node,
                                 fn_node,
                                 receiver_expr,
@@ -1692,7 +1696,8 @@ impl InstanceResolver<'_> {
                                 call_stack,
                                 depth,
                                 active,
-                            ),
+                            )
+                        }
                         lookup => self.resolve_external_or_unbodied_target_with_lookup(
                             call_node,
                             target.decl_node,
@@ -1909,17 +1914,19 @@ impl InstanceResolver<'_> {
         depth: usize,
         active: &mut Vec<VisitKey>,
     ) -> TraceOutcome {
-        let lookup = resolve_impl_for_call_target(
-            &self.package_impl_cache,
+        let workspace_programs = self.snapshot.workspace_programs();
+        let sourcemap_cache = self.snapshot.sourcemap_cache.clone();
+        let lookup = resolve_first_party_for_call_target(
             self.cwd,
             self.program,
             self.checker,
-            call_node,
+            &workspace_programs,
+            &sourcemap_cache,
             Some(decl),
-            None,
+            call_node,
         );
-        if let PackageImplLookup::ResolvedExternal { fn_node, .. }
-        | PackageImplLookup::SourceBody { fn_node, .. } = lookup
+        if let FacadeImplementationOutcome::Resolved(impl_target) = &lookup
+            && let Some(fn_node) = impl_target.fn_node
         {
             let receiver_expr = call_node
                 .expression()
@@ -1949,7 +1956,7 @@ impl InstanceResolver<'_> {
         &mut self,
         call_node: P<Node>,
         decl: P<Node>,
-        lookup: Option<&PackageImplLookup>,
+        lookup: Option<&FacadeImplementationOutcome>,
         call_stack: &[CallFrame],
         depth: usize,
         active: &mut Vec<VisitKey>,
@@ -1977,19 +1984,12 @@ impl InstanceResolver<'_> {
             ),
             ModelMatchOutcome::NoMatch => {
                 let (kind, message) = match lookup {
-                    Some(PackageImplLookup::MissingPackage { message, .. }) => {
-                        ("missing-package", message.clone())
+                    Some(FacadeImplementationOutcome::Inconclusive { gaps, .. })
+                        if !gaps.is_empty() =>
+                    {
+                        let gap = &gaps[0];
+                        (gap.kind, gap.message.clone())
                     }
-                    Some(PackageImplLookup::Ambiguous { message, .. }) => {
-                        ("ambiguous-package-implementation", message.clone())
-                    }
-                    Some(PackageImplLookup::DeclarationOnly { message, .. }) => (
-                        "missing-instance-model",
-                        format!(
-                            "{message} No matching project model is configured for '{}'.",
-                            meta.display_label
-                        ),
-                    ),
                     _ => {
                         let is_ext = is_external_declaration(self.program, decl);
                         if is_ext {
@@ -2876,7 +2876,6 @@ pub fn run_resolve_instances(
     }
 
     let cwd = snapshot.cwd.clone();
-    let package_impl_cache = snapshot.package_impl_cache.clone();
 
     let mut outcomes = Vec::with_capacity(target_nodes.len());
     {
@@ -2889,7 +2888,6 @@ pub fn run_resolve_instances(
             lookup_files,
             call_graph: None,
             field_index: None,
-            package_impl_cache,
             models,
         };
         for (target_id, node) in target_nodes {

@@ -1,0 +1,13 @@
+[package]
+name = "tssae-analysis"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tssae-common = { path = "../tssae-common" }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

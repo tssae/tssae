@@ -2,18 +2,21 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tsrs_ast::{
-    Kind, Node, SourceFile, Symbol, SymbolFlags, get_source_file_of_node,
-    is_function_like_declaration,
-};
-use tsrs_checker::{LiteralValue, Signature, Type, TypeDataTag, TypeFlags, TypeFormatFlags};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{
     P,
     context::{CheckerLifetime, Context, with_checker_lifetime},
 };
-use tsrs_scanner::{
-    get_ecma_line_and_utf16_character_of_position, get_ecma_line_starts, get_token_pos_of_node,
+pub use tssae_common::SourceLocation;
+use tssae_common::{GapItem, UnknownReason};
+use tssae_tsrs_boundary::{
+    FacadeCallProjection, FacadeCallSelect, FacadeDeclarationSelect, FacadeDeclarationTarget,
+    FacadeInstantiatedParameter, FacadeParameterIndexSelection, FacadeSignatureSelect,
+    FacadeTypeSelect, FacadeTypeSummary, FindSyntaxFilter, SemanticFacade, SourceRangeSpec,
+    SyntaxLookupOptions, SyntaxView,
+};
+pub use tssae_tsrs_boundary::{
+    node_location, safe_expression, safe_initializer, slice_source_text,
 };
 
 use crate::call_effects::{
@@ -21,10 +24,9 @@ use crate::call_effects::{
     run_instance_cleanup,
 };
 use crate::calls_values::{
-    CallTargetsRow, DeclarationCallersRow, ValuePropagationResultPayload, node_text, prop_key_text,
-    run_callees_of, run_callers_of, run_value_propagation, unwrap_expr_wrappers,
+    CallTargetsRow, DeclarationCallersRow, ValuePropagationResultPayload, run_callees_of,
+    run_callers_of, run_value_propagation,
 };
-use crate::cfg::GapItem;
 use crate::instance_identity::{
     InstanceModelInput, InstanceProjectionRow, InstanceResolutionRow, InstanceSelect,
     run_project_instances, run_resolve_instances,
@@ -32,7 +34,6 @@ use crate::instance_identity::{
 use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
 use crate::package_impl::{ImplementationResolutionRow, run_resolve_implementations};
-use crate::projects::{is_project_source_file, relative_to_cwd, resolve_against_cwd};
 use crate::serve::{
     BranchCoverageItem, FunctionBranchesItem, HandlePayload, RpcErr, SnapshotState,
     run_branch_coverage, run_list_branches,
@@ -49,6 +50,14 @@ enum ProjectedField<T> {
 impl<T> ProjectedField<T> {
     const fn is_omitted(&self) -> bool {
         matches!(self, Self::Omitted)
+    }
+
+    fn from_option(selected: bool, value: Option<T>) -> Self {
+        if selected {
+            Self::Value(value)
+        } else {
+            Self::Omitted
+        }
     }
 
     fn from_selected(selected: bool, build: impl FnOnce() -> Option<T>) -> Self {
@@ -370,12 +379,15 @@ enum ParameterIndexSelection {
 }
 
 impl ParameterIndexSelection {
-    fn requested_indices(&self, param_count: usize) -> Option<Vec<usize>> {
+    fn to_facade(&self) -> FacadeParameterIndexSelection {
         match self {
-            Self::All(false) => None,
-            Self::All(true) => Some((0..param_count).collect()),
-            Self::Indices(indices) => Some(indices.clone()),
+            Self::All(all) => FacadeParameterIndexSelection::All(*all),
+            Self::Indices(indices) => FacadeParameterIndexSelection::Indices(indices.clone()),
         }
+    }
+
+    fn requested_indices(&self, param_count: usize) -> Option<Vec<usize>> {
+        self.to_facade().requested_indices(param_count)
     }
 }
 
@@ -460,18 +472,6 @@ enum StepResult {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sub_queries: Vec<native_adapter::NativeSubQueryTrace>,
     },
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceLocation {
-    pub file: String,
-    pub line: u32,
-    pub column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
-    pub start: u32,
-    pub end: u32,
 }
 
 #[derive(Serialize)]
@@ -768,7 +768,7 @@ fn execute_step(
             observer,
         ),
         QueryStep::TypeAtLocation { targets } => execute_type_at_location_step(
-            snapshot, project_id, checker, &targets, step_start, observer,
+            snapshot, project_id, program, checker, &targets, step_start, observer,
         ),
         other @ (QueryStep::ResolveDeclarations { .. }
         | QueryStep::ResolveCalls { .. }
@@ -1007,6 +1007,7 @@ fn execute_projection_step(
             let items = run_resolve_calls(
                 snapshot,
                 project_id,
+                program,
                 checker,
                 &targets,
                 &select.unwrap_or_default(),
@@ -1015,22 +1016,25 @@ fn execute_projection_step(
             Ok(StepResult::ResolveCalls { items })
         }
         QueryStep::ProjectCalls { targets, select } => {
-            let items = run_project_calls(snapshot, project_id, checker, &targets, &select)?;
+            let items =
+                run_project_calls(snapshot, project_id, program, checker, &targets, &select)?;
             observer.record_step("projectCalls", step_start, items.len(), Vec::new());
             Ok(StepResult::ProjectCalls { items })
         }
         QueryStep::ProjectSignatures { targets, select } => {
-            let items = run_project_signatures(snapshot, project_id, checker, &targets, &select)?;
+            let items =
+                run_project_signatures(snapshot, project_id, program, checker, &targets, &select)?;
             observer.record_step("projectSignatures", step_start, items.len(), Vec::new());
             Ok(StepResult::ProjectSignatures { items })
         }
         QueryStep::ProjectTypes { targets, select } => {
-            let items = run_project_types(snapshot, project_id, checker, &targets, &select)?;
+            let items =
+                run_project_types(snapshot, project_id, program, checker, &targets, &select)?;
             observer.record_step("projectTypes", step_start, items.len(), Vec::new());
             Ok(StepResult::ProjectTypes { items })
         }
         QueryStep::IsAssignableTo { pairs } => {
-            let items = run_is_assignable_to(snapshot, project_id, checker, &pairs)?;
+            let items = run_is_assignable_to(snapshot, project_id, program, checker, &pairs)?;
             observer.record_step("isAssignableTo", step_start, items.len(), Vec::new());
             Ok(StepResult::IsAssignableTo { items })
         }
@@ -1165,12 +1169,13 @@ fn execute_find_syntax_step(
 fn execute_type_at_location_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
 ) -> Result<StepResult, RpcErr> {
-    let items = run_type_at_location(snapshot, project_id, checker, targets)?;
+    let items = run_type_at_location(snapshot, project_id, program, checker, targets)?;
     let raw_details = if observer.is_detail() {
         items
             .iter()
@@ -1253,97 +1258,6 @@ fn execute_branch_coverage_step(
     Ok(StepResult::BranchCoverage { items })
 }
 
-#[derive(Clone, Copy)]
-enum RangeMatchMode {
-    Within,
-    Intersects,
-}
-
-#[derive(Clone, Copy)]
-struct ResolvedByteRange {
-    start: u32,
-    end: u32,
-    mode: RangeMatchMode,
-}
-
-fn line_col_to_byte_offset(sf: P<SourceFile>, line1: u32, col1: Option<u32>, is_end: bool) -> u32 {
-    let text = sf.text();
-    let text_len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-    let line_starts = get_ecma_line_starts(sf.get());
-    let line0 = usize::try_from(line1.saturating_sub(1)).unwrap_or(0);
-    if line0 >= line_starts.len() {
-        return text_len;
-    }
-
-    let line_start = line_starts[line0];
-    let next_line_start = line_starts.get(line0 + 1).copied().unwrap_or(text_len);
-
-    if is_end && col1.is_none() {
-        return next_line_start;
-    }
-
-    let target_utf16_col = col1.unwrap_or(1).saturating_sub(1);
-    let start_idx = usize::try_from(line_start).unwrap_or(0);
-    let end_idx = usize::try_from(next_line_start)
-        .unwrap_or(text.len())
-        .min(text.len());
-    let line_slice = text.get(start_idx..end_idx).unwrap_or("");
-
-    let mut utf16_acc = 0u32;
-    for (byte_rel, ch) in line_slice.char_indices() {
-        if utf16_acc >= target_utf16_col {
-            return line_start + u32::try_from(byte_rel).unwrap_or(0);
-        }
-        utf16_acc += u32::try_from(ch.len_utf16()).unwrap_or(1);
-    }
-
-    next_line_start
-}
-
-fn resolve_byte_range(
-    sf: P<SourceFile>,
-    filter: &SourceRangeFilter,
-) -> Result<ResolvedByteRange, RpcErr> {
-    let text_len = u32::try_from(sf.text().len()).unwrap_or(u32::MAX);
-    let start = filter.start.map_or_else(
-        || {
-            filter.start_line.map_or(0, |line1| {
-                line_col_to_byte_offset(sf, line1, filter.start_column, false)
-            })
-        },
-        |offset| offset.min(text_len),
-    );
-
-    let end = filter.end.map_or_else(
-        || {
-            filter.end_line.map_or(text_len, |line1| {
-                line_col_to_byte_offset(sf, line1, filter.end_column, true)
-            })
-        },
-        |offset| offset.min(text_len),
-    );
-
-    if start > end {
-        return Err(RpcErr::new(
-            "INVALID_PARAMS",
-            format!("Invalid source range: start ({start}) exceeds end ({end})."),
-        ));
-    }
-
-    let mode = match filter.match_mode.as_deref() {
-        None | Some("within") => RangeMatchMode::Within,
-        Some("intersects") => RangeMatchMode::Intersects,
-        Some(other) => {
-            return Err(RpcErr::new(
-                "INVALID_PARAMS",
-                format!("Unsupported range match mode: {other}"),
-            ));
-        }
-    };
-
-    Ok(ResolvedByteRange { start, end, mode })
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Query filtering extends the existing find-syntax parameters without changing the RPC shape."
@@ -1358,438 +1272,82 @@ fn run_find_syntax(
     text_includes: Option<&[String]>,
     callee_names: Option<&[String]>,
 ) -> Result<Vec<SyntaxItem>, RpcErr> {
-    let kinds_slice = kinds.unwrap_or(&[]);
-    if kinds_slice.is_empty() && range.is_none() {
-        return Err(RpcErr::new(
-            "INVALID_PARAMS",
-            "findSyntax requires at least one syntax kind or a source range.".to_string(),
-        ));
-    }
-
-    let mut target_kinds = Vec::with_capacity(kinds_slice.len());
-    for kind_name in kinds_slice {
-        let Some(kind) = parse_syntax_kind(kind_name) else {
-            return Err(RpcErr::new(
-                "INVALID_PARAMS",
-                format!("Unsupported syntax kind: {kind_name}"),
-            ));
-        };
-        target_kinds.push((kind, kind_name.as_str()));
-    }
-
-    let text_filter = syntax_needles(text_includes);
-    let callee_filter = syntax_needles(callee_names);
-    if (text_includes.is_some() && text_filter.is_empty())
-        || (callee_names.is_some() && callee_filter.is_empty())
-    {
-        return Ok(Vec::new());
-    }
-
-    let range_file =
-        range.map(|r| relative_to_cwd(&snapshot.cwd, &resolve_against_cwd(&snapshot.cwd, &r.file)));
-
-    let file_filter: Option<Vec<String>> = files.map(|list| {
-        list.iter()
-            .map(|f| relative_to_cwd(&snapshot.cwd, &resolve_against_cwd(&snapshot.cwd, f)))
-            .collect()
+    let syntax_view = SyntaxView::new(&snapshot.cwd);
+    let range_spec = range.map(|r| SourceRangeSpec {
+        file: &r.file,
+        start_line: r.start_line,
+        start_column: r.start_column,
+        end_line: r.end_line,
+        end_column: r.end_column,
+        start: r.start,
+        end: r.end,
+        match_mode: r.match_mode.as_deref(),
     });
+    let matches = syntax_view
+        .find_syntax(
+            program,
+            &FindSyntaxFilter {
+                files,
+                kinds,
+                range: range_spec,
+                text_includes,
+                callee_names,
+            },
+        )
+        .map_err(|err| RpcErr::new(err.code, err.message))?;
 
-    let explicit_file_targeted = range.is_some() || file_filter.is_some();
-    let mut source_files: Vec<(String, P<SourceFile>)> = program
-        .get_source_files()
-        .iter()
-        .copied()
-        .filter(|&sf| {
-            if explicit_file_targeted {
-                !program.is_source_file_default_library(sf.path())
-            } else {
-                is_project_source_file(program, sf)
-            }
-        })
-        .filter_map(|sf| {
-            if !text_filter.is_empty() {
-                let sf_text = sf.text();
-                if !text_filter.iter().any(|needle| sf_text.contains(needle)) {
-                    return None;
-                }
-            }
-            if !callee_filter.is_empty() {
-                let sf_text = sf.text();
-                if !callee_filter.iter().any(|name| sf_text.contains(name)) {
-                    return None;
-                }
-            }
-            let rel = relative_to_cwd(&snapshot.cwd, sf.file_name());
-            if let Some(target_file) = &range_file
-                && target_file != &rel
-            {
-                return None;
-            }
-            if let Some(filter) = &file_filter
-                && !filter.iter().any(|item| item == &rel)
-            {
-                return None;
-            }
-            Some((rel, sf))
-        })
-        .collect();
-    source_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut items = Vec::new();
-    for (rel_file, sf) in source_files {
-        let byte_range = match range {
-            Some(filter) => Some(resolve_byte_range(sf, filter)?),
-            None => None,
-        };
-        collect_matching_nodes(
-            snapshot,
-            project_id,
-            sf,
-            &rel_file,
-            sf.as_node(),
-            &target_kinds,
-            byte_range,
-            &text_filter,
-            &callee_filter,
-            &mut items,
-        );
+    let mut items = Vec::with_capacity(matches.len());
+    for matched in matches {
+        let node_ref = snapshot.alloc_syntax(project_id, matched.node);
+        let expression = matched
+            .children
+            .expression
+            .map(|expr| snapshot.alloc_syntax(project_id, expr));
+        let arguments = matched.children.arguments.map(|args| {
+            args.into_iter()
+                .map(|arg| snapshot.alloc_syntax(project_id, arg))
+                .collect()
+        });
+        let name = matched
+            .children
+            .name
+            .map(|name_node| snapshot.alloc_syntax(project_id, name_node));
+        let initializer = matched
+            .children
+            .initializer
+            .map(|init_node| snapshot.alloc_syntax(project_id, init_node));
+        let body = matched
+            .children
+            .body
+            .map(|body_node| snapshot.alloc_syntax(project_id, body_node));
+        let parameters = matched.children.parameters.map(|params| {
+            params
+                .into_iter()
+                .map(|param| snapshot.alloc_syntax(project_id, param))
+                .collect()
+        });
+        items.push(SyntaxItem {
+            node_ref,
+            kind: matched.kind,
+            text: matched.text,
+            location: matched.location,
+            expression,
+            arguments,
+            name,
+            initializer,
+            body,
+            parameters,
+        });
     }
     Ok(items)
 }
 
-fn syntax_needles(values: Option<&[String]>) -> Vec<&str> {
-    values
-        .unwrap_or(&[])
-        .iter()
-        .map(String::as_str)
-        .filter(|needle| !needle.is_empty())
-        .collect()
-}
-
-fn call_callee_name(node: P<Node>) -> Option<String> {
-    if !matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
-        return None;
-    }
-    let expr = unwrap_expr_wrappers(node.expression()?);
-    match expr.kind() {
-        Kind::Identifier => node_text(expr),
-        Kind::PropertyAccessExpression => node_text(expr.as_property_access_expression().name()),
-        Kind::ElementAccessExpression => {
-            let arg =
-                unwrap_expr_wrappers(expr.as_element_access_expression().argument_expression());
-            matches!(
-                arg.kind(),
-                Kind::StringLiteral | Kind::NoSubstitutionTemplateLiteral
-            )
-            .then(|| prop_key_text(arg))
-            .flatten()
-        }
-        _ => None,
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "AST range collector passes immutable filter context alongside mutable output."
-)]
-fn collect_matching_nodes(
+fn alloc_type_summary_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    sf: P<SourceFile>,
-    rel_file: &str,
-    node: P<Node>,
-    target_kinds: &[(Kind, &str)],
-    range: Option<ResolvedByteRange>,
-    text_filter: &[&str],
-    callee_filter: &[&str],
-    out: &mut Vec<SyntaxItem>,
-) {
-    let full_start = node.pos().source_offset().unwrap_or(0);
-    let full_end = node.end().source_offset().unwrap_or(full_start);
-    if let Some(r) = range
-        && (full_end < r.start || full_start > r.end)
-    {
-        return;
-    }
-    if !text_filter.is_empty() || !callee_filter.is_empty() {
-        let start_idx = usize::try_from(full_start).unwrap_or(0);
-        let end_idx = usize::try_from(full_end).unwrap_or(start_idx);
-        if let Some(sub) = sf.text().get(start_idx..end_idx) {
-            if !text_filter.is_empty() && !text_filter.iter().any(|needle| sub.contains(needle)) {
-                return;
-            }
-            if !callee_filter.is_empty() && !callee_filter.iter().any(|name| sub.contains(name)) {
-                return;
-            }
-        }
-    }
-
-    let kind_label_opt = if target_kinds.is_empty() {
-        (node.kind() != Kind::SourceFile).then(|| format!("{:?}", node.kind()))
-    } else {
-        target_kinds
-            .iter()
-            .find(|(k, _)| *k == node.kind())
-            .map(|(_, label)| (*label).to_string())
-    };
-
-    if let Some(kind_label) = kind_label_opt {
-        let matches_text = text_filter.is_empty() || {
-            let tok_start = get_token_pos_of_node(node, sf, false);
-            let tok_end = full_end.max(tok_start);
-            let s_idx = usize::try_from(tok_start).unwrap_or(0);
-            let e_idx = usize::try_from(tok_end).unwrap_or(s_idx);
-            sf.text()
-                .get(s_idx..e_idx)
-                .is_some_and(|slice| text_filter.iter().any(|needle| slice.contains(needle)))
-        };
-        let matches_callee = callee_filter.is_empty()
-            || call_callee_name(node).is_some_and(|name| callee_filter.contains(&name.as_str()));
-        if matches_text && matches_callee {
-            let location = node_location(sf, rel_file, node);
-            let matches_range = match range {
-                None => true,
-                Some(r) => match r.mode {
-                    RangeMatchMode::Within => location.start >= r.start && location.end <= r.end,
-                    RangeMatchMode::Intersects => location.end > r.start && location.start < r.end,
-                },
-            };
-            if matches_range {
-                out.push(build_syntax_item(
-                    snapshot, project_id, sf, node, kind_label, location,
-                ));
-            }
-        }
-    }
-
-    node.for_each_child(&mut |child| {
-        collect_matching_nodes(
-            snapshot,
-            project_id,
-            sf,
-            rel_file,
-            child,
-            target_kinds,
-            range,
-            text_filter,
-            callee_filter,
-            out,
-        );
-        false
-    });
-}
-
-pub fn safe_expression(node: P<Node>) -> Option<P<Node>> {
-    match node.kind() {
-        Kind::PropertyAccessExpression
-        | Kind::ElementAccessExpression
-        | Kind::ParenthesizedExpression
-        | Kind::CallExpression
-        | Kind::NewExpression
-        | Kind::ExpressionWithTypeArguments
-        | Kind::ComputedPropertyName
-        | Kind::NonNullExpression
-        | Kind::TypeAssertionExpression
-        | Kind::AsExpression
-        | Kind::SatisfiesExpression
-        | Kind::TypeOfExpression
-        | Kind::SpreadAssignment
-        | Kind::SpreadElement
-        | Kind::TemplateSpan
-        | Kind::DeleteExpression
-        | Kind::VoidExpression
-        | Kind::AwaitExpression
-        | Kind::YieldExpression
-        | Kind::IfStatement
-        | Kind::DoStatement
-        | Kind::WhileStatement
-        | Kind::WithStatement
-        | Kind::ForInStatement
-        | Kind::ForOfStatement
-        | Kind::SwitchStatement
-        | Kind::CaseClause
-        | Kind::ExpressionStatement
-        | Kind::ReturnStatement
-        | Kind::ThrowStatement
-        | Kind::ExportAssignment
-        | Kind::Decorator
-        | Kind::JsxExpression
-        | Kind::JsxSpreadAttribute => node.expression(),
-        _ => None,
-    }
-}
-
-pub fn safe_initializer(node: P<Node>) -> Option<P<Node>> {
-    match node.kind() {
-        Kind::VariableDeclaration
-        | Kind::Parameter
-        | Kind::BindingElement
-        | Kind::PropertyDeclaration
-        | Kind::PropertySignature
-        | Kind::PropertyAssignment
-        | Kind::EnumMember
-        | Kind::ForStatement
-        | Kind::ForInStatement
-        | Kind::ForOfStatement
-        | Kind::JsxAttribute => node.initializer(),
-        _ => None,
-    }
-}
-
-fn safe_arguments(node: P<Node>) -> Option<&'static [P<Node>]> {
-    matches!(node.kind(), Kind::CallExpression | Kind::NewExpression).then(|| node.arguments())
-}
-
-fn safe_parameters(node: P<Node>) -> Option<&'static [P<Node>]> {
-    (is_function_like_declaration(Some(node)) || node.function_like_data().is_some())
-        .then(|| node.parameters())
-}
-
-fn build_syntax_item(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    sf: P<SourceFile>,
-    node: P<Node>,
-    kind_label: String,
-    location: SourceLocation,
-) -> SyntaxItem {
-    let text = slice_source_text(sf, location.start, location.end);
-    let node_ref = snapshot.alloc_syntax(project_id, node);
-
-    let expression = safe_expression(node).map(|expr| snapshot.alloc_syntax(project_id, expr));
-
-    let arguments = safe_arguments(node).map(|args| {
-        args.iter()
-            .map(|&arg| snapshot.alloc_syntax(project_id, arg))
-            .collect()
-    });
-
-    let name = node
-        .name()
-        .map(|name_node| snapshot.alloc_syntax(project_id, name_node));
-
-    let initializer =
-        safe_initializer(node).map(|init_node| snapshot.alloc_syntax(project_id, init_node));
-
-    let body = node
-        .body()
-        .map(|body_node| snapshot.alloc_syntax(project_id, body_node));
-
-    let parameters = safe_parameters(node).map(|params| {
-        params
-            .iter()
-            .map(|&param| snapshot.alloc_syntax(project_id, param))
-            .collect()
-    });
-
-    SyntaxItem {
-        node_ref,
-        kind: kind_label,
-        text,
-        location,
-        expression,
-        arguments,
-        name,
-        initializer,
-        body,
-        parameters,
-    }
-}
-
-fn is_error_or_unresolved_type(ty: P<Type>) -> bool {
-    if ty.data_tag() == TypeDataTag::Intrinsic {
-        let name = ty.as_intrinsic_type().intrinsic_name();
-        return matches!(name, "error" | "unresolved");
-    }
-    ty.flags().intersects(TypeFlags::Any) && ty.alias().is_some()
-}
-
-struct ComputedTypeSummary {
-    ty: P<Type>,
-    type_text: String,
-    is_union: bool,
-    is_intersection: bool,
-    is_literal: bool,
-    literal_value: Option<Value>,
-    union_members: Option<Vec<String>>,
-}
-
-fn summarize_type(
-    checker: &mut CheckerHandle,
-    ty: P<Type>,
-    enclosing: Option<P<Node>>,
-) -> ComputedTypeSummary {
-    let type_text = checker.type_to_string_ex_exported(ty, enclosing, TypeFormatFlags::None, None);
-    let is_union = ty.is_union();
-    let is_intersection = ty.is_intersection();
-    let is_boolean_literal = ty.flags().contains(TypeFlags::BooleanLiteral);
-    let is_literal = ty.is_string_literal() || ty.is_number_literal() || is_boolean_literal;
-
-    let literal_value = if ty.is_string_literal() || ty.is_number_literal() {
-        ty.as_literal_type().value().and_then(|val| match val {
-            LiteralValue::String(s) => Some(Value::String(s.to_string())),
-            LiteralValue::Number(num) => serde_json::Number::from_f64(num.0).map(Value::Number),
-            LiteralValue::Boolean(b) => Some(Value::Bool(b)),
-            LiteralValue::BigInt(_) => None,
-        })
-    } else if is_boolean_literal {
-        match type_text.as_str() {
-            "true" => Some(Value::Bool(true)),
-            "false" => Some(Value::Bool(false)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    let union_members = if is_union {
-        Some(
-            ty.types()
-                .iter()
-                .map(|&member| {
-                    checker.type_to_string_ex_exported(
-                        member,
-                        enclosing,
-                        TypeFormatFlags::None,
-                        None,
-                    )
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
-
-    ComputedTypeSummary {
-        ty,
-        type_text,
-        is_union,
-        is_intersection,
-        is_literal,
-        literal_value,
-        union_members,
-    }
-}
-
-fn alloc_type_summary(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    summary: ComputedTypeSummary,
-    enclosing: Option<P<Node>>,
-    gap_at: Option<&SourceLocation>,
-    gaps: &mut Vec<GapItem>,
+    summary: FacadeTypeSummary,
 ) -> TypeSummaryPayload {
-    if is_error_or_unresolved_type(summary.ty) {
-        gaps.push(GapItem {
-            kind: "unresolved-type",
-            message: format!(
-                "Type resolved to an error or unresolved type ({}).",
-                summary.type_text
-            ),
-            at: gap_at.cloned(),
-        });
-    }
-    let type_ref = snapshot.alloc_type(project_id, summary.ty, enclosing);
+    let type_ref = snapshot.alloc_type(project_id, summary.ty, summary.enclosing);
     TypeSummaryPayload {
         type_ref,
         type_text: summary.type_text,
@@ -1801,9 +1359,45 @@ fn alloc_type_summary(
     }
 }
 
+fn alloc_type_summary_with_gap(
+    snapshot: &mut SnapshotState,
+    project_id: &str,
+    summary: FacadeTypeSummary,
+    gaps: &mut Vec<GapItem>,
+) -> TypeSummaryPayload {
+    if summary.is_unresolved {
+        gaps.push(GapItem::from_reason(
+            UnknownReason::UnresolvedType,
+            format!(
+                "Type resolved to an error or unresolved type ({}).",
+                summary.type_text
+            ),
+            summary.gap_at.clone(),
+        ));
+    }
+    alloc_type_summary_payload(snapshot, project_id, summary)
+}
+
+fn alloc_instantiated_params(
+    snapshot: &mut SnapshotState,
+    project_id: &str,
+    params: Vec<FacadeInstantiatedParameter>,
+) -> Vec<InstantiatedParameterPayload> {
+    params
+        .into_iter()
+        .map(|param| InstantiatedParameterPayload {
+            index: param.index,
+            parameter_name: param.parameter_name,
+            is_rest: param.is_rest,
+            type_summary: alloc_type_summary_payload(snapshot, project_id, param.type_summary),
+        })
+        .collect()
+}
+
 fn run_type_at_location(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
 ) -> Result<Vec<TypeItem>, RpcErr> {
@@ -1813,21 +1407,17 @@ fn run_type_at_location(
         nodes.push((handle_id.clone(), node));
     }
 
-    let mut items = Vec::with_capacity(nodes.len());
-    for (target_id, node) in nodes {
-        let ty = checker.get_type_at_location(node);
-        let enclosing = node.parent().or(Some(node));
-        let summary = summarize_type(checker, ty, enclosing);
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let summaries: Vec<_> = nodes
+        .into_iter()
+        .map(|(target_id, node)| (target_id, facade.type_at_location(node)))
+        .collect();
+
+    let mut items = Vec::with_capacity(summaries.len());
+    for (target_id, summary) in summaries {
         let mut gaps = Vec::new();
-        let node_loc = node_location_relative(&snapshot.cwd, node);
-        let payload = alloc_type_summary(
-            snapshot,
-            project_id,
-            summary,
-            enclosing,
-            node_loc.as_ref(),
-            &mut gaps,
-        );
+        let payload = alloc_type_summary_with_gap(snapshot, project_id, summary, &mut gaps);
         items.push(TypeItem {
             target: target_id,
             type_ref: payload.type_ref,
@@ -1844,151 +1434,6 @@ fn run_type_at_location(
     Ok(items)
 }
 
-fn unwrap_aliased_symbol(checker: &mut CheckerHandle, mut sym: P<Symbol>) -> P<Symbol> {
-    let mut seen = Vec::new();
-    while sym.flags().intersects(SymbolFlags::Alias) && !seen.contains(&sym) {
-        seen.push(sym);
-        let next = checker.get_aliased_symbol(sym);
-        if next == sym || next == checker.get_unknown_symbol() {
-            break;
-        }
-        sym = next;
-    }
-    sym
-}
-
-struct ResolvedDeclarationTarget {
-    primary_decl: Option<P<Node>>,
-    all_decls: Vec<P<Node>>,
-    symbol: Option<P<Symbol>>,
-}
-
-fn is_unresolved_signature(checker: &mut CheckerHandle, sig: P<Signature>) -> bool {
-    if sig == checker.get_unknown_signature() {
-        return true;
-    }
-    if sig.declaration().is_none()
-        && sig.target().is_none()
-        && sig.parameters().is_empty()
-        && !sig.has_rest_parameter()
-    {
-        let ret = checker.get_return_type_of_signature_exported(sig);
-        return ret == checker.get_any_type() || is_error_or_unresolved_type(ret);
-    }
-    false
-}
-
-fn resolve_symbol_for_node(
-    checker: &mut CheckerHandle,
-    node: P<Node>,
-) -> ResolvedDeclarationTarget {
-    if matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
-        let sig = checker.get_resolved_signature_exported(node);
-        let sig_decl = if is_unresolved_signature(checker, sig) {
-            None
-        } else {
-            sig.declaration()
-                .or_else(|| sig.target().and_then(|t| t.declaration()))
-        };
-
-        let callee_sym = node
-            .expression()
-            .and_then(|expr| checker.get_symbol_at_location_exported(expr))
-            .map(|s| unwrap_aliased_symbol(checker, s))
-            .filter(|&s| s != checker.get_unknown_symbol());
-
-        let all_decls = callee_sym.map_or_default(|s| s.declarations().to_vec());
-        let primary_decl = sig_decl.or_else(|| {
-            callee_sym.and_then(|s| {
-                s.value_declaration()
-                    .or_else(|| s.declarations().first().copied())
-            })
-        });
-
-        return ResolvedDeclarationTarget {
-            primary_decl,
-            all_decls,
-            symbol: callee_sym,
-        };
-    }
-
-    let raw_sym = if node.kind() == Kind::ShorthandPropertyAssignment {
-        checker
-            .get_shorthand_assignment_value_symbol(Some(node))
-            .or_else(|| checker.get_symbol_at_location_exported(node))
-    } else if let Some(parent) = node.parent()
-        && parent.kind() == Kind::ShorthandPropertyAssignment
-    {
-        checker
-            .get_shorthand_assignment_value_symbol(Some(parent))
-            .or_else(|| checker.get_symbol_at_location_exported(node))
-    } else {
-        checker.get_symbol_at_location_exported(node).or_else(|| {
-            node.name()
-                .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
-        })
-    };
-
-    let sym = raw_sym
-        .map(|s| unwrap_aliased_symbol(checker, s))
-        .filter(|&s| s != checker.get_unknown_symbol());
-
-    if let Some(resolved_sym) = sym {
-        let all_decls = resolved_sym.declarations().to_vec();
-        let primary_decl = resolved_sym
-            .value_declaration()
-            .or_else(|| all_decls.first().copied());
-        return ResolvedDeclarationTarget {
-            primary_decl,
-            all_decls,
-            symbol: Some(resolved_sym),
-        };
-    }
-
-    if is_declaration_node(node) {
-        return ResolvedDeclarationTarget {
-            primary_decl: Some(node),
-            all_decls: vec![node],
-            symbol: node.symbol(),
-        };
-    }
-
-    ResolvedDeclarationTarget {
-        primary_decl: None,
-        all_decls: Vec::new(),
-        symbol: None,
-    }
-}
-
-fn is_declaration_node(node: P<Node>) -> bool {
-    matches!(
-        node.kind(),
-        Kind::FunctionDeclaration
-            | Kind::VariableDeclaration
-            | Kind::Parameter
-            | Kind::MethodDeclaration
-            | Kind::MethodSignature
-            | Kind::ClassDeclaration
-            | Kind::InterfaceDeclaration
-            | Kind::TypeAliasDeclaration
-            | Kind::EnumDeclaration
-            | Kind::PropertyDeclaration
-            | Kind::PropertySignature
-            | Kind::PropertyAssignment
-            | Kind::ShorthandPropertyAssignment
-            | Kind::GetAccessor
-            | Kind::SetAccessor
-            | Kind::Constructor
-    )
-}
-
-#[derive(Clone, Copy)]
-enum TargetInput {
-    Node(P<Node>),
-    Signature(P<Signature>, Option<P<Node>>),
-    Declaration(P<Node>, Option<P<Symbol>>),
-}
-
 fn run_resolve_declarations(
     snapshot: &mut SnapshotState,
     project_id: &str,
@@ -2001,9 +1446,15 @@ fn run_resolve_declarations(
     for handle_id in targets {
         let entry = snapshot.get_entry(project_id, handle_id)?;
         let target_payload = match entry.payload {
-            HandlePayload::Syntax(node) | HandlePayload::Call(node) => TargetInput::Node(node),
-            HandlePayload::Signature { sig, call_node } => TargetInput::Signature(sig, call_node),
-            HandlePayload::Declaration { node, symbol } => TargetInput::Declaration(node, symbol),
+            HandlePayload::Syntax(node) | HandlePayload::Call(node) => {
+                FacadeDeclarationTarget::Node(node)
+            }
+            HandlePayload::Signature { sig, call_node } => {
+                FacadeDeclarationTarget::Signature(sig, call_node)
+            }
+            HandlePayload::Declaration { node, symbol } => {
+                FacadeDeclarationTarget::Declaration(node, symbol)
+            }
             HandlePayload::Type { .. } => {
                 return Err(RpcErr::new(
                     "INVALID_REFERENCE_KIND",
@@ -2022,188 +1473,92 @@ fn run_resolve_declarations(
         resolved_inputs.push((handle_id.clone(), target_payload));
     }
 
-    let mut items = Vec::with_capacity(resolved_inputs.len());
-    for (target_id, target_input) in resolved_inputs {
-        items.push(evaluate_declaration_row(
-            snapshot,
-            project_id,
-            program,
-            checker,
-            target_id,
-            target_input,
-            select,
-        ));
+    let facade_select = FacadeDeclarationSelect {
+        name: select.name,
+        container_name: select.container_name,
+        kind: select.kind,
+        location: select.location,
+        is_external: select.is_external,
+        declarations: select.declarations,
+    };
+
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let resolutions: Vec<_> = resolved_inputs
+        .into_iter()
+        .map(|(target_id, target_input)| {
+            (
+                target_id,
+                facade.resolve_declaration(target_input, &facade_select),
+            )
+        })
+        .collect();
+
+    let mut items = Vec::with_capacity(resolutions.len());
+    for (target_id, resolved) in resolutions {
+        let mut gaps = Vec::new();
+        let declaration = if let Some(decl_node) = resolved.primary_decl {
+            Some(snapshot.alloc_declaration(project_id, decl_node, resolved.symbol))
+        } else {
+            gaps.push(GapItem::from_reason(
+                UnknownReason::UnresolvedDeclaration,
+                "Could not resolve target to a declaration.".to_string(),
+                resolved.target_loc,
+            ));
+            None
+        };
+
+        let syntax = ProjectedField::from_selected(select.syntax, || {
+            resolved
+                .primary_decl
+                .map(|decl| snapshot.alloc_syntax(project_id, decl))
+        });
+
+        let declarations = select.declarations.then(|| {
+            resolved
+                .all_decls
+                .iter()
+                .map(|&decl| snapshot.alloc_declaration(project_id, decl, resolved.symbol))
+                .collect()
+        });
+
+        items.push(DeclarationRow {
+            target: target_id,
+            declaration,
+            gaps,
+            name: ProjectedField::from_option(select.name, resolved.name),
+            container_name: ProjectedField::from_option(
+                select.container_name,
+                resolved.container_name,
+            ),
+            kind: ProjectedField::from_option(select.kind, resolved.kind),
+            location: ProjectedField::from_option(select.location, resolved.location),
+            syntax,
+            is_external: resolved.is_external,
+            declarations,
+        });
     }
     Ok(items)
 }
 
-fn resolve_target_input(
-    cwd: &str,
-    checker: &mut CheckerHandle,
-    target_input: TargetInput,
-) -> (ResolvedDeclarationTarget, Option<SourceLocation>) {
-    match target_input {
-        TargetInput::Node(node) => {
-            let loc = node_location_relative(cwd, node);
-            (resolve_symbol_for_node(checker, node), loc)
-        }
-        TargetInput::Signature(sig, call_node) => {
-            let loc = call_node.and_then(|n| node_location_relative(cwd, n));
-            let decl = if is_unresolved_signature(checker, sig) {
-                None
-            } else {
-                sig.declaration()
-                    .or_else(|| sig.target().and_then(|t| t.declaration()))
-            };
-            let all_decls = decl.into_iter().collect();
-            let sym = decl.and_then(|d| {
-                d.symbol().or_else(|| {
-                    d.name()
-                        .and_then(|n| checker.get_symbol_at_location_exported(n))
-                })
-            });
-            (
-                ResolvedDeclarationTarget {
-                    primary_decl: decl,
-                    all_decls,
-                    symbol: sym,
-                },
-                loc,
-            )
-        }
-        TargetInput::Declaration(node, symbol) => {
-            let loc = node_location_relative(cwd, node);
-            let all_decls = symbol
-                .map(|s| s.declarations().to_vec())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| vec![node]);
-            (
-                ResolvedDeclarationTarget {
-                    primary_decl: Some(node),
-                    all_decls,
-                    symbol,
-                },
-                loc,
-            )
+impl CallSelect {
+    fn to_facade(&self) -> FacadeCallSelect {
+        FacadeCallSelect {
+            location: self.location,
+            callee: self.callee,
+            callee_declaration: self.callee_declaration,
+            signature: self.signature,
+            arguments: self.arguments,
+            instantiated_parameter_types: self
+                .instantiated_parameter_types
+                .as_ref()
+                .map(ParameterIndexSelection::to_facade),
+            return_type: self.return_type,
         }
     }
 }
 
-fn resolve_declaration_container_name(decl: P<Node>) -> Option<String> {
-    let mut current = decl.parent();
-    while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            Kind::ClassDeclaration
-                | Kind::ClassExpression
-                | Kind::InterfaceDeclaration
-                | Kind::ModuleDeclaration
-                | Kind::TypeAliasDeclaration
-                | Kind::EnumDeclaration
-                | Kind::VariableDeclaration
-        ) && let Some(name_node) = parent.name()
-            && let Some(source_file) = get_source_file_of_node(name_node)
-        {
-            let location = node_location(source_file, "", name_node);
-            let name = slice_source_text(source_file, location.start, location.end);
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn evaluate_declaration_row(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    target_id: String,
-    target_input: TargetInput,
-    select: &DeclarationSelect,
-) -> DeclarationRow {
-    let (resolved, target_loc) = resolve_target_input(&snapshot.cwd, checker, target_input);
-
-    let mut gaps = Vec::new();
-    let declaration = if let Some(decl_node) = resolved.primary_decl {
-        Some(snapshot.alloc_declaration(project_id, decl_node, resolved.symbol))
-    } else {
-        gaps.push(GapItem {
-            kind: "unresolved-declaration",
-            message: "Could not resolve target to a declaration.".to_string(),
-            at: target_loc,
-        });
-        None
-    };
-
-    let name = ProjectedField::from_selected(select.name, || {
-        resolved.symbol.map(|s| s.name().to_string()).or_else(|| {
-            resolved.primary_decl.and_then(|decl| {
-                decl.name().and_then(|name_node| {
-                    get_source_file_of_node(name_node).map(|sf| {
-                        let loc = node_location(sf, "", name_node);
-                        slice_source_text(sf, loc.start, loc.end)
-                    })
-                })
-            })
-        })
-    });
-
-    let container_name = ProjectedField::from_selected(select.container_name, || {
-        resolved
-            .primary_decl
-            .and_then(resolve_declaration_container_name)
-    });
-
-    let kind = ProjectedField::from_selected(select.kind, || {
-        resolved
-            .primary_decl
-            .map(|decl| format!("{:?}", decl.kind()))
-    });
-
-    let location = ProjectedField::from_selected(select.location, || {
-        resolved
-            .primary_decl
-            .and_then(|decl| node_location_relative(&snapshot.cwd, decl))
-    });
-
-    let syntax = ProjectedField::from_selected(select.syntax, || {
-        resolved
-            .primary_decl
-            .map(|decl| snapshot.alloc_syntax(project_id, decl))
-    });
-
-    let is_external = select.is_external.then(|| {
-        resolved.primary_decl.is_some_and(|decl| {
-            get_source_file_of_node(decl).is_some_and(|sf| !is_project_source_file(program, sf))
-        })
-    });
-
-    let declarations = select.declarations.then(|| {
-        resolved
-            .all_decls
-            .iter()
-            .map(|&decl| snapshot.alloc_declaration(project_id, decl, resolved.symbol))
-            .collect()
-    });
-
-    DeclarationRow {
-        target: target_id,
-        declaration,
-        gaps,
-        name,
-        container_name,
-        kind,
-        location,
-        syntax,
-        is_external,
-        declarations,
-    }
-}
-
-struct ProjectedCallFields {
+struct AllocatedCallFields {
     gaps: Vec<GapItem>,
     location: Option<SourceLocation>,
     syntax: Option<String>,
@@ -2215,112 +1570,59 @@ struct ProjectedCallFields {
     return_type: ProjectedField<TypeSummaryPayload>,
 }
 
-fn evaluate_call_fields(
+fn allocate_call_fields(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    checker: &mut CheckerHandle,
-    node: P<Node>,
+    node: P<tsrs_ast::Node>,
     select: &CallSelect,
-) -> ProjectedCallFields {
-    let call_loc = node_location_relative(&snapshot.cwd, node);
-    let mut gaps = Vec::new();
-
-    let location = if select.location {
-        call_loc.clone()
-    } else {
-        None
-    };
-
+    fields: FacadeCallProjection,
+) -> AllocatedCallFields {
     let syntax = select
         .syntax
         .then(|| snapshot.alloc_syntax(project_id, node));
 
-    let callee = ProjectedField::from_selected(select.callee, || {
-        node.expression()
-            .map(|expr| snapshot.alloc_syntax(project_id, expr))
-    });
+    let callee = ProjectedField::from_option(
+        select.callee,
+        fields
+            .callee
+            .map(|expr| snapshot.alloc_syntax(project_id, expr)),
+    );
 
-    let callee_declaration = ProjectedField::from_selected(select.callee_declaration, || {
-        let resolved = resolve_symbol_for_node(checker, node);
-        if let Some(decl) = resolved.primary_decl {
-            Some(snapshot.alloc_declaration(project_id, decl, resolved.symbol))
-        } else {
-            gaps.push(GapItem {
-                kind: "unresolved-declaration",
-                message: "Could not resolve callee declaration for call.".to_string(),
-                at: call_loc.clone(),
-            });
-            None
-        }
-    });
+    let callee_declaration = ProjectedField::from_option(
+        select.callee_declaration,
+        fields
+            .callee_declaration
+            .map(|(decl, sym)| snapshot.alloc_declaration(project_id, decl, sym)),
+    );
 
-    let needs_sig =
-        select.signature || select.instantiated_parameter_types.is_some() || select.return_type;
-    let resolved_sig = if needs_sig {
-        let sig = checker.get_resolved_signature_exported(node);
-        if is_unresolved_signature(checker, sig) {
-            gaps.push(GapItem {
-                kind: "unresolved-signature",
-                message: "Call signature could not be resolved.".to_string(),
-                at: call_loc.clone(),
-            });
-            None
-        } else {
-            Some(sig)
-        }
-    } else {
-        None
-    };
+    let signature = ProjectedField::from_option(
+        select.signature,
+        fields
+            .signature
+            .map(|sig| snapshot.alloc_signature(project_id, sig, Some(node))),
+    );
 
-    let signature = ProjectedField::from_selected(select.signature, || {
-        resolved_sig.map(|sig| snapshot.alloc_signature(project_id, sig, Some(node)))
-    });
-
-    let arguments = select.arguments.then(|| {
-        node.arguments()
-            .iter()
-            .map(|&arg| snapshot.alloc_syntax(project_id, arg))
+    let arguments = fields.arguments.map(|args| {
+        args.into_iter()
+            .map(|arg| snapshot.alloc_syntax(project_id, arg))
             .collect()
     });
 
-    let instantiated_parameter_types =
-        select
-            .instantiated_parameter_types
-            .as_ref()
-            .map(|param_sel| {
-                let Some(sig) = resolved_sig else {
-                    return Vec::new();
-                };
-                collect_instantiated_param_types(
-                    snapshot,
-                    project_id,
-                    checker,
-                    sig,
-                    Some(node),
-                    param_sel,
-                    call_loc.as_ref(),
-                    &mut gaps,
-                )
-            });
+    let instantiated_parameter_types = fields
+        .instantiated_parameter_types
+        .map(|params| alloc_instantiated_params(snapshot, project_id, params));
 
-    let return_type = ProjectedField::from_selected(select.return_type, || {
-        resolved_sig.map(|sig| {
-            let ret_ty = checker.get_return_type_of_signature_exported(sig);
-            let summary = summarize_type(checker, ret_ty, Some(node));
-            alloc_type_summary(
-                snapshot,
-                project_id,
-                summary,
-                Some(node),
-                call_loc.as_ref(),
-                &mut gaps,
-            )
-        })
-    });
+    let mut gaps = fields.gaps;
+    let return_type = ProjectedField::from_option(
+        select.return_type,
+        fields
+            .return_type
+            .map(|summary| alloc_type_summary_with_gap(snapshot, project_id, summary, &mut gaps)),
+    );
 
-    ProjectedCallFields {
+    AllocatedCallFields {
         gaps,
-        location,
+        location: fields.location,
         syntax,
         callee,
         callee_declaration,
@@ -2331,66 +1633,10 @@ fn evaluate_call_fields(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Parameter type extraction needs checker, snapshot, signature, and gap output."
-)]
-fn collect_instantiated_param_types(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    checker: &mut CheckerHandle,
-    sig: P<Signature>,
-    enclosing: Option<P<Node>>,
-    param_sel: &ParameterIndexSelection,
-    gap_at: Option<&SourceLocation>,
-    gaps: &mut Vec<GapItem>,
-) -> Vec<InstantiatedParameterPayload> {
-    let params = sig.parameters();
-    let Some(indices) = param_sel.requested_indices(params.len()) else {
-        return Vec::new();
-    };
-    let has_rest = sig.has_rest_parameter();
-    let mut out = Vec::with_capacity(indices.len());
-
-    for idx in indices {
-        if idx >= params.len() && !has_rest {
-            gaps.push(GapItem {
-                kind: "parameter-out-of-bounds",
-                message: format!(
-                    "Requested parameter index {idx}, but signature has {} parameter(s).",
-                    params.len()
-                ),
-                at: gap_at.cloned(),
-            });
-            continue;
-        }
-        let param_symbol = params.get(idx).copied().or_else(|| {
-            if has_rest {
-                params.last().copied()
-            } else {
-                None
-            }
-        });
-        let param_name = param_symbol.map(|s| s.name().to_string());
-        let is_rest = has_rest && idx + 1 >= params.len();
-        let param_ty = checker.get_type_at_position_exported(sig, idx);
-        let summary = summarize_type(checker, param_ty, enclosing);
-        let type_summary =
-            alloc_type_summary(snapshot, project_id, summary, enclosing, gap_at, gaps);
-        out.push(InstantiatedParameterPayload {
-            index: idx,
-            parameter_name: param_name,
-            is_rest,
-            type_summary,
-        });
-    }
-
-    out
-}
-
 fn run_resolve_calls(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
     select: &CallSelect,
@@ -2401,59 +1647,72 @@ fn run_resolve_calls(
         nodes.push((handle_id.clone(), node));
     }
 
-    let mut items = Vec::with_capacity(nodes.len());
-    for (target_id, node) in nodes {
-        if !matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
-            let loc = node_location_relative(&snapshot.cwd, node);
-            let gaps = vec![GapItem {
-                kind: "not-a-call",
-                message: format!(
-                    "Syntax node of kind {:?} is not a call or new expression.",
-                    node.kind()
-                ),
-                at: loc.clone(),
-            }];
-            let syntax = select
-                .syntax
-                .then(|| snapshot.alloc_syntax(project_id, node));
-            let location = if select.location { loc } else { None };
-            let instantiated_parameter_types = select
-                .instantiated_parameter_types
-                .as_ref()
-                .and_then(|s| s.requested_indices(0))
-                .map(|_| Vec::new());
+    let facade_select = select.to_facade();
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let resolved: Vec<_> = nodes
+        .into_iter()
+        .map(|(target_id, node)| (target_id, node, facade.resolve_call(node, &facade_select)))
+        .collect();
 
-            items.push(CallResolutionRow {
-                target: target_id,
-                call: None,
-                gaps,
-                location,
-                syntax,
-                callee: ProjectedField::null_if_selected(select.callee),
-                callee_declaration: ProjectedField::null_if_selected(select.callee_declaration),
-                signature: ProjectedField::null_if_selected(select.signature),
-                arguments: select.arguments.then(Vec::new),
-                instantiated_parameter_types,
-                return_type: ProjectedField::null_if_selected(select.return_type),
-            });
-            continue;
+    let mut items = Vec::with_capacity(resolved.len());
+    for (target_id, node, outcome) in resolved {
+        match outcome {
+            Err(not_a_call) => {
+                let gaps = vec![GapItem::from_reason(
+                    UnknownReason::NotACall,
+                    format!(
+                        "Syntax node of kind {} is not a call or new expression.",
+                        not_a_call.kind_label
+                    ),
+                    not_a_call.location.clone(),
+                )];
+                let syntax = select
+                    .syntax
+                    .then(|| snapshot.alloc_syntax(project_id, node));
+                let location = if select.location {
+                    not_a_call.location
+                } else {
+                    None
+                };
+                let instantiated_parameter_types = select
+                    .instantiated_parameter_types
+                    .as_ref()
+                    .and_then(|s| s.requested_indices(0))
+                    .map(|_| Vec::new());
+
+                items.push(CallResolutionRow {
+                    target: target_id,
+                    call: None,
+                    gaps,
+                    location,
+                    syntax,
+                    callee: ProjectedField::null_if_selected(select.callee),
+                    callee_declaration: ProjectedField::null_if_selected(select.callee_declaration),
+                    signature: ProjectedField::null_if_selected(select.signature),
+                    arguments: select.arguments.then(Vec::new),
+                    instantiated_parameter_types,
+                    return_type: ProjectedField::null_if_selected(select.return_type),
+                });
+            }
+            Ok(fields) => {
+                let call_ref = snapshot.alloc_call(project_id, node);
+                let allocated = allocate_call_fields(snapshot, project_id, node, select, fields);
+                items.push(CallResolutionRow {
+                    target: target_id,
+                    call: Some(call_ref),
+                    gaps: allocated.gaps,
+                    location: allocated.location,
+                    syntax: allocated.syntax,
+                    callee: allocated.callee,
+                    callee_declaration: allocated.callee_declaration,
+                    signature: allocated.signature,
+                    arguments: allocated.arguments,
+                    instantiated_parameter_types: allocated.instantiated_parameter_types,
+                    return_type: allocated.return_type,
+                });
+            }
         }
-
-        let call_ref = snapshot.alloc_call(project_id, node);
-        let fields = evaluate_call_fields(snapshot, project_id, checker, node, select);
-        items.push(CallResolutionRow {
-            target: target_id,
-            call: Some(call_ref),
-            gaps: fields.gaps,
-            location: fields.location,
-            syntax: fields.syntax,
-            callee: fields.callee,
-            callee_declaration: fields.callee_declaration,
-            signature: fields.signature,
-            arguments: fields.arguments,
-            instantiated_parameter_types: fields.instantiated_parameter_types,
-            return_type: fields.return_type,
-        });
     }
 
     Ok(items)
@@ -2462,6 +1721,7 @@ fn run_resolve_calls(
 fn run_project_calls(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
     select: &CallSelect,
@@ -2472,20 +1732,28 @@ fn run_project_calls(
         call_nodes.push((handle_id.clone(), node));
     }
 
-    let mut items = Vec::with_capacity(call_nodes.len());
-    for (call_id, node) in call_nodes {
-        let fields = evaluate_call_fields(snapshot, project_id, checker, node, select);
+    let facade_select = select.to_facade();
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let projected: Vec<_> = call_nodes
+        .into_iter()
+        .map(|(call_id, node)| (call_id, node, facade.project_call(node, &facade_select)))
+        .collect();
+
+    let mut items = Vec::with_capacity(projected.len());
+    for (call_id, node, fields) in projected {
+        let allocated = allocate_call_fields(snapshot, project_id, node, select, fields);
         items.push(CallProjectionRow {
             call: call_id,
-            gaps: fields.gaps,
-            location: fields.location,
-            syntax: fields.syntax,
-            callee: fields.callee,
-            callee_declaration: fields.callee_declaration,
-            signature: fields.signature,
-            arguments: fields.arguments,
-            instantiated_parameter_types: fields.instantiated_parameter_types,
-            return_type: fields.return_type,
+            gaps: allocated.gaps,
+            location: allocated.location,
+            syntax: allocated.syntax,
+            callee: allocated.callee,
+            callee_declaration: allocated.callee_declaration,
+            signature: allocated.signature,
+            arguments: allocated.arguments,
+            instantiated_parameter_types: allocated.instantiated_parameter_types,
+            return_type: allocated.return_type,
         });
     }
 
@@ -2495,6 +1763,7 @@ fn run_project_calls(
 fn run_project_signatures(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
     select: &SignatureSelect,
@@ -2505,138 +1774,92 @@ fn run_project_signatures(
         sig_entries.push((handle_id.clone(), sig, call_node));
     }
 
-    let mut items = Vec::with_capacity(sig_entries.len());
-    for (sig_id, sig, call_node) in sig_entries {
-        items.push(evaluate_signature_row(
-            snapshot, project_id, checker, sig_id, sig, call_node, select,
-        ));
-    }
-    Ok(items)
-}
+    let facade_select = FacadeSignatureSelect {
+        signature_text: select.signature_text,
+        declaration: select.declaration,
+        location: select.location,
+        syntax: select.syntax,
+        parameters: select.parameters,
+        min_argument_count: select.min_argument_count,
+        has_rest_parameter: select.has_rest_parameter,
+        instantiated_parameter_types: select
+            .instantiated_parameter_types
+            .as_ref()
+            .map(ParameterIndexSelection::to_facade),
+        return_type: select.return_type,
+        is_instantiated: select.is_instantiated,
+    };
 
-fn evaluate_signature_row(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    checker: &mut CheckerHandle,
-    sig_id: String,
-    sig: P<Signature>,
-    call_node: Option<P<Node>>,
-    select: &SignatureSelect,
-) -> SignatureProjectionRow {
-    let mut gaps = Vec::new();
-    let decl_node = sig
-        .declaration()
-        .or_else(|| sig.target().and_then(|t| t.declaration()));
-    let enclosing = call_node.or(decl_node);
-    let gap_at = enclosing.and_then(|n| node_location_relative(&snapshot.cwd, n));
-
-    let signature_text = select
-        .signature_text
-        .then(|| checker.signature_to_string_ex(sig, enclosing, TypeFormatFlags::None, None));
-
-    let declaration = ProjectedField::from_selected(select.declaration, || {
-        decl_node.map(|decl| {
-            let sym = decl.symbol().or_else(|| {
-                decl.name()
-                    .and_then(|n| checker.get_symbol_at_location_exported(n))
-            });
-            snapshot.alloc_declaration(project_id, decl, sym)
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let projected: Vec<_> = sig_entries
+        .into_iter()
+        .map(|(sig_id, sig, call_node)| {
+            (
+                sig_id,
+                facade.project_signature(sig, call_node, &facade_select),
+            )
         })
-    });
+        .collect();
 
-    let location = ProjectedField::from_selected(select.location, || {
-        decl_node.and_then(|decl| node_location_relative(&snapshot.cwd, decl))
-    });
+    let mut items = Vec::with_capacity(projected.len());
+    for (sig_id, fields) in projected {
+        let declaration = ProjectedField::from_option(
+            select.declaration,
+            fields
+                .declaration
+                .map(|(decl, sym)| snapshot.alloc_declaration(project_id, decl, sym)),
+        );
+        let location = ProjectedField::from_option(select.location, fields.location);
+        let syntax = ProjectedField::from_option(
+            select.syntax,
+            fields
+                .syntax_node
+                .map(|decl| snapshot.alloc_syntax(project_id, decl)),
+        );
+        let parameters = fields.parameters.map(|params| {
+            params
+                .into_iter()
+                .map(|param| SignatureParameterPayload {
+                    name: param.name,
+                    declaration: param
+                        .declaration_node
+                        .map(|d| snapshot.alloc_declaration(project_id, d, Some(param.symbol))),
+                    optional: param.optional,
+                    rest: param.rest,
+                })
+                .collect()
+        });
+        let instantiated_parameter_types = fields
+            .instantiated_parameter_types
+            .map(|params| alloc_instantiated_params(snapshot, project_id, params));
+        let mut gaps = fields.gaps;
+        let return_type = fields
+            .return_type
+            .map(|summary| alloc_type_summary_with_gap(snapshot, project_id, summary, &mut gaps));
 
-    let syntax = ProjectedField::from_selected(select.syntax, || {
-        decl_node.map(|decl| snapshot.alloc_syntax(project_id, decl))
-    });
-
-    let parameters = select
-        .parameters
-        .then(|| build_signature_parameters(snapshot, project_id, sig));
-
-    let min_argument_count = select.min_argument_count.then(|| sig.min_argument_count());
-    let has_rest_parameter = select.has_rest_parameter.then(|| sig.has_rest_parameter());
-
-    let instantiated_parameter_types = select.instantiated_parameter_types.as_ref().map(|sel| {
-        collect_instantiated_param_types(
-            snapshot,
-            project_id,
-            checker,
-            sig,
-            enclosing,
-            sel,
-            gap_at.as_ref(),
-            &mut gaps,
-        )
-    });
-
-    let return_type = select.return_type.then(|| {
-        let ret_ty = checker.get_return_type_of_signature_exported(sig);
-        let summary = summarize_type(checker, ret_ty, enclosing);
-        alloc_type_summary(
-            snapshot,
-            project_id,
-            summary,
-            enclosing,
-            gap_at.as_ref(),
-            &mut gaps,
-        )
-    });
-
-    let is_instantiated = select.is_instantiated.then(|| sig.target().is_some());
-
-    SignatureProjectionRow {
-        signature: sig_id,
-        gaps,
-        signature_text,
-        declaration,
-        location,
-        syntax,
-        parameters,
-        min_argument_count,
-        has_rest_parameter,
-        instantiated_parameter_types,
-        return_type,
-        is_instantiated,
-    }
-}
-
-fn build_signature_parameters(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    sig: P<Signature>,
-) -> Vec<SignatureParameterPayload> {
-    let params = sig.parameters();
-    let has_rest = sig.has_rest_parameter();
-    let mut param_items = Vec::with_capacity(params.len());
-    for (idx, &param_sym) in params.iter().enumerate() {
-        let param_decl = param_sym
-            .value_declaration()
-            .or_else(|| param_sym.declarations().first().copied());
-        let is_rest = has_rest && idx + 1 == params.len();
-        let is_optional = param_sym.flags().intersects(SymbolFlags::Optional)
-            || param_decl.is_some_and(|d| {
-                d.kind() == Kind::Parameter
-                    && (d.as_parameter_declaration().question_token().is_some()
-                        || d.initializer().is_some())
-            });
-        let decl_ref =
-            param_decl.map(|d| snapshot.alloc_declaration(project_id, d, Some(param_sym)));
-        param_items.push(SignatureParameterPayload {
-            name: param_sym.name().to_string(),
-            declaration: decl_ref,
-            optional: is_optional,
-            rest: is_rest,
+        items.push(SignatureProjectionRow {
+            signature: sig_id,
+            gaps,
+            signature_text: fields.signature_text,
+            declaration,
+            location,
+            syntax,
+            parameters,
+            min_argument_count: fields.min_argument_count,
+            has_rest_parameter: fields.has_rest_parameter,
+            instantiated_parameter_types,
+            return_type,
+            is_instantiated: fields.is_instantiated,
         });
     }
-    param_items
+    Ok(items)
 }
 
 fn run_project_types(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     targets: &[String],
     select: &TypeSelect,
@@ -2647,58 +1870,69 @@ fn run_project_types(
         type_entries.push((handle_id.clone(), ty, enclosing));
     }
 
-    let mut items = Vec::with_capacity(type_entries.len());
-    for (type_id, ty, enclosing) in type_entries {
-        let summary = summarize_type(checker, ty, enclosing);
+    let facade_select = FacadeTypeSelect {
+        type_text: select.type_text,
+        is_union: select.is_union,
+        is_intersection: select.is_intersection,
+        is_literal: select.is_literal,
+        literal_value: select.literal_value,
+        union_members: select.union_members,
+        union_member_types: select.union_member_types,
+        properties: select.properties,
+        type_arguments: select.type_arguments,
+    };
+
+    let cwd = snapshot.cwd.clone();
+    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let projected: Vec<_> = type_entries
+        .into_iter()
+        .map(|(type_id, ty, enclosing)| {
+            (
+                type_id,
+                enclosing,
+                facade.project_type(ty, enclosing, &facade_select),
+            )
+        })
+        .collect();
+
+    let mut items = Vec::with_capacity(projected.len());
+    for (type_id, enclosing, proj) in projected {
+        let summary = proj.summary;
         let mut gaps = Vec::new();
-        if is_error_or_unresolved_type(summary.ty) {
-            gaps.push(GapItem {
-                kind: "unresolved-type",
-                message: format!(
+        if summary.is_unresolved {
+            gaps.push(GapItem::from_reason(
+                UnknownReason::UnresolvedType,
+                format!(
                     "Type resolved to an error or unresolved type ({}).",
                     summary.type_text
                 ),
-                at: enclosing.and_then(|n| node_location_relative(&snapshot.cwd, n)),
-            });
+                summary.gap_at,
+            ));
         }
 
-        let union_member_types = select.union_member_types.then(|| {
-            if ty.is_union() {
-                ty.types()
-                    .iter()
-                    .map(|&member| snapshot.alloc_type(project_id, member, enclosing))
-                    .collect()
-            } else {
-                Vec::new()
-            }
+        let union_member_types = proj.union_member_types.map(|members| {
+            members
+                .into_iter()
+                .map(|member| snapshot.alloc_type(project_id, member, enclosing))
+                .collect()
         });
 
-        let properties = select.properties.then(|| {
-            checker
-                .get_properties_of_type_exported(ty)
-                .iter()
-                .map(|&prop_sym| {
-                    let decl = prop_sym
-                        .value_declaration()
-                        .or_else(|| prop_sym.declarations().first().copied())
-                        .map(|d| snapshot.alloc_declaration(project_id, d, Some(prop_sym)));
-                    TypePropertyPayload {
-                        name: prop_sym.name().to_string(),
-                        optional: prop_sym.flags().intersects(SymbolFlags::Optional),
-                        declaration: decl,
-                    }
+        let properties = proj.properties.map(|props| {
+            props
+                .into_iter()
+                .map(|prop| TypePropertyPayload {
+                    name: prop.name,
+                    optional: prop.optional,
+                    declaration: prop
+                        .declaration_node
+                        .map(|d| snapshot.alloc_declaration(project_id, d, Some(prop.symbol))),
                 })
                 .collect()
         });
 
-        let type_arguments = select.type_arguments.then(|| {
-            let args = if ty.try_as_type_reference().is_some() {
-                checker.get_type_arguments_exported(ty)
-            } else {
-                &[]
-            };
-            args.iter()
-                .map(|&arg_ty| snapshot.alloc_type(project_id, arg_ty, enclosing))
+        let type_arguments = proj.type_arguments.map(|args| {
+            args.into_iter()
+                .map(|arg_ty| snapshot.alloc_type(project_id, arg_ty, enclosing))
                 .collect()
         });
 
@@ -2709,9 +1943,7 @@ fn run_project_types(
             is_union: select.is_union.then_some(summary.is_union),
             is_intersection: select.is_intersection.then_some(summary.is_intersection),
             is_literal: select.is_literal.then_some(summary.is_literal),
-            literal_value: ProjectedField::from_selected(select.literal_value, || {
-                summary.literal_value
-            }),
+            literal_value: ProjectedField::from_option(select.literal_value, summary.literal_value),
             union_members: select
                 .union_members
                 .then(|| summary.union_members.unwrap_or_default()),
@@ -2727,6 +1959,7 @@ fn run_project_types(
 fn run_is_assignable_to(
     snapshot: &SnapshotState,
     project_id: &str,
+    program: &'static Program,
     checker: &mut CheckerHandle,
     pairs: &[AssignabilityPairInput],
 ) -> Result<Vec<AssignabilityRow>, RpcErr> {
@@ -2743,21 +1976,35 @@ fn run_is_assignable_to(
         ));
     }
 
-    let mut items = Vec::with_capacity(resolved.len());
-    for (source_id, target_id, source_ty, target_ty, enclosing) in resolved {
+    let cwd = snapshot.cwd.clone();
+    let outcomes: Vec<_> = {
+        let mut facade = SemanticFacade::new(&cwd, program, checker);
+        resolved
+            .into_iter()
+            .map(|(source_id, target_id, source_ty, target_ty, enclosing)| {
+                (
+                    source_id,
+                    target_id,
+                    facade.is_assignable_to(source_ty, target_ty, enclosing),
+                )
+            })
+            .collect()
+    };
+
+    let mut items = Vec::with_capacity(outcomes.len());
+    for (source_id, target_id, outcome) in outcomes {
         let mut gaps = Vec::new();
-        if is_error_or_unresolved_type(source_ty) || is_error_or_unresolved_type(target_ty) {
-            gaps.push(GapItem {
-                kind: "unresolved-type",
-                message: "Assignability check involves an error or unresolved type.".to_string(),
-                at: enclosing.and_then(|n| node_location_relative(&snapshot.cwd, n)),
-            });
+        if outcome.has_unresolved_type {
+            gaps.push(GapItem::from_reason(
+                UnknownReason::UnresolvedType,
+                "Assignability check involves an error or unresolved type.".to_string(),
+                outcome.gap_at,
+            ));
         }
-        let assignable = checker.is_type_assignable_to_exported(source_ty, target_ty);
         items.push(AssignabilityRow {
             source: source_id,
             target: target_id,
-            assignable,
+            assignable: outcome.assignable,
             gaps,
         });
     }
@@ -2765,55 +2012,14 @@ fn run_is_assignable_to(
     Ok(items)
 }
 
-fn run_syntax_of(
+fn allocate_syntax_lookup_row(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    targets: &[String],
+    syntax_view: &SyntaxView<'_>,
+    lookup_opts: &SyntaxLookupOptions,
     select: &SyntaxLookupSelect,
-) -> Result<Vec<SyntaxLookupRow>, RpcErr> {
-    let mut resolved = Vec::with_capacity(targets.len());
-    for handle_id in targets {
-        let entry = snapshot.get_entry(project_id, handle_id)?;
-        let node_opt = match entry.payload {
-            HandlePayload::Syntax(node)
-            | HandlePayload::Call(node)
-            | HandlePayload::Declaration { node, .. } => Some(node),
-            HandlePayload::Signature { sig, .. } => sig
-                .declaration()
-                .or_else(|| sig.target().and_then(|t| t.declaration())),
-            HandlePayload::Type { .. } => {
-                return Err(RpcErr::new(
-                    "INVALID_REFERENCE_KIND",
-                    format!(
-                        "Program reference {handle_id} is a type reference and has no syntax node."
-                    ),
-                ));
-            }
-            HandlePayload::Branch(_) | HandlePayload::Instance(_) => {
-                return Err(RpcErr::new(
-                    "INVALID_REFERENCE_KIND",
-                    format!("Program reference {handle_id} has no syntax node."),
-                ));
-            }
-        };
-        resolved.push((handle_id.clone(), node_opt));
-    }
-
-    let mut items = Vec::with_capacity(resolved.len());
-    for (target_id, node_opt) in resolved {
-        items.push(evaluate_syntax_lookup_row(
-            snapshot, project_id, target_id, node_opt, select,
-        ));
-    }
-    Ok(items)
-}
-
-fn evaluate_syntax_lookup_row(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
     target_id: String,
-    node_opt: Option<P<Node>>,
-    select: &SyntaxLookupSelect,
+    node_opt: Option<P<tsrs_ast::Node>>,
 ) -> SyntaxLookupRow {
     let Some(node) = node_opt else {
         return SyntaxLookupRow {
@@ -2832,140 +2038,109 @@ fn evaluate_syntax_lookup_row(
         };
     };
 
-    let sf_opt = get_source_file_of_node(node);
-    let syntax_ref = snapshot.alloc_syntax(project_id, node);
-    let loc_opt = sf_opt.map(|sf| {
-        let rel_file = relative_to_cwd(&snapshot.cwd, sf.file_name());
-        node_location(sf, &rel_file, node)
-    });
-
-    let kind = ProjectedField::from_selected(select.kind, || Some(format!("{:?}", node.kind())));
-    let text = ProjectedField::from_selected(select.text, || {
-        sf_opt
-            .zip(loc_opt.as_ref())
-            .map(|(sf, loc)| slice_source_text(sf, loc.start, loc.end))
-    });
-    let location = ProjectedField::from_selected(select.location, || loc_opt);
-    let expression = ProjectedField::from_selected(select.expression, || {
-        safe_expression(node).map(|e| snapshot.alloc_syntax(project_id, e))
-    });
-    let arguments = select.arguments.then(|| {
-        safe_arguments(node).map_or_else(Vec::new, |args| {
-            args.iter()
-                .map(|&arg| snapshot.alloc_syntax(project_id, arg))
-                .collect()
-        })
-    });
-    let name = ProjectedField::from_selected(select.name, || {
-        node.name().map(|n| snapshot.alloc_syntax(project_id, n))
-    });
-    let initializer = ProjectedField::from_selected(select.initializer, || {
-        safe_initializer(node).map(|i| snapshot.alloc_syntax(project_id, i))
-    });
-    let body = ProjectedField::from_selected(select.body, || {
-        node.body().map(|b| snapshot.alloc_syntax(project_id, b))
-    });
-    let parameters = select.parameters.then(|| {
-        safe_parameters(node).map_or_else(Vec::new, |params| {
-            params
-                .iter()
-                .map(|&p| snapshot.alloc_syntax(project_id, p))
-                .collect()
-        })
-    });
+    let inspected = syntax_view.inspect_node(node, lookup_opts);
+    let syntax_ref = snapshot.alloc_syntax(project_id, inspected.node);
 
     SyntaxLookupRow {
         target: target_id,
         syntax: Some(syntax_ref),
         gaps: Vec::new(),
-        kind,
-        text,
-        location,
-        expression,
-        arguments,
-        name,
-        initializer,
-        body,
-        parameters,
+        kind: ProjectedField::from_option(select.kind, inspected.kind),
+        text: ProjectedField::from_option(select.text, inspected.text),
+        location: ProjectedField::from_option(select.location, inspected.location),
+        expression: ProjectedField::from_option(
+            select.expression,
+            inspected
+                .expression
+                .map(|e| snapshot.alloc_syntax(project_id, e)),
+        ),
+        arguments: inspected.arguments.map(|args| {
+            args.into_iter()
+                .map(|arg| snapshot.alloc_syntax(project_id, arg))
+                .collect()
+        }),
+        name: ProjectedField::from_option(
+            select.name,
+            inspected.name.map(|n| snapshot.alloc_syntax(project_id, n)),
+        ),
+        initializer: ProjectedField::from_option(
+            select.initializer,
+            inspected
+                .initializer
+                .map(|i| snapshot.alloc_syntax(project_id, i)),
+        ),
+        body: ProjectedField::from_option(
+            select.body,
+            inspected.body.map(|b| snapshot.alloc_syntax(project_id, b)),
+        ),
+        parameters: inspected.parameters.map(|params| {
+            params
+                .into_iter()
+                .map(|p| snapshot.alloc_syntax(project_id, p))
+                .collect()
+        }),
     }
 }
 
-fn node_location_relative(cwd: &str, node: P<Node>) -> Option<SourceLocation> {
-    let sf = get_source_file_of_node(node)?;
-    let rel_file = relative_to_cwd(cwd, sf.file_name());
-    Some(node_location(sf, &rel_file, node))
-}
-
-pub fn node_location(sf: P<SourceFile>, rel_file: &str, node: P<Node>) -> SourceLocation {
-    let start = get_token_pos_of_node(node, sf, false);
-    let end = node.end().source_offset().unwrap_or(start).max(start);
-
-    let (start_line0, start_col0) = get_ecma_line_and_utf16_character_of_position(sf.get(), start);
-    let (end_line0, end_col0) = get_ecma_line_and_utf16_character_of_position(sf.get(), end);
-
-    SourceLocation {
-        file: rel_file.to_string(),
-        line: u32::try_from(start_line0).unwrap_or(u32::MAX - 1) + 1,
-        column: start_col0 + 1,
-        end_line: u32::try_from(end_line0).unwrap_or(u32::MAX - 1) + 1,
-        end_column: end_col0 + 1,
-        start,
-        end,
+fn run_syntax_of(
+    snapshot: &mut SnapshotState,
+    project_id: &str,
+    targets: &[String],
+    select: &SyntaxLookupSelect,
+) -> Result<Vec<SyntaxLookupRow>, RpcErr> {
+    let mut resolved = Vec::with_capacity(targets.len());
+    for handle_id in targets {
+        let entry = snapshot.get_entry(project_id, handle_id)?;
+        let node_opt = match entry.payload {
+            HandlePayload::Syntax(node)
+            | HandlePayload::Call(node)
+            | HandlePayload::Declaration { node, .. } => Some(node),
+            HandlePayload::Signature { sig, .. } => {
+                SemanticFacade::raw_signature_declaration_node(sig)
+            }
+            HandlePayload::Type { .. } => {
+                return Err(RpcErr::new(
+                    "INVALID_REFERENCE_KIND",
+                    format!(
+                        "Program reference {handle_id} is a type reference and has no syntax node."
+                    ),
+                ));
+            }
+            HandlePayload::Branch(_) | HandlePayload::Instance(_) => {
+                return Err(RpcErr::new(
+                    "INVALID_REFERENCE_KIND",
+                    format!("Program reference {handle_id} has no syntax node."),
+                ));
+            }
+        };
+        resolved.push((handle_id.clone(), node_opt));
     }
-}
 
-pub fn slice_source_text(sf: P<SourceFile>, start: u32, end: u32) -> String {
-    let text = sf.text();
-    let start_idx = usize::try_from(start).unwrap_or(0);
-    let end_idx = usize::try_from(end).unwrap_or(start_idx);
-    if start_idx <= end_idx && end_idx <= text.len() {
-        text.get(start_idx..end_idx).unwrap_or("").to_string()
-    } else {
-        String::new()
-    }
-}
+    let cwd = snapshot.cwd.clone();
+    let syntax_view = SyntaxView::new(&cwd);
+    let lookup_opts = SyntaxLookupOptions {
+        kind: select.kind,
+        text: select.text,
+        location: select.location,
+        expression: select.expression,
+        arguments: select.arguments,
+        name: select.name,
+        initializer: select.initializer,
+        body: select.body,
+        parameters: select.parameters,
+    };
 
-fn parse_syntax_kind(name: &str) -> Option<Kind> {
-    match name {
-        "Identifier" => Some(Kind::Identifier),
-        "CallExpression" => Some(Kind::CallExpression),
-        "NewExpression" => Some(Kind::NewExpression),
-        "ReturnStatement" => Some(Kind::ReturnStatement),
-        "VariableDeclaration" => Some(Kind::VariableDeclaration),
-        "BinaryExpression" => Some(Kind::BinaryExpression),
-        "PropertyAccessExpression" => Some(Kind::PropertyAccessExpression),
-        "IfStatement" => Some(Kind::IfStatement),
-        "FunctionDeclaration" => Some(Kind::FunctionDeclaration),
-        "ArrowFunction" => Some(Kind::ArrowFunction),
-        "FunctionExpression" => Some(Kind::FunctionExpression),
-        "MethodDeclaration" => Some(Kind::MethodDeclaration),
-        "MethodSignature" => Some(Kind::MethodSignature),
-        "CallSignature" => Some(Kind::CallSignature),
-        "Constructor" => Some(Kind::Constructor),
-        "FunctionType" => Some(Kind::FunctionType),
-        "StringLiteral" => Some(Kind::StringLiteral),
-        "NumericLiteral" => Some(Kind::NumericLiteral),
-        "Parameter" => Some(Kind::Parameter),
-        "PropertyAssignment" => Some(Kind::PropertyAssignment),
-        "ShorthandPropertyAssignment" => Some(Kind::ShorthandPropertyAssignment),
-        "PropertyDeclaration" => Some(Kind::PropertyDeclaration),
-        "PropertySignature" => Some(Kind::PropertySignature),
-        "ClassDeclaration" => Some(Kind::ClassDeclaration),
-        "InterfaceDeclaration" => Some(Kind::InterfaceDeclaration),
-        "TypeAliasDeclaration" => Some(Kind::TypeAliasDeclaration),
-        "ImportDeclaration" => Some(Kind::ImportDeclaration),
-        "ImportSpecifier" => Some(Kind::ImportSpecifier),
-        "ExportSpecifier" => Some(Kind::ExportSpecifier),
-        "Block" => Some(Kind::Block),
-        "TypeReference" => Some(Kind::TypeReference),
-        "SwitchStatement" => Some(Kind::SwitchStatement),
-        "CaseClause" => Some(Kind::CaseClause),
-        "DefaultClause" => Some(Kind::DefaultClause),
-        "ConditionalExpression" => Some(Kind::ConditionalExpression),
-        "ThrowStatement" => Some(Kind::ThrowStatement),
-        "TryStatement" => Some(Kind::TryStatement),
-        "ExpressionStatement" => Some(Kind::ExpressionStatement),
-        "VariableStatement" => Some(Kind::VariableStatement),
-        _ => None,
+    let mut items = Vec::with_capacity(resolved.len());
+    for (target_id, node_opt) in resolved {
+        items.push(allocate_syntax_lookup_row(
+            snapshot,
+            project_id,
+            &syntax_view,
+            &lookup_opts,
+            select,
+            target_id,
+            node_opt,
+        ));
     }
+    Ok(items)
 }

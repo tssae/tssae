@@ -4,14 +4,26 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build", "//#toolchain:prepare"],
-      "inputs": ["$TURBO_DEFAULT$", "Cargo.toml", "Cargo.lock", "src/**/*.rs"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/**/*.rs",
+        "crates/**/Cargo.toml",
+        "crates/**/*.rs"
+      ],
       "outputs": ["dist/**"],
       "cache": false,
       "tags": ["work:preparation"]
     },
     "format:check": {
       "dependsOn": ["//#toolchain:prepare"],
-      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "crates/**/Cargo.toml",
+        "crates/**/*.rs",
+        "!target/**"
+      ],
       "outputs": [],
       "tags": ["quality:light"]
     },
@@ -28,7 +40,12 @@
         "^lint",
         "@tssae/test-hosts#typecheck"
       ],
-      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "crates/**/Cargo.toml",
+        "crates/**/*.rs",
+        "!target/**"
+      ],
       "outputs": [],
       "tags": ["quality:light"]
     },
@@ -45,7 +62,12 @@
         "//#toolchain:prepare",
         "@tssae/test-hosts#typecheck"
       ],
-      "inputs": ["$TURBO_DEFAULT$", "!target/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "crates/**/Cargo.toml",
+        "crates/**/*.rs",
+        "!target/**"
+      ],
       "outputs": [],
       "tags": ["quality:light"]
     },

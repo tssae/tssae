@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tsrs_api::{Handler, Response, Session, session::SnapshotData};
-use tsrs_ast::{Diagnostic as TsrsDiagnostic, SourceFile};
+use tsrs_ast::Diagnostic as TsrsDiagnostic;
 use tsrs_compiler::Program;
 use tsrs_core::{
     CompilerOptions, JsxEmit, ModuleKind, ModuleResolutionKind, ScriptTarget,
@@ -115,72 +115,9 @@ struct DiscoveryState {
     project_refs_map: BTreeMap<String, Vec<String>>,
 }
 
-pub fn normalize_path(path: &str) -> String {
-    let replaced = path.replace('\\', "/");
-    let is_abs = replaced.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for segment in replaced.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                if let Some(&last) = parts.last()
-                    && last != ".."
-                {
-                    parts.pop();
-                } else if !is_abs {
-                    parts.push("..");
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    if is_abs {
-        if parts.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", parts.join("/"))
-        }
-    } else if parts.is_empty() {
-        ".".to_string()
-    } else {
-        parts.join("/")
-    }
-}
-
-pub fn resolve_against_cwd(cwd: &str, candidate: &str) -> String {
-    let normalized = candidate.replace('\\', "/");
-    if Path::new(&normalized).is_absolute() {
-        normalize_path(&normalized)
-    } else if cwd == "/" {
-        normalize_path(&format!("/{normalized}"))
-    } else {
-        normalize_path(&format!("{cwd}/{normalized}"))
-    }
-}
-
-pub fn relative_to_cwd(cwd: &str, file_path: &str) -> String {
-    let file_norm = normalize_path(file_path);
-    let cwd_norm = normalize_path(cwd);
-    let prefix = if cwd_norm == "/" {
-        "/".to_string()
-    } else {
-        format!("{cwd_norm}/")
-    };
-    if let Some(stripped) = file_norm.strip_prefix(&prefix) {
-        return stripped.to_string();
-    }
-    if file_norm == cwd_norm {
-        return ".".to_string();
-    }
-    file_norm
-}
-
-pub fn is_project_source_file(program: &Program, sf: tsrs_core::P<SourceFile>) -> bool {
-    let path = sf.path();
-    !program.is_source_file_default_library(path)
-        && !program.is_source_file_from_external_library(sf)
-        && !program.is_source_from_project_reference(path)
-}
+pub use tssae_tsrs_boundary::{
+    is_project_source_file, normalize_path, relative_to_cwd, resolve_against_cwd,
+};
 
 pub fn release_tsrs_snapshot(session: &Session, tsrs_snapshot_id: u64) {
     if let Ok(payload) = serde_json::to_vec(&serde_json::json!({ "snapshot": tsrs_snapshot_id })) {

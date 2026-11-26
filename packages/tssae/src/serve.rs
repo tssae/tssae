@@ -16,7 +16,8 @@ use tsrs_core::P;
 use tsrs_project::ID as ProjectId;
 use tsrs_vfs::{FS, bundled, osvfs};
 use tssae_analysis::branch_coverage::{
-    BranchBypassPath, BranchCoverageOutcome, evaluate_branch_coverage,
+    BranchBypassPath, BranchCoverageOutcome, ImplicitExceptionCoverageOutcome,
+    evaluate_branch_coverage,
 };
 use tssae_common::{BranchId, UnknownReason};
 use tssae_tsrs_boundary::{
@@ -196,12 +197,14 @@ pub enum BranchCoverageItem {
     Proved {
         target: String,
         target_reachable: bool,
+        implicit_exceptions: ImplicitExceptionCoverageOutcome,
         evidence: Vec<EvidenceItem>,
     },
     #[serde(rename_all = "camelCase")]
     Disproved {
         target: String,
         target_reachable: bool,
+        implicit_exceptions: ImplicitExceptionCoverageOutcome,
         counterexample_path: BranchBypassPath,
         evidence: Vec<EvidenceItem>,
     },
@@ -209,6 +212,7 @@ pub enum BranchCoverageItem {
     Inconclusive {
         target: String,
         target_reachable: bool,
+        implicit_exceptions: ImplicitExceptionCoverageOutcome,
         gaps: Vec<GapItem>,
         evidence: Vec<EvidenceItem>,
     },
@@ -1089,29 +1093,35 @@ fn outcome_to_branch_coverage_item(
     match outcome {
         BranchCoverageOutcome::Proved {
             target_reachable,
+            implicit_exceptions,
             evidence,
         } => BranchCoverageItem::Proved {
             target,
             target_reachable,
+            implicit_exceptions,
             evidence,
         },
         BranchCoverageOutcome::Disproved {
             target_reachable,
+            implicit_exceptions,
             counterexample_path,
             evidence,
         } => BranchCoverageItem::Disproved {
             target,
             target_reachable,
+            implicit_exceptions,
             counterexample_path,
             evidence,
         },
         BranchCoverageOutcome::Inconclusive {
             target_reachable,
+            implicit_exceptions,
             gaps,
             evidence,
         } => BranchCoverageItem::Inconclusive {
             target,
             target_reachable,
+            implicit_exceptions,
             gaps,
             evidence,
         },
@@ -1166,6 +1176,11 @@ pub fn run_branch_coverage(
             items.push(BranchCoverageItem::Inconclusive {
                 target: target_id,
                 target_reachable: false,
+                implicit_exceptions: ImplicitExceptionCoverageOutcome::Inconclusive {
+                    may_throw_sites: Vec::new(),
+                    gaps: vec![gap.clone()],
+                    evidence: evidence.clone(),
+                },
                 gaps: vec![gap],
                 evidence,
             });
@@ -1184,6 +1199,11 @@ pub fn run_branch_coverage(
                     items.push(BranchCoverageItem::Inconclusive {
                         target: target_id,
                         target_reachable: false,
+                        implicit_exceptions: ImplicitExceptionCoverageOutcome::Inconclusive {
+                            may_throw_sites: Vec::new(),
+                            gaps: vec![gap.clone()],
+                            evidence: evidence.clone(),
+                        },
                         gaps: vec![gap],
                         evidence,
                     });

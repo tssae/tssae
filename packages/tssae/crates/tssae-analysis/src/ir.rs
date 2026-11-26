@@ -1,8 +1,8 @@
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use tssae_common::{
-    BranchId, DiagnosticLocation, FileId, FunctionIrId, LocalBindingId, LocalSyntaxId, SignatureId,
-    SymbolId, SyntaxId, TypeId, UnknownReason, ValueId, VertexId,
+    BranchId, DiagnosticLocation, FileId, FinallyId, FunctionIrId, LocalBindingId, LocalSyntaxId,
+    SignatureId, SymbolId, SyntaxId, TypeId, UnknownReason, ValueId, VertexId,
 };
 
 /// Kind of analyzable scope represented by an IR unit.
@@ -272,12 +272,26 @@ pub struct IrBranchRecord {
 pub enum ExplicitEdgeKind {
     Fallthrough,
     Branch(BranchId),
-    SwitchNoMatch { switch_location: DiagnosticLocation },
+    SwitchNoMatch {
+        switch_location: DiagnosticLocation,
+    },
     LoopBack,
-    Break { label: Option<String> },
-    Continue { label: Option<String> },
+    Break {
+        label: Option<String>,
+    },
+    Continue {
+        label: Option<String>,
+    },
     Return,
     ExplicitThrow,
+    FinallyEnter {
+        finally_id: FinallyId,
+        resume: VertexId,
+    },
+    FinallyResume {
+        finally_id: FinallyId,
+        resume: VertexId,
+    },
     ExitMerge,
 }
 
@@ -399,6 +413,28 @@ pub enum IrOp {
     Throw {
         exception: ValueId,
     },
+    CatchParamBind {
+        binding: Option<LocalBindingId>,
+    },
+    Await {
+        promise: ValueId,
+    },
+    Yield {
+        value: Option<ValueId>,
+        is_delegate: bool,
+    },
+    IteratorInit {
+        iterable: ValueId,
+        is_async: bool,
+    },
+    IteratorNext {
+        iterator: ValueId,
+        is_async: bool,
+    },
+    IteratorClose {
+        iterator: ValueId,
+        is_async: bool,
+    },
     FunctionLiteral {
         syntax: SyntaxId,
     },
@@ -427,6 +463,7 @@ pub struct CfgVertex {
     pub op: IrOp,
     pub explicit_edges: Vec<ExplicitEdge>,
     pub may_throw_edge: Option<MayThrowEdge>,
+    pub enclosing_finallies: Vec<FinallyId>,
 }
 
 /// Lowered semantic IR and derived CFG for one analyzable function or local block scope.
@@ -506,14 +543,28 @@ impl FunctionIr {
             }
             for edge in &vertex.explicit_edges {
                 check_vid("explicit edge target", edge.target)?;
-                if let ExplicitEdgeKind::Branch(branch_id) = edge.kind {
-                    let b_idx = usize::try_from(branch_id.0).unwrap_or(usize::MAX);
-                    if b_idx >= self.branches.len() {
-                        return Err(format!(
-                            "Explicit edge references out-of-bounds BranchId({}).",
-                            branch_id.0
-                        ));
+                match edge.kind {
+                    ExplicitEdgeKind::Branch(branch_id) => {
+                        let b_idx = usize::try_from(branch_id.0).unwrap_or(usize::MAX);
+                        if b_idx >= self.branches.len() {
+                            return Err(format!(
+                                "Explicit edge references out-of-bounds BranchId({}).",
+                                branch_id.0
+                            ));
+                        }
                     }
+                    ExplicitEdgeKind::FinallyEnter { resume, .. }
+                    | ExplicitEdgeKind::FinallyResume { resume, .. } => {
+                        check_vid("finally completion resume", resume)?;
+                    }
+                    ExplicitEdgeKind::Fallthrough
+                    | ExplicitEdgeKind::SwitchNoMatch { .. }
+                    | ExplicitEdgeKind::LoopBack
+                    | ExplicitEdgeKind::Break { .. }
+                    | ExplicitEdgeKind::Continue { .. }
+                    | ExplicitEdgeKind::Return
+                    | ExplicitEdgeKind::ExplicitThrow
+                    | ExplicitEdgeKind::ExitMerge => {}
                 }
             }
             if let Some(may_throw) = vertex.may_throw_edge {

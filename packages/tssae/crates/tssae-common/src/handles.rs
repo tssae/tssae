@@ -66,6 +66,10 @@ pub struct VertexId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct BranchId(pub u32);
 
+/// Lexical `finally` block identifier within a function IR.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FinallyId(pub u32);
+
 /// Analysis-level instance identity handle.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct InstanceId(pub u32);

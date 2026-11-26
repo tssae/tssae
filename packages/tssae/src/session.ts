@@ -1328,8 +1328,13 @@ export async function openProject(
           );
         }
         const mapped = toBranchCoverageItem(raw, targetRef);
-        if (recordRuleQuery && mapped.status === "inconclusive") {
-          recordGaps(mapped.gaps);
+        if (recordRuleQuery) {
+          if (mapped.status === "inconclusive") {
+            recordGaps(mapped.gaps);
+          }
+          if (mapped.implicitExceptions.status === "inconclusive") {
+            recordGaps(mapped.implicitExceptions.gaps);
+          }
         }
         results.push(mapped);
       }

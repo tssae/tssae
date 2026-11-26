@@ -67,6 +67,7 @@ export type {
   BranchKind,
   ControlFlowPathStep,
   FunctionBranchesResult,
+  ImplicitExceptionCoverageOutcome,
 } from "./branch-coverage.ts";
 export type {
   CallEffectsOptions,

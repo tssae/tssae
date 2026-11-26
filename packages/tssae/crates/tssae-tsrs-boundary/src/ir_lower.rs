@@ -235,7 +235,22 @@ fn lower_validated_scope_inner(
         let mut body_entry = if body.kind() == Kind::Block {
             lowerer.lower_stmt(body, lowerer.normal_exit)
         } else {
-            let (expr_entry, _) = lowerer.lower_expr_to(body, lowerer.normal_exit);
+            let ret_val = lowerer.alloc_value();
+            let ret_v = lowerer.new_vertex(
+                None,
+                IrOp::Return {
+                    value: Some(ret_val),
+                },
+                None,
+                false,
+            );
+            lowerer.add_edge(ret_v, lowerer.normal_exit, ExplicitEdgeKind::Return);
+            let (expr_entry, expr_val) = lowerer.lower_expr_to(body, ret_v);
+            if let Some(v) = lowerer.vertices.get_mut(ret_v.0 as usize)
+                && let IrOp::Return { value } = &mut v.op
+            {
+                *value = Some(expr_val);
+            }
             expr_entry
         };
         lowerer.active_ctor_class = None;
@@ -602,6 +617,7 @@ struct ScopeLowerer<'a, 'b> {
     syntax_to_vertex: FxHashMap<SyntaxId, VertexId>,
     expr_to_vertex: FxHashMap<LocalSyntaxId, VertexId>,
     expr_to_value: FxHashMap<LocalSyntaxId, ValueId>,
+    value_sources: FxHashMap<ValueId, Vec<ValueId>>,
     branches: Vec<IrBranchRecord>,
     cf_frames: Vec<CfFrame>,
     active_finally_bodies: Vec<FinallyId>,
@@ -674,6 +690,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             syntax_to_vertex: FxHashMap::default(),
             expr_to_vertex: FxHashMap::default(),
             expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
             branches: Vec::new(),
             cf_frames: Vec::new(),
             active_finally_bodies: Vec::new(),
@@ -729,6 +746,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             syntax_to_vertex: self.syntax_to_vertex,
             expr_to_vertex: self.expr_to_vertex,
             expr_to_value: self.expr_to_value,
+            value_sources: self.value_sources,
             branches: self.branches,
             value_count: self.next_value_id,
         };
@@ -736,6 +754,15 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             ir: Arc::new(ir),
             node_to_syntax: self.node_to_syntax,
             syntax_to_node: self.syntax_to_node,
+        }
+    }
+
+    fn record_value_sources(&mut self, merged: ValueId, sources: &[ValueId]) {
+        let entry = self.value_sources.entry(merged).or_default();
+        for &src in sources {
+            if src != merged && !entry.contains(&src) {
+                entry.push(src);
+            }
         }
     }
 
@@ -979,10 +1006,8 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
     }
 
     fn resolve_binding(&self, ident_node: P<Node>) -> Option<LocalBindingId> {
-        if let Some(sym) = self.bridge.and_then(|b| b.symbol_for_node_raw(ident_node))
-            && let Some(&id) = self.binding_by_raw_symbol.get(&sym)
-        {
-            return Some(id);
+        if let Some(sym) = self.bridge.and_then(|b| b.symbol_for_node_raw(ident_node)) {
+            return self.binding_by_raw_symbol.get(&sym).copied();
         }
         node_text(ident_node).and_then(|name| self.binding_by_name.get(&name).copied())
     }
@@ -1997,7 +2022,8 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         let join = self.new_vertex(None, IrOp::NopMerge, Some(out_val), false);
         self.add_edge(join, cont, ExplicitEdgeKind::Fallthrough);
 
-        let (def_entry, _def_val) = self.lower_expr_to(default_expr, join);
+        let (def_entry, def_val) = self.lower_expr_to(default_expr, join);
+        self.record_value_sources(out_val, &[raw_val, def_val]);
         let use_raw = self.new_vertex(
             None,
             IrOp::ValueForward {
@@ -3508,13 +3534,22 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             Kind::SuperKeyword => self.emit_leaf_expr(node, IrOp::SuperRef, next, true),
             Kind::MetaProperty => self.emit_leaf_expr(node, IrOp::MetaProp, next, true),
             Kind::Identifier => {
-                let sid = self.intern_node(node);
-                let op = self
-                    .resolve_binding(node)
-                    .map_or(IrOp::ReadSymbol { ident_syntax: sid }, |binding| {
-                        IrOp::ReadLocal { binding }
-                    });
-                self.emit_leaf_expr(node, op, next, true)
+                if let Some(binding) = self.resolve_binding(node) {
+                    self.emit_leaf_expr(node, IrOp::ReadLocal { binding }, next, true)
+                } else if self.bridge.is_some_and(|b| b.is_global_undefined(node)) {
+                    self.emit_leaf_expr(
+                        node,
+                        IrOp::Literal {
+                            kind: LiteralKind::Undefined,
+                            as_const: false,
+                        },
+                        next,
+                        true,
+                    )
+                } else {
+                    let sid = self.intern_node(node);
+                    self.emit_leaf_expr(node, IrOp::ReadSymbol { ident_syntax: sid }, next, true)
+                }
             }
             Kind::PrivateIdentifier => {
                 let sid = self.intern_node(node);
@@ -4270,8 +4305,9 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         self.add_edge(join, next, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, join, out_val);
 
-        let (true_entry, _) = self.lower_expr_to(cond_expr.when_true(), join);
-        let (false_entry, _) = self.lower_expr_to(cond_expr.when_false(), join);
+        let (true_entry, true_val) = self.lower_expr_to(cond_expr.when_true(), join);
+        let (false_entry, false_val) = self.lower_expr_to(cond_expr.when_false(), join);
+        self.record_value_sources(out_val, &[true_val, false_val]);
         let entry =
             self.build_conditional_branches(node, cond_expr.condition(), true_entry, false_entry);
         // Ensure the ConditionalExpression itself resolves to `entry` in `syntax_to_vertex` / `expr_to_vertex`
@@ -4291,13 +4327,27 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             return self.lower_logical_assign_expr(node, bin.left(), bin.right(), op_kind, next);
         }
         if matches!(op_kind, Kind::AmpersandAmpersandToken | Kind::BarBarToken) {
-            let out_val = self.alloc_value();
-            let entry = self.lower_bool_expr(node, next, next);
-            self.bind_expr_maps(node, entry, out_val);
-            return (entry, out_val);
+            let branch_kind = if op_kind == Kind::AmpersandAmpersandToken {
+                IrBranchKind::LogicalAnd
+            } else {
+                IrBranchKind::LogicalOr
+            };
+            return self.lower_short_circuit_value_expr(
+                branch_kind,
+                node,
+                bin.left(),
+                bin.right(),
+                next,
+            );
         }
         if op_kind == Kind::QuestionQuestionToken {
-            return self.lower_nullish_expr(node, bin.left(), bin.right(), next);
+            return self.lower_short_circuit_value_expr(
+                IrBranchKind::NullishCoalescing,
+                node,
+                bin.left(),
+                bin.right(),
+                next,
+            );
         }
         if let Some(assign_op) = classify_assign_op(op_kind) {
             return self.lower_assignment_expr(node, bin.left(), bin.right(), assign_op, next);
@@ -4471,6 +4521,26 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             {
                 *object = base_val;
             }
+            if write_cont != join
+                && let Some(vert) = self.vertices.get_mut(write_cont.0 as usize)
+                && let IrOp::Call {
+                    callee,
+                    receiver,
+                    args,
+                    ..
+                } = &mut vert.op
+            {
+                *callee = base_val;
+                *receiver = Some(base_val);
+                *args = vec![IrCallArg::Positional(right_val)];
+            }
+            if read_cont != gate
+                && let Some(vert) = self.vertices.get_mut(read_cont.0 as usize)
+                && let IrOp::Call { receiver, .. } = &mut vert.op
+            {
+                *receiver = Some(base_val);
+            }
+            self.record_value_sources(out_val, &[read_val, right_val]);
             self.bind_expr_maps(node, join, out_val);
             return (base_entry, out_val);
         }
@@ -4561,6 +4631,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         self.add_edge(gate, right_entry, ExplicitEdgeKind::Branch(cont_branch));
 
         let (read_entry, read_val) = self.lower_expr_to(target, gate);
+        self.record_value_sources(out_val, &[read_val, right_val]);
         for w in wrappers {
             self.bind_expr_maps(w, read_entry, read_val);
         }
@@ -4568,18 +4639,23 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         (read_entry, out_val)
     }
 
-    fn lower_nullish_expr(
+    fn lower_short_circuit_value_expr(
         &mut self,
+        branch_kind: IrBranchKind,
         node: P<Node>,
         left: P<Node>,
         right: P<Node>,
         next: VertexId,
     ) -> (VertexId, ValueId) {
-        let (right_entry, _) = self.lower_expr_to(right, next);
+        let out_val = self.alloc_value();
+        let join = self.new_vertex(Some(node), IrOp::NopMerge, Some(out_val), true);
+        self.add_edge(join, next, ExplicitEdgeKind::Fallthrough);
+
+        let (right_entry, right_val) = self.lower_expr_to(right, join);
         let expr_loc = self.loc(node);
         let left_loc = self.loc(left);
         let short_branch = self.push_branch(
-            IrBranchKind::NullishCoalescing,
+            branch_kind,
             IrBranchDirection::ShortCircuit,
             left,
             left_loc.clone(),
@@ -4587,7 +4663,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             None,
         );
         let cont_branch = self.push_branch(
-            IrBranchKind::NullishCoalescing,
+            branch_kind,
             IrBranchDirection::Continue,
             left,
             left_loc,
@@ -4596,15 +4672,13 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         );
 
         let gate = self.new_vertex(None, IrOp::NopMerge, None, false);
-        self.add_edge(gate, next, ExplicitEdgeKind::Branch(short_branch));
+        self.add_edge(gate, join, ExplicitEdgeKind::Branch(short_branch));
         self.add_edge(gate, right_entry, ExplicitEdgeKind::Branch(cont_branch));
 
-        let out_val = self.alloc_value();
-        let here = self.new_vertex(Some(node), IrOp::NopMerge, Some(out_val), true);
-        let (left_entry, _) = self.lower_expr_to(left, gate);
-        self.add_edge(here, left_entry, ExplicitEdgeKind::Fallthrough);
-        self.bind_expr_maps(node, here, out_val);
-        (here, out_val)
+        let (left_entry, left_val) = self.lower_expr_to(left, gate);
+        self.record_value_sources(out_val, &[left_val, right_val]);
+        self.bind_expr_maps(node, join, out_val);
+        (left_entry, out_val)
     }
 
     fn patch_assign_value(&mut self, assign_v: VertexId, rhs_val: ValueId) {
@@ -5653,6 +5727,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             self.lower_expr_to(node, cont_next)
         };
         if owns_join {
+            self.record_value_sources(out_val, &[val]);
             self.bind_expr_maps(node, tail_join, val);
         }
         (entry, val)
@@ -6829,7 +6904,20 @@ fn is_ident_write_site(ident: P<Node>) -> bool {
     let mut cur = ident;
     while let Some(parent) = cur.parent() {
         let pk = parent.kind();
-        if matches!(pk, Kind::ParenthesizedExpression | Kind::NonNullExpression) {
+        if matches!(
+            pk,
+            Kind::ParenthesizedExpression
+                | Kind::NonNullExpression
+                | Kind::AsExpression
+                | Kind::TypeAssertionExpression
+                | Kind::SatisfiesExpression
+                | Kind::ShorthandPropertyAssignment
+                | Kind::PropertyAssignment
+                | Kind::ObjectLiteralExpression
+                | Kind::ArrayLiteralExpression
+                | Kind::SpreadElement
+                | Kind::SpreadAssignment
+        ) {
             cur = parent;
         } else if pk == Kind::PrefixUnaryExpression {
             return matches!(

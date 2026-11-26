@@ -1,8 +1,14 @@
-use std::cell::RefCell;
+use std::{
+    cell::{OnceCell, RefCell},
+    sync::{Arc, RwLock},
+};
 
 use rustc_hash::FxHashMap;
 use serde_json::Value;
-use tsrs_ast::{Kind, Node, SourceFile, Symbol, SymbolFlags, get_source_file_of_node};
+use tsrs_ast::{
+    Kind, Node, NodeFlags, SourceFile, Symbol, SymbolFlags, get_source_file_of_node,
+    is_function_like_declaration,
+};
 use tsrs_checker::{
     LiteralValue, Signature, Type, TypeDataTag, TypeFlags, TypeFormatFlags, TypePredicateKind,
 };
@@ -10,13 +16,22 @@ use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, resolve_project_reference_path};
 use tssae_analysis::ir::{ImplicitAccessorKind, TypeGuardSemantics};
 use tssae_common::{
-    DeclarationSummaryData, DiagnosticLocation, FileId, GapItem, SemanticModel, SignatureId,
-    SymbolId, SyntaxId, TypeId, TypeSummaryData, UnknownReason,
+    DeclarationSummaryData, DiagnosticLocation, FileId, GapItem, ImplementationFact,
+    ImplementationSourceKind, MemberTargetHierarchy, ResolvedImplementationFact, SemanticModel,
+    SignatureId, SymbolId, SyntaxCatalog, SyntaxId, TypeId, TypeSummaryData, UnknownReason,
 };
 
-use crate::syntax_view::{
-    FileSyntaxIndex, SyntaxCatalogBridge, is_project_source_file, node_location,
-    node_location_relative, relative_to_cwd, resolve_against_cwd, slice_source_text,
+use crate::{
+    hierarchy::{HierarchyInterner, HierarchyQueryEnv, ProgramHierarchyIndex},
+    impl_resolution::{
+        FacadeImplementationInput, FacadeImplementationOutcome, FirstPartyResolutionSource,
+        SourceMapCache,
+    },
+    syntax_view::{
+        FileIdRegistry, FileSyntaxIndex, SyntaxCatalogBridge, is_project_source_file,
+        node_location, node_location_relative, node_text, relative_to_cwd, resolve_against_cwd,
+        slice_source_text, unwrap_expr_wrappers,
+    },
 };
 
 /// Parameter index selector forwarded from projection queries.
@@ -440,26 +455,113 @@ impl<'a> SemanticFacade<'a> {
 
     /// Inspects a syntax target for `resolveCalls`.
     ///
+    /// Accepts explicit `CallExpression`, `NewExpression`, `TaggedTemplateExpression`,
+    /// as well as implicit getter `PropertyAccessExpression`, setter `BinaryExpression`,
+    /// and `using` `VariableDeclaration` sites.
+    ///
     /// # Errors
-    /// Returns [`NotACallError`] if `node` is not a `CallExpression` or `NewExpression`.
+    /// Returns [`NotACallError`] if `node` is not a supported call/construct/implicit-call site.
     pub fn resolve_call(
         &mut self,
         node: P<Node>,
         select: &FacadeCallSelect,
     ) -> Result<FacadeCallProjection, NotACallError> {
-        if !matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
+        let implicit_flavor = self.classify_implicit_call(node);
+        if !matches!(
+            node.kind(),
+            Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression
+        ) && implicit_flavor.is_none()
+        {
             return Err(NotACallError {
                 kind_label: format!("{:?}", node.kind()),
                 location: node_location_relative(self.cwd, node),
             });
         }
-        Ok(self.project_call(node, select))
+        Ok(self.project_call_with_flavor(node, select, implicit_flavor))
     }
 
     pub fn project_call(
         &mut self,
         node: P<Node>,
         select: &FacadeCallSelect,
+    ) -> FacadeCallProjection {
+        let implicit_flavor = self.classify_implicit_call(node);
+        self.project_call_with_flavor(node, select, implicit_flavor)
+    }
+
+    fn classify_implicit_call(&mut self, node: P<Node>) -> Option<ImplicitAccessorKind> {
+        match node.kind() {
+            Kind::PropertyAccessExpression => {
+                if let Some(parent) = node.parent()
+                    && parent.kind() == Kind::BinaryExpression
+                    && parent.as_binary_expression().left() == node
+                {
+                    return None;
+                }
+                let sym = self
+                    .checker
+                    .get_symbol_at_location_exported(node)
+                    .map(|s| unwrap_aliased_symbol(self.checker, s))
+                    .filter(|&s| s != self.checker.get_unknown_symbol())?;
+                sym.flags()
+                    .intersects(SymbolFlags::GetAccessor)
+                    .then_some(ImplicitAccessorKind::Getter)
+            }
+            Kind::BinaryExpression => {
+                let bin = node.as_binary_expression();
+                let op = bin.operator_token().kind();
+                if !matches!(
+                    op,
+                    Kind::EqualsToken
+                        | Kind::PlusEqualsToken
+                        | Kind::MinusEqualsToken
+                        | Kind::AsteriskEqualsToken
+                        | Kind::SlashEqualsToken
+                        | Kind::PercentEqualsToken
+                        | Kind::BarBarEqualsToken
+                        | Kind::AmpersandAmpersandEqualsToken
+                        | Kind::QuestionQuestionEqualsToken
+                ) {
+                    return None;
+                }
+                let lhs = unwrap_expr_wrappers(bin.left());
+                if lhs.kind() != Kind::PropertyAccessExpression {
+                    return None;
+                }
+                let sym = self
+                    .checker
+                    .get_symbol_at_location_exported(lhs)
+                    .map(|s| unwrap_aliased_symbol(self.checker, s))
+                    .filter(|&s| s != self.checker.get_unknown_symbol())?;
+                sym.flags()
+                    .intersects(SymbolFlags::SetAccessor)
+                    .then_some(ImplicitAccessorKind::Setter)
+            }
+            Kind::VariableDeclaration => {
+                let list = node.parent()?;
+                if list.kind() == Kind::VariableDeclarationList
+                    && list
+                        .flags()
+                        .intersects(NodeFlags::Using | NodeFlags::AwaitUsing)
+                {
+                    // Reuse `Getter` sentinel in this private enum helper only to mark `using` as callable.
+                    return Some(ImplicitAccessorKind::Getter);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Projects both explicit call/new/tagged-template expressions and implicit accessor/`using` call sites."
+    )]
+    fn project_call_with_flavor(
+        &mut self,
+        node: P<Node>,
+        select: &FacadeCallSelect,
+        implicit_flavor: Option<ImplicitAccessorKind>,
     ) -> FacadeCallProjection {
         let call_loc = node_location_relative(self.cwd, node);
         let mut gaps = Vec::new();
@@ -470,14 +572,29 @@ impl<'a> SemanticFacade<'a> {
             None
         };
 
+        let is_explicit = matches!(
+            node.kind(),
+            Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression
+        );
+
         let callee = if select.callee {
-            node.expression()
+            if node.kind() == Kind::TaggedTemplateExpression {
+                Some(node.as_tagged_template_expression().tag())
+            } else if node.kind() == Kind::BinaryExpression {
+                Some(unwrap_expr_wrappers(node.as_binary_expression().left()))
+            } else if node.kind() == Kind::PropertyAccessExpression
+                || node.kind() == Kind::VariableDeclaration
+            {
+                Some(node)
+            } else {
+                node.expression()
+            }
         } else {
             None
         };
 
         let callee_declaration = if select.callee_declaration {
-            let resolved = resolve_symbol_for_node(self.checker, node);
+            let resolved = resolve_implicit_or_call_decl(self.checker, node, implicit_flavor);
             if let Some(decl) = resolved.primary_decl {
                 Some((decl, resolved.symbol))
             } else {
@@ -492,8 +609,10 @@ impl<'a> SemanticFacade<'a> {
             None
         };
 
-        let needs_sig =
-            select.signature || select.instantiated_parameter_types.is_some() || select.return_type;
+        let needs_sig = is_explicit
+            && (select.signature
+                || select.instantiated_parameter_types.is_some()
+                || select.return_type);
         let resolved_sig = if needs_sig {
             let sig = self.checker.get_resolved_signature_exported(node);
             if is_unresolved_signature(self.checker, sig) {
@@ -511,7 +630,20 @@ impl<'a> SemanticFacade<'a> {
         };
 
         let signature = if select.signature { resolved_sig } else { None };
-        let arguments = select.arguments.then(|| node.arguments().to_vec());
+        let arguments = select.arguments.then(|| {
+            if node.kind() == Kind::TaggedTemplateExpression {
+                vec![node.as_tagged_template_expression().template()]
+            } else if node.kind() == Kind::BinaryExpression {
+                vec![node.as_binary_expression().right()]
+            } else if matches!(
+                node.kind(),
+                Kind::PropertyAccessExpression | Kind::VariableDeclaration
+            ) {
+                Vec::new()
+            } else {
+                node.arguments().to_vec()
+            }
+        });
 
         let instantiated_parameter_types =
             select
@@ -702,18 +834,53 @@ impl<'a> SemanticFacade<'a> {
 
 type InternedTypeMap = FxHashMap<TypeId, (P<Type>, Option<P<Node>>)>;
 
-/// Snapshot-scoped bridge implementing [`SemanticModel`] over opaque handles.
+/// Snapshot-scoped registry assigning stable [`SymbolId`]s across multiple analysis queries.
+#[derive(Default)]
+pub struct SymbolRegistry {
+    symbols: FxHashMap<SymbolId, P<Symbol>>,
+    symbol_ids: FxHashMap<P<Symbol>, SymbolId>,
+}
+
+impl SymbolRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, sym: P<Symbol>) -> SymbolId {
+        if let Some(&id) = self.symbol_ids.get(&sym) {
+            return id;
+        }
+        let next = u64::try_from(self.symbols.len()).unwrap_or(u64::MAX);
+        let id = SymbolId(next);
+        self.symbols.insert(id, sym);
+        self.symbol_ids.insert(sym, id);
+        id
+    }
+
+    #[must_use]
+    pub fn get(&self, id: SymbolId) -> Option<P<Symbol>> {
+        self.symbols.get(&id).copied()
+    }
+}
+
+/// Snapshot-scoped bridge implementing [`SemanticModel`] and [`SyntaxCatalog`] over opaque handles.
 ///
 /// Uses interior mutability for the underlying `CheckerHandle` and interning tables so
 /// analysis passes can query read-only semantic facts via `&dyn SemanticModel`.
 pub struct SemanticModelBridge<'a> {
     cwd: &'a str,
     program: &'static Program,
+    workspace_programs: &'a [&'static Program],
     checker: RefCell<&'a mut CheckerHandle>,
     syntax: RefCell<SyntaxCatalogBridge>,
     file_index: Option<(&'a FileSyntaxIndex, FileId)>,
-    symbols: RefCell<FxHashMap<SymbolId, P<Symbol>>>,
-    symbol_ids: RefCell<FxHashMap<P<Symbol>, SymbolId>>,
+    file_ids: Option<Arc<RwLock<FileIdRegistry>>>,
+    file_indices: Option<RefCell<&'a mut FxHashMap<FileId, Arc<FileSyntaxIndex>>>>,
+    sourcemap_cache: Option<&'a SourceMapCache>,
+    hierarchy_index: OnceCell<ProgramHierarchyIndex>,
+    shared_symbols: Option<RefCell<&'a mut SymbolRegistry>>,
+    local_symbols: RefCell<SymbolRegistry>,
     types: RefCell<InternedTypeMap>,
     type_ids: RefCell<FxHashMap<P<Type>, TypeId>>,
     signatures: RefCell<FxHashMap<SignatureId, P<Signature>>>,
@@ -726,11 +893,16 @@ impl<'a> SemanticModelBridge<'a> {
         Self {
             cwd,
             program,
+            workspace_programs: &[],
             checker: RefCell::new(checker),
             syntax: RefCell::new(SyntaxCatalogBridge::new(cwd)),
             file_index: None,
-            symbols: RefCell::new(FxHashMap::default()),
-            symbol_ids: RefCell::new(FxHashMap::default()),
+            file_ids: None,
+            file_indices: None,
+            sourcemap_cache: None,
+            hierarchy_index: OnceCell::new(),
+            shared_symbols: None,
+            local_symbols: RefCell::new(SymbolRegistry::new()),
             types: RefCell::new(FxHashMap::default()),
             type_ids: RefCell::new(FxHashMap::default()),
             signatures: RefCell::new(FxHashMap::default()),
@@ -751,8 +923,123 @@ impl<'a> SemanticModelBridge<'a> {
     }
 
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Wires snapshot multi-file syntax indices, symbol registry, source-map cache, and workspace programs."
+    )]
+    pub fn with_snapshot_store(
+        cwd: &'a str,
+        program: &'static Program,
+        workspace_programs: &'a [&'static Program],
+        checker: &'a mut CheckerHandle,
+        file_ids: Arc<RwLock<FileIdRegistry>>,
+        file_indices: &'a mut FxHashMap<FileId, Arc<FileSyntaxIndex>>,
+        shared_symbols: &'a mut SymbolRegistry,
+        sourcemap_cache: &'a SourceMapCache,
+    ) -> Self {
+        Self {
+            cwd,
+            program,
+            workspace_programs,
+            checker: RefCell::new(checker),
+            syntax: RefCell::new(SyntaxCatalogBridge::new(cwd)),
+            file_index: None,
+            file_ids: Some(file_ids),
+            file_indices: Some(RefCell::new(file_indices)),
+            sourcemap_cache: Some(sourcemap_cache),
+            hierarchy_index: OnceCell::new(),
+            shared_symbols: Some(RefCell::new(shared_symbols)),
+            local_symbols: RefCell::new(SymbolRegistry::new()),
+            types: RefCell::new(FxHashMap::default()),
+            type_ids: RefCell::new(FxHashMap::default()),
+            signatures: RefCell::new(FxHashMap::default()),
+            signature_ids: RefCell::new(FxHashMap::default()),
+        }
+    }
+
+    #[must_use]
     pub const fn cwd(&self) -> &'a str {
         self.cwd
+    }
+
+    pub fn ensure_source_file_index(
+        &self,
+        sf: P<SourceFile>,
+    ) -> Option<(FileId, Arc<FileSyntaxIndex>)> {
+        let fid = self.ensure_file_index_for_sf(sf)?;
+        let idx = self.file_indices.as_ref()?.borrow().get(&fid).cloned()?;
+        Some((fid, idx))
+    }
+
+    #[must_use]
+    pub fn get_file_syntax_index(&self, file_id: FileId) -> Option<Arc<FileSyntaxIndex>> {
+        if let Some((_, fid)) = self.file_index
+            && fid == file_id
+        {
+            return None;
+        }
+        self.file_indices.as_ref()?.borrow().get(&file_id).cloned()
+    }
+
+    /// Lowers `scope_node` using this bridge's checker and cached file syntax index.
+    ///
+    /// # Errors
+    /// Returns a [`GapItem`] if `scope_node` has no source file or fails IR lowering.
+    pub fn lower_scope_to_ir(
+        &self,
+        scope_node: P<Node>,
+        local_scope: u32,
+    ) -> Result<Arc<tssae_analysis::ir::FunctionIr>, GapItem> {
+        let sf = get_source_file_of_node(scope_node).ok_or_else(|| {
+            GapItem::from_reason(
+                UnknownReason::MissingSourceFile,
+                "Scope node has no source file.".to_string(),
+                None,
+            )
+        })?;
+        let file_index = self.ensure_source_file_index(sf).map(|(_, idx)| idx);
+        let mut checker = self.checker.borrow_mut();
+        if matches!(
+            scope_node.kind(),
+            Kind::ClassDeclaration | Kind::ClassExpression
+        ) {
+            return crate::ir_lower::lower_class_default_constructor_to_ir(
+                self.cwd,
+                self.program,
+                &mut checker,
+                scope_node,
+                local_scope,
+                file_index.as_deref(),
+            )
+            .map(|ls| ls.ir);
+        }
+        crate::ir_lower::lower_scope_to_ir_with_index(
+            self.cwd,
+            self.program,
+            &mut checker,
+            scope_node,
+            local_scope,
+            file_index.as_deref(),
+        )
+        .map(|ls| ls.ir)
+    }
+
+    fn ensure_file_index_for_sf(&self, sf: P<SourceFile>) -> Option<FileId> {
+        let file_ids = self.file_ids.as_ref()?;
+        let rel_file = relative_to_cwd(self.cwd, sf.file_name());
+        let file_id = file_ids.write().ok()?.intern(&rel_file);
+        let sf_addr = std::ptr::from_ref(&*sf) as usize;
+        if let Some(indices_cell) = &self.file_indices {
+            let mut indices = indices_cell.borrow_mut();
+            let needs_rebuild = indices
+                .get(&file_id)
+                .is_none_or(|existing| existing.source_file_addr != sf_addr);
+            if needs_rebuild {
+                let built = Arc::new(FileSyntaxIndex::build(file_id, rel_file, sf));
+                indices.insert(file_id, built);
+            }
+        }
+        Some(file_id)
     }
 
     pub fn intern_syntax(&self, node: P<Node>) -> Option<SyntaxId> {
@@ -761,13 +1048,170 @@ impl<'a> SemanticModelBridge<'a> {
         {
             return Some(sid);
         }
+        if let (Some(_), Some(indices_cell)) = (&self.file_ids, &self.file_indices)
+            && let Some(sf) = get_source_file_of_node(node)
+            && let Some(fid) = self.ensure_file_index_for_sf(sf)
+            && let Some(sid) = indices_cell
+                .borrow()
+                .get(&fid)
+                .and_then(|idx| idx.syntax_id_for_node(node))
+        {
+            return Some(sid);
+        }
         self.syntax.borrow_mut().intern_node(node)
+    }
+
+    #[must_use]
+    pub fn node_for_syntax(&self, syntax: SyntaxId) -> Option<P<Node>> {
+        if let Some((index, fid)) = self.file_index
+            && syntax.file_id() == fid
+            && let Some(node) = index.node_for_syntax_id(syntax)
+        {
+            return Some(node);
+        }
+        if let Some(indices_cell) = &self.file_indices
+            && let Some(node) = indices_cell
+                .borrow()
+                .get(&syntax.file_id())
+                .and_then(|idx| idx.node_for_syntax_id(syntax))
+        {
+            return Some(node);
+        }
+        self.syntax.borrow().get_node(syntax)
+    }
+
+    #[must_use]
+    pub fn symbol_for_id(&self, symbol: SymbolId) -> Option<P<Symbol>> {
+        if let Some(shared) = &self.shared_symbols {
+            return shared.borrow().get(symbol);
+        }
+        self.local_symbols.borrow().get(symbol)
+    }
+
+    fn hierarchy_index(&self) -> &ProgramHierarchyIndex {
+        self.hierarchy_index.get_or_init(|| {
+            let mut checker = self.checker.borrow_mut();
+            ProgramHierarchyIndex::build(
+                self.cwd,
+                self.program,
+                self.workspace_programs,
+                &mut checker,
+            )
+        })
+    }
+
+    fn summarize_decl(
+        &self,
+        decl_node: Option<P<Node>>,
+        sym_opt: Option<P<Symbol>>,
+    ) -> DeclarationSummaryData {
+        let primary_syntax = decl_node.and_then(|decl| self.intern_syntax(decl));
+        let symbol = sym_opt.map(|sym| self.intern_symbol(sym));
+        let raw_name = decl_node
+            .and_then(|decl| {
+                decl.name().and_then(node_text).or_else(|| {
+                    (decl.kind() == Kind::Constructor).then(|| "constructor".to_string())
+                })
+            })
+            .or_else(|| {
+                sym_opt
+                    .map(|s| s.name().to_string())
+                    .filter(|n| !matches!(n.as_str(), "__function" | "__class" | "unknown"))
+            });
+        let container_name = decl_node.and_then(resolve_declaration_container_name);
+        let kind = decl_node.map(|decl| format!("{:?}", decl.kind()));
+        let location = decl_node.and_then(|decl| node_location_relative(self.cwd, decl));
+        let decl_sf = decl_node.and_then(get_source_file_of_node);
+        let is_default_library =
+            decl_sf.is_some_and(|sf| self.program.is_source_file_default_library(sf.path()));
+        let is_external = decl_sf.is_some_and(|sf| {
+            !is_project_source_file(self.program, sf)
+                && !crate::impl_resolution::is_first_party_workspace_path(self.cwd, sf.file_name())
+        });
+        let is_signature_only = decl_node.is_some_and(|decl| {
+            matches!(
+                decl.kind(),
+                Kind::MethodSignature
+                    | Kind::CallSignature
+                    | Kind::ConstructSignature
+                    | Kind::FunctionType
+                    | Kind::ConstructorType
+                    | Kind::PropertySignature
+                    | Kind::Parameter
+            )
+        });
+        let callable_node = decl_node.and_then(extract_callable_from_decl_node);
+        let has_body = decl_node.is_some_and(|decl| {
+            if is_function_like_declaration(Some(decl)) {
+                return decl.body().is_some();
+            }
+            if matches!(decl.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
+                return decl_sf.is_some_and(|sf| !sf.is_declaration_file());
+            }
+            callable_node.is_some_and(|f| f.body().is_some())
+        });
+        let initializer_syntax = decl_node
+            .and_then(|decl| {
+                matches!(
+                    decl.kind(),
+                    Kind::VariableDeclaration
+                        | Kind::PropertyDeclaration
+                        | Kind::PropertyAssignment
+                )
+                .then(|| decl.initializer().map(unwrap_expr_wrappers))
+                .flatten()
+            })
+            .and_then(|init| self.intern_syntax(init));
+        let callable_syntax = callable_node.and_then(|c| self.intern_syntax(c));
+
+        DeclarationSummaryData {
+            symbol,
+            primary_syntax,
+            name: raw_name,
+            container_name,
+            kind,
+            location,
+            is_external,
+            is_default_library,
+            has_body,
+            is_signature_only,
+            initializer_syntax,
+            callable_syntax,
+        }
     }
 
     #[must_use]
     pub fn symbol_for_node_raw(&self, node: P<Node>) -> Option<P<Symbol>> {
         let mut checker = self.checker.borrow_mut();
         resolve_symbol_for_node(&mut checker, node).symbol
+    }
+
+    #[must_use]
+    pub fn is_global_undefined(&self, node: P<Node>) -> bool {
+        if node.kind() != Kind::Identifier || node_text(node).as_deref() != Some("undefined") {
+            return false;
+        }
+        let mut checker = self.checker.borrow_mut();
+        let sym_opt = checker
+            .get_symbol_at_location_exported(node)
+            .map(|s| unwrap_aliased_symbol(&mut checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol());
+        let ty_is_undefined = checker
+            .get_type_at_location(node)
+            .flags()
+            .intersects(TypeFlags::Undefined);
+        drop(checker);
+        let Some(sym) = sym_opt else {
+            return ty_is_undefined;
+        };
+        let decls = unwrap_sym_declarations(sym);
+        if decls.is_empty() {
+            return ty_is_undefined;
+        }
+        decls.iter().any(|&decl| {
+            get_source_file_of_node(decl)
+                .is_some_and(|sf| self.program.is_source_file_default_library(sf.path()))
+        })
     }
 
     #[must_use]
@@ -857,14 +1301,10 @@ impl<'a> SemanticModelBridge<'a> {
     }
 
     pub fn intern_symbol(&self, sym: P<Symbol>) -> SymbolId {
-        if let Some(&id) = self.symbol_ids.borrow().get(&sym) {
-            return id;
+        if let Some(shared) = &self.shared_symbols {
+            return shared.borrow_mut().intern(sym);
         }
-        let next = u64::try_from(self.symbols.borrow().len()).unwrap_or(u64::MAX);
-        let id = SymbolId(next);
-        self.symbols.borrow_mut().insert(id, sym);
-        self.symbol_ids.borrow_mut().insert(sym, id);
-        id
+        self.local_symbols.borrow_mut().intern(sym)
     }
 
     pub fn intern_type(&self, ty: P<Type>, enclosing: Option<P<Node>>) -> TypeId {
@@ -930,9 +1370,35 @@ impl<'a> SemanticModelBridge<'a> {
     }
 }
 
+impl SyntaxCatalog for SemanticModelBridge<'_> {
+    fn syntax_location(&self, syntax: SyntaxId) -> Option<DiagnosticLocation> {
+        let node = self.node_for_syntax(syntax)?;
+        node_location_relative(self.cwd, node)
+    }
+
+    fn syntax_text(&self, syntax: SyntaxId) -> Option<String> {
+        let node = self.node_for_syntax(syntax)?;
+        node_text(node)
+    }
+
+    fn syntax_kind(&self, syntax: SyntaxId) -> Option<String> {
+        let node = self.node_for_syntax(syntax)?;
+        Some(format!("{:?}", node.kind()))
+    }
+
+    fn file_path(&self, file: FileId) -> Option<&str> {
+        if let Some((index, fid)) = self.file_index
+            && fid == file
+        {
+            return Some(Box::leak(index.rel_file.clone().into_boxed_str()));
+        }
+        None
+    }
+}
+
 impl SemanticModel for SemanticModelBridge<'_> {
     fn symbol_at_syntax(&self, syntax: SyntaxId) -> Option<SymbolId> {
-        let node = self.syntax.borrow().get_node(syntax)?;
+        let node = self.node_for_syntax(syntax)?;
         let sym = {
             let mut checker = self.checker.borrow_mut();
             let resolved = resolve_symbol_for_node(&mut checker, node).symbol;
@@ -943,7 +1409,7 @@ impl SemanticModel for SemanticModelBridge<'_> {
     }
 
     fn type_at_syntax(&self, syntax: SyntaxId) -> Option<TypeSummaryData> {
-        let node = self.syntax.borrow().get_node(syntax)?;
+        let node = self.node_for_syntax(syntax)?;
         let enclosing = node.parent().or(Some(node));
         let summary = {
             let mut checker = self.checker.borrow_mut();
@@ -966,45 +1432,27 @@ impl SemanticModel for SemanticModelBridge<'_> {
     }
 
     fn signature_at_syntax(&self, syntax: SyntaxId) -> Option<SignatureId> {
-        let node = self.syntax.borrow().get_node(syntax)?;
+        let node = self.node_for_syntax(syntax)?;
         self.signature_id_for_node(node)
     }
 
     fn resolve_declaration(&self, syntax: SyntaxId) -> Option<DeclarationSummaryData> {
-        let node = self.syntax.borrow().get_node(syntax)?;
+        let node = self.node_for_syntax(syntax)?;
         let resolved = {
             let mut checker = self.checker.borrow_mut();
             let resolved = resolve_symbol_for_node(&mut checker, node);
             drop(checker);
             resolved
         };
-        let primary_syntax = resolved
-            .primary_decl
-            .and_then(|decl| self.intern_syntax(decl));
-        let symbol = resolved.symbol.map(|sym| self.intern_symbol(sym));
-        let name = resolved.symbol.map(|s| s.name().to_string());
-        let container_name = resolved
-            .primary_decl
-            .and_then(resolve_declaration_container_name);
-        let kind = resolved
-            .primary_decl
-            .map(|decl| format!("{:?}", decl.kind()));
-        let location = resolved
-            .primary_decl
-            .and_then(|decl| node_location_relative(self.cwd, decl));
-        let is_external = resolved.primary_decl.is_some_and(|decl| {
-            get_source_file_of_node(decl)
-                .is_some_and(|sf| !is_project_source_file(self.program, sf))
-        });
-        Some(DeclarationSummaryData {
-            symbol,
-            primary_syntax,
-            name,
-            container_name,
-            kind,
-            location,
-            is_external,
-        })
+        resolved.primary_decl.as_ref()?;
+        Some(self.summarize_decl(resolved.primary_decl, resolved.symbol))
+    }
+
+    fn resolve_declaration_by_symbol(&self, symbol: SymbolId) -> Option<DeclarationSummaryData> {
+        let sym = self.symbol_for_id(symbol)?;
+        let primary = pick_preferred_symbol_decl(sym);
+        primary.as_ref()?;
+        Some(self.summarize_decl(primary, Some(sym)))
     }
 
     fn is_assignable_to(&self, source: TypeId, target: TypeId) -> bool {
@@ -1035,10 +1483,231 @@ impl SemanticModel for SemanticModelBridge<'_> {
     }
 
     fn is_external_syntax(&self, syntax: SyntaxId) -> bool {
-        let Some(node) = self.syntax.borrow().get_node(syntax) else {
+        let Some(node) = self.node_for_syntax(syntax) else {
             return false;
         };
         get_source_file_of_node(node).is_some_and(|sf| !is_project_source_file(self.program, sf))
+    }
+
+    fn member_target_hierarchy(
+        &self,
+        receiver_syntax: SyntaxId,
+        _member_name: Option<&str>,
+        static_receiver: bool,
+    ) -> Option<MemberTargetHierarchy> {
+        struct BridgeInterner<'a, 'b>(&'a SemanticModelBridge<'b>);
+        impl HierarchyInterner for BridgeInterner<'_, '_> {
+            fn intern_syntax(&mut self, node: P<Node>) -> Option<SyntaxId> {
+                self.0.intern_syntax(node)
+            }
+            fn intern_symbol(&mut self, sym: P<Symbol>) -> SymbolId {
+                self.0.intern_symbol(sym)
+            }
+        }
+        let recv_node = self.node_for_syntax(receiver_syntax)?;
+        let index = self.hierarchy_index();
+        let mut checker = self.checker.borrow_mut();
+        let mut env = HierarchyQueryEnv {
+            cwd: self.cwd,
+            program: self.program,
+            checker: &mut checker,
+        };
+        let mut interner = BridgeInterner(self);
+        index.build_hierarchy_for_receiver(&mut env, recv_node, static_receiver, &mut interner)
+    }
+
+    fn class_hierarchy_for_symbol(&self, class_symbol: SymbolId) -> Option<MemberTargetHierarchy> {
+        struct BridgeInterner<'a, 'b>(&'a SemanticModelBridge<'b>);
+        impl HierarchyInterner for BridgeInterner<'_, '_> {
+            fn intern_syntax(&mut self, node: P<Node>) -> Option<SyntaxId> {
+                self.0.intern_syntax(node)
+            }
+            fn intern_symbol(&mut self, sym: P<Symbol>) -> SymbolId {
+                self.0.intern_symbol(sym)
+            }
+        }
+        let sym = self.symbol_for_id(class_symbol)?;
+        let index = self.hierarchy_index();
+        let mut checker = self.checker.borrow_mut();
+        let mut env = HierarchyQueryEnv {
+            cwd: self.cwd,
+            program: self.program,
+            checker: &mut checker,
+        };
+        let mut interner = BridgeInterner(self);
+        Some(index.hierarchy_from_symbols(&mut env, &[sym], false, false, &mut interner))
+    }
+
+    fn resolve_class_constructor(&self, class_syntax: SyntaxId) -> Option<DeclarationSummaryData> {
+        let node = self.node_for_syntax(class_syntax)?;
+        if node.kind() == Kind::Constructor {
+            let sym = self.symbol_for_node_raw(node);
+            return Some(self.summarize_decl(Some(node), sym));
+        }
+        if matches!(node.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
+            let members = if node.kind() == Kind::ClassDeclaration {
+                node.as_class_declaration().members().nodes()
+            } else {
+                node.as_class_expression().members().nodes()
+            };
+            let ctor = members
+                .iter()
+                .copied()
+                .find(|m| m.kind() == Kind::Constructor && m.body().is_some())
+                .or_else(|| {
+                    members
+                        .iter()
+                        .copied()
+                        .find(|m| m.kind() == Kind::Constructor)
+                });
+            let target_node = ctor.unwrap_or(node);
+            let sym = self.symbol_for_node_raw(target_node);
+            return Some(self.summarize_decl(Some(target_node), sym));
+        }
+        None
+    }
+
+    fn resolve_super_target(&self, call_syntax: SyntaxId) -> Option<DeclarationSummaryData> {
+        let call_node = self.node_for_syntax(call_syntax)?;
+        let mut cur = call_node.parent();
+        let class_node = loop {
+            let n = cur?;
+            if matches!(n.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
+                break n;
+            }
+            cur = n.parent();
+        };
+        let clauses = if class_node.kind() == Kind::ClassDeclaration {
+            class_node.as_class_declaration().heritage_clauses()?
+        } else {
+            class_node.as_class_expression().heritage_clauses()?
+        };
+        let mut base_expr: Option<P<Node>> = None;
+        for &clause in clauses.nodes() {
+            if clause.kind() == Kind::HeritageClause
+                && clause.as_heritage_clause().token() == Kind::ExtendsKeyword
+                && let Some(&first_ty) = clause.as_heritage_clause().types().nodes().first()
+                && first_ty.kind() == Kind::ExpressionWithTypeArguments
+            {
+                base_expr = Some(first_ty.as_expression_with_type_arguments().expression());
+                break;
+            }
+        }
+        let base_expr = base_expr?;
+        let base_sym = {
+            let mut checker = self.checker.borrow_mut();
+            checker
+                .get_symbol_at_location_exported(base_expr)
+                .map(|s| unwrap_aliased_symbol(&mut checker, s))
+                .filter(|&s| s != checker.get_unknown_symbol())?
+        };
+        let base_class = pick_preferred_symbol_decl(base_sym)?;
+        let base_class_syntax = self.intern_syntax(base_class)?;
+        self.resolve_class_constructor(base_class_syntax)
+    }
+
+    fn resolve_implementation_for_syntax(
+        &self,
+        decl_or_node_syntax: SyntaxId,
+        call_site_syntax: Option<SyntaxId>,
+    ) -> ImplementationFact {
+        let fallback_node = self.node_for_syntax(decl_or_node_syntax);
+        let call_node = call_site_syntax.and_then(|s| self.node_for_syntax(s));
+        let Some(target_node) = fallback_node else {
+            return ImplementationFact::External {
+                package_name: None,
+                declaration_file: None,
+                evidence: Vec::new(),
+            };
+        };
+
+        let sym = {
+            let mut checker = self.checker.borrow_mut();
+            resolve_symbol_for_node(&mut checker, target_node).symbol
+        };
+        let input = if let Some(cn) = call_node
+            && matches!(cn.kind(), Kind::CallExpression | Kind::NewExpression)
+            && target_node == cn
+        {
+            FacadeImplementationInput::Node(cn)
+        } else {
+            FacadeImplementationInput::Declaration(target_node, sym)
+        };
+
+        let mut owned_cache = None;
+        let sm_cache = self
+            .sourcemap_cache
+            .unwrap_or_else(|| owned_cache.get_or_insert_with(SourceMapCache::default));
+
+        let outcome = {
+            let mut checker = self.checker.borrow_mut();
+            let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
+            facade.resolve_implementation(input, self.workspace_programs, sm_cache)
+        };
+
+        match outcome {
+            FacadeImplementationOutcome::Resolved(target) => {
+                let Some(declaration_syntax) = self.intern_syntax(target.declaration_node) else {
+                    return ImplementationFact::External {
+                        package_name: target.package_name,
+                        declaration_file: target.declaration_file,
+                        evidence: Vec::new(),
+                    };
+                };
+                let declaration_symbol = target.declaration_symbol.map(|s| self.intern_symbol(s));
+                let fn_syntax = target.fn_node.and_then(|n| self.intern_syntax(n));
+                let resolution_source = match target.resolution_source {
+                    FirstPartyResolutionSource::CurrentProject => {
+                        ImplementationSourceKind::CurrentProject
+                    }
+                    FirstPartyResolutionSource::ProjectReference => {
+                        ImplementationSourceKind::ProjectReference
+                    }
+                    FirstPartyResolutionSource::CustomConditions => {
+                        ImplementationSourceKind::CustomConditions
+                    }
+                    FirstPartyResolutionSource::DeclarationMap => {
+                        ImplementationSourceKind::DeclarationMap
+                    }
+                };
+                ImplementationFact::Resolved(ResolvedImplementationFact {
+                    file: target.file,
+                    location: target.location,
+                    declaration_syntax,
+                    declaration_symbol,
+                    fn_syntax,
+                    export_name: target.export_name,
+                    package_name: target.package_name,
+                    resolution_source,
+                    declaration_file: target.declaration_file,
+                })
+            }
+            FacadeImplementationOutcome::External {
+                package_name,
+                declaration_file,
+                evidence,
+            } => ImplementationFact::External {
+                package_name,
+                declaration_file,
+                evidence,
+            },
+            FacadeImplementationOutcome::Inconclusive {
+                declaration_file,
+                gaps,
+                evidence,
+            } => ImplementationFact::Inconclusive {
+                declaration_file,
+                gaps,
+                evidence,
+            },
+        }
+    }
+
+    fn check_call_missing_package_gap(&self, call_syntax: SyntaxId) -> Option<GapItem> {
+        let node = self.node_for_syntax(call_syntax)?;
+        let mut checker = self.checker.borrow_mut();
+        let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
+        facade.check_call_missing_package_gap(node)
     }
 }
 
@@ -1145,11 +1814,145 @@ pub(crate) fn is_unresolved_signature(checker: &mut CheckerHandle, sig: P<Signat
     false
 }
 
+pub(crate) fn unwrap_sym_declarations(sym: P<Symbol>) -> Vec<P<Node>> {
+    let mut decls = sym.declarations().to_vec();
+    if let Some(vd) = sym.value_declaration()
+        && !decls.contains(&vd)
+    {
+        decls.push(vd);
+    }
+    decls
+}
+
+fn extract_callable_from_decl_node(decl: P<Node>) -> Option<P<Node>> {
+    if is_function_like_declaration(Some(decl)) {
+        return Some(decl);
+    }
+    match decl.kind() {
+        Kind::VariableDeclaration | Kind::PropertyDeclaration | Kind::PropertyAssignment => {
+            decl.initializer().and_then(|init| {
+                let inner = unwrap_expr_wrappers(init);
+                is_function_like_declaration(Some(inner)).then_some(inner)
+            })
+        }
+        Kind::ExportAssignment => decl.expression().and_then(|expr| {
+            let inner = unwrap_expr_wrappers(expr);
+            is_function_like_declaration(Some(inner)).then_some(inner)
+        }),
+        _ => None,
+    }
+}
+
+fn pick_preferred_symbol_decl(sym: P<Symbol>) -> Option<P<Node>> {
+    let decls = unwrap_sym_declarations(sym);
+    for &d in &decls {
+        if let Some(callable) = extract_callable_from_decl_node(d)
+            && callable.body().is_some()
+        {
+            return Some(d);
+        }
+    }
+    sym.value_declaration().or_else(|| decls.into_iter().next())
+}
+
+fn resolve_implicit_or_call_decl(
+    checker: &mut CheckerHandle,
+    node: P<Node>,
+    implicit_flavor: Option<ImplicitAccessorKind>,
+) -> ResolvedDeclarationNodes {
+    if let Some(flavor) = implicit_flavor {
+        let target_node = match node.kind() {
+            Kind::BinaryExpression => unwrap_expr_wrappers(node.as_binary_expression().left()),
+            _ => node,
+        };
+        if node.kind() == Kind::VariableDeclaration {
+            let ty = checker.get_type_at_location(node);
+            let sym = checker
+                .get_property_of_type_exported(ty, "[Symbol.asyncDispose]")
+                .or_else(|| checker.get_property_of_type_exported(ty, "[Symbol.dispose]"))
+                .map(|s| unwrap_aliased_symbol(checker, s));
+            if let Some(s) = sym {
+                return ResolvedDeclarationNodes {
+                    primary_decl: pick_preferred_symbol_decl(s),
+                    all_decls: unwrap_sym_declarations(s),
+                    symbol: Some(s),
+                };
+            }
+        }
+        if let Some(sym) = checker
+            .get_symbol_at_location_exported(target_node)
+            .map(|s| unwrap_aliased_symbol(checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol())
+        {
+            let expected_kind = match flavor {
+                ImplicitAccessorKind::Getter => Kind::GetAccessor,
+                ImplicitAccessorKind::Setter => Kind::SetAccessor,
+            };
+            let decls = unwrap_sym_declarations(sym);
+            let primary = decls
+                .iter()
+                .copied()
+                .find(|&d| d.kind() == expected_kind)
+                .or_else(|| pick_preferred_symbol_decl(sym));
+            return ResolvedDeclarationNodes {
+                primary_decl: primary,
+                all_decls: decls,
+                symbol: Some(sym),
+            };
+        }
+    }
+    resolve_symbol_for_node(checker, node)
+}
+
+fn resolve_setter_assignment_symbol(
+    checker: &mut CheckerHandle,
+    node: P<Node>,
+) -> Option<ResolvedDeclarationNodes> {
+    let bin = node.as_binary_expression();
+    if !matches!(
+        bin.operator_token().kind(),
+        Kind::EqualsToken
+            | Kind::PlusEqualsToken
+            | Kind::MinusEqualsToken
+            | Kind::AsteriskEqualsToken
+            | Kind::SlashEqualsToken
+            | Kind::PercentEqualsToken
+            | Kind::BarBarEqualsToken
+            | Kind::AmpersandAmpersandEqualsToken
+            | Kind::QuestionQuestionEqualsToken
+    ) {
+        return None;
+    }
+    let lhs = unwrap_expr_wrappers(bin.left());
+    if lhs.kind() != Kind::PropertyAccessExpression {
+        return None;
+    }
+    let sym = checker
+        .get_symbol_at_location_exported(lhs)
+        .map(|s| unwrap_aliased_symbol(checker, s))
+        .filter(|&s| s != checker.get_unknown_symbol())
+        .filter(|s| s.flags().intersects(SymbolFlags::SetAccessor))?;
+    let all_decls = unwrap_sym_declarations(sym);
+    let primary_decl = all_decls
+        .iter()
+        .copied()
+        .find(|&d| d.kind() == Kind::SetAccessor)
+        .or_else(|| pick_preferred_symbol_decl(sym));
+    Some(ResolvedDeclarationNodes {
+        primary_decl,
+        all_decls,
+        symbol: Some(sym),
+    })
+}
+
 pub(crate) fn resolve_symbol_for_node(
     checker: &mut CheckerHandle,
     node: P<Node>,
 ) -> ResolvedDeclarationNodes {
-    if matches!(node.kind(), Kind::CallExpression | Kind::NewExpression) {
+    if matches!(
+        node.kind(),
+        Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression
+    ) {
         let sig = checker.get_resolved_signature_exported(node);
         let sig_decl = if is_unresolved_signature(checker, sig) {
             None
@@ -1158,25 +1961,48 @@ pub(crate) fn resolve_symbol_for_node(
                 .or_else(|| sig.target().and_then(|t| t.declaration()))
         };
 
-        let callee_sym = node
-            .expression()
+        let callee_expr = if node.kind() == Kind::TaggedTemplateExpression {
+            Some(node.as_tagged_template_expression().tag())
+        } else {
+            node.expression()
+        };
+
+        let callee_sym = callee_expr
             .and_then(|expr| checker.get_symbol_at_location_exported(expr))
             .map(|s| unwrap_aliased_symbol(checker, s))
             .filter(|&s| s != checker.get_unknown_symbol());
 
         let all_decls = callee_sym.map_or_default(|s| s.declarations().to_vec());
-        let primary_decl = sig_decl.or_else(|| {
-            callee_sym.and_then(|s| {
-                s.value_declaration()
-                    .or_else(|| s.declarations().first().copied())
-            })
-        });
+        let primary_decl = sig_decl
+            .filter(|d| extract_callable_from_decl_node(*d).is_some_and(|f| f.body().is_some()))
+            .or_else(|| callee_sym.and_then(pick_preferred_symbol_decl))
+            .or(sig_decl);
 
         return ResolvedDeclarationNodes {
             primary_decl,
             all_decls,
             symbol: callee_sym,
         };
+    }
+
+    if is_declaration_node(node) && matches!(node.kind(), Kind::GetAccessor | Kind::SetAccessor) {
+        let sym = checker
+            .get_symbol_at_location_exported(node)
+            .or_else(|| node.symbol())
+            .map(|s| unwrap_aliased_symbol(checker, s))
+            .filter(|&s| s != checker.get_unknown_symbol());
+        let all_decls = sym.map_or_else(|| vec![node], unwrap_sym_declarations);
+        return ResolvedDeclarationNodes {
+            primary_decl: Some(node),
+            all_decls,
+            symbol: sym,
+        };
+    }
+
+    if node.kind() == Kind::BinaryExpression
+        && let Some(resolved) = resolve_setter_assignment_symbol(checker, node)
+    {
+        return resolved;
     }
 
     let raw_sym = if node.kind() == Kind::ShorthandPropertyAssignment {
@@ -1201,10 +2027,8 @@ pub(crate) fn resolve_symbol_for_node(
         .filter(|&s| s != checker.get_unknown_symbol());
 
     if let Some(resolved_sym) = sym {
-        let all_decls = resolved_sym.declarations().to_vec();
-        let primary_decl = resolved_sym
-            .value_declaration()
-            .or_else(|| all_decls.first().copied());
+        let all_decls = unwrap_sym_declarations(resolved_sym);
+        let primary_decl = pick_preferred_symbol_decl(resolved_sym);
         return ResolvedDeclarationNodes {
             primary_decl,
             all_decls,
@@ -1231,11 +2055,14 @@ fn is_declaration_node(node: P<Node>) -> bool {
     matches!(
         node.kind(),
         Kind::FunctionDeclaration
+            | Kind::FunctionExpression
+            | Kind::ArrowFunction
             | Kind::VariableDeclaration
             | Kind::Parameter
             | Kind::MethodDeclaration
             | Kind::MethodSignature
             | Kind::ClassDeclaration
+            | Kind::ClassExpression
             | Kind::InterfaceDeclaration
             | Kind::TypeAliasDeclaration
             | Kind::EnumDeclaration
@@ -1246,6 +2073,7 @@ fn is_declaration_node(node: P<Node>) -> bool {
             | Kind::GetAccessor
             | Kind::SetAccessor
             | Kind::Constructor
+            | Kind::ExportAssignment
     )
 }
 

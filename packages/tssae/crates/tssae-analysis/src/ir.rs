@@ -568,6 +568,7 @@ pub struct FunctionIr {
     pub syntax_to_vertex: FxHashMap<SyntaxId, VertexId>,
     pub expr_to_vertex: FxHashMap<LocalSyntaxId, VertexId>,
     pub expr_to_value: FxHashMap<LocalSyntaxId, ValueId>,
+    pub value_sources: FxHashMap<ValueId, Vec<ValueId>>,
     pub branches: Vec<IrBranchRecord>,
     pub value_count: u32,
 }
@@ -680,7 +681,26 @@ impl FunctionIr {
                 ));
             }
         }
+        self.validate_value_sources_invariants()
+    }
 
+    fn validate_value_sources_invariants(&self) -> Result<(), String> {
+        for (&val_id, sources) in &self.value_sources {
+            if val_id.0 >= self.value_count {
+                return Err(format!(
+                    "value_sources key {val_id:?} is out of bounds (count={}).",
+                    self.value_count
+                ));
+            }
+            for &src in sources {
+                if src.0 >= self.value_count {
+                    return Err(format!(
+                        "value_sources entry for {val_id:?} points out of bounds to {src:?} (count={}).",
+                        self.value_count
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -692,6 +712,29 @@ pub struct ScopeCatalogEntry {
     pub local_syntax: LocalSyntaxId,
     pub root_syntax: SyntaxId,
     pub kind: IrScopeKind,
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+/// Lazy IR provider implemented by the snapshot service layer for cross-scope analysis passes.
+pub trait IrProvider {
+    /// Returns the lowered [`FunctionIr`] for the scope rooted at `scope_syntax` (building and caching lazily).
+    ///
+    /// # Errors
+    /// Returns a [`GapItem`] if `scope_syntax` has no body or cannot be lowered.
+    fn function_ir(&self, scope_syntax: SyntaxId) -> Result<Arc<FunctionIr>, GapItem>;
+
+    /// Returns the lowered [`FunctionIr`] enclosing `node_syntax` (including `ModuleTopLevel`).
+    ///
+    /// # Errors
+    /// Returns a [`GapItem`] if the enclosing scope cannot be resolved or lowered.
+    fn enclosing_scope_ir(&self, node_syntax: SyntaxId) -> Result<Arc<FunctionIr>, GapItem>;
+
+    /// Returns the module top-level [`FunctionIr`] for `file`, if available.
+    fn file_scope_ir(&self, file: FileId) -> Option<Arc<FunctionIr>>;
+
+    /// Lists all cataloged analyzable scopes in `file` without forcing eager lowering.
+    fn scopes_in_file(&self, file: FileId) -> Vec<ScopeCatalogEntry>;
 }
 
 type CachedScopeOutcome = Result<Arc<FunctionIr>, GapItem>;

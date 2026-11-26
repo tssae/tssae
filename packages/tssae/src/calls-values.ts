@@ -41,8 +41,16 @@ export type DeclarationCallersResult = {
   readonly declaration: DeclarationRef;
   readonly calls: readonly CallRef[];
   readonly callSites: readonly DirectCallInfo[];
-  readonly gaps: readonly Gap[];
-};
+  readonly evidence: readonly Evidence[];
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 export type CallTargetInfo = {
   readonly declaration: DeclarationRef;
@@ -166,8 +174,15 @@ export type CallTargetsResult = {
   readonly resolvedTargets: readonly CallTargetInfo[];
   readonly returnTarget: SyntaxRef;
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawParameterBinding = {
   readonly argumentIndex: number;
@@ -190,8 +205,16 @@ type RawDeclarationCallersRow = {
   readonly declaration: string;
   readonly calls: readonly string[];
   readonly callSites: readonly RawDirectCallInfo[];
-  readonly gaps: readonly Gap[];
-};
+  readonly evidence: readonly Evidence[];
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawCallTargetInfo = {
   readonly declaration: string;
@@ -209,8 +232,15 @@ type RawCallTargetsRow = {
   readonly resolvedTargets: readonly RawCallTargetInfo[];
   readonly returnTarget: string;
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawValuePropagationPath = {
   readonly from: string;
@@ -386,7 +416,7 @@ export function createCallsValuesQueries(deps: {
                 `Engine omitted callersOf result for "${decl.handleId}".`,
               );
             }
-            return {
+            const common = {
               declaration: decl,
               calls: raw.calls.map((id) =>
                 makeProgramRef("call", sessionToken, projectId, snapshotId, id),
@@ -442,8 +472,13 @@ export function createCallsValuesQueries(deps: {
                   ],
                 ),
               ),
-              gaps: raw.gaps,
+              evidence: raw.evidence,
             };
+            const row: DeclarationCallersResult =
+              raw.completeness === "incomplete"
+                ? { ...common, completeness: "incomplete", gaps: raw.gaps }
+                : { ...common, completeness: "complete" };
+            return registerProvenance(row, raw.evidence);
           });
           cache.callersCache.set(key, rowPromise);
         }
@@ -453,7 +488,9 @@ export function createCallsValuesQueries(deps: {
         declarations.map((decl) => cache.callersCache.get(cacheKeyFor(decl))!),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.completeness === "incomplete") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {
@@ -515,7 +552,7 @@ export function createCallsValuesQueries(deps: {
                 `Engine omitted calleesOf result for "${call.handleId}".`,
               );
             }
-            const result: CallTargetsResult = {
+            const common = {
               call,
               targets: raw.targets.map((id) =>
                 makeProgramRef(
@@ -615,8 +652,11 @@ export function createCallsValuesQueries(deps: {
                 raw.returnTarget,
               ),
               evidence: raw.evidence,
-              gaps: raw.gaps,
             };
+            const result: CallTargetsResult =
+              raw.completeness === "incomplete"
+                ? { ...common, completeness: "incomplete", gaps: raw.gaps }
+                : { ...common, completeness: "complete" };
             return registerProvenance(result, raw.evidence);
           });
           cache.calleesCache.set(key, rowPromise);
@@ -631,7 +671,9 @@ export function createCallsValuesQueries(deps: {
         ),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.completeness === "incomplete") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {

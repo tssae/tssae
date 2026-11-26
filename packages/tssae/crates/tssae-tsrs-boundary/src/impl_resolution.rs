@@ -688,6 +688,13 @@ fn pick_bodied_declaration(
     sym_opt: Option<P<Symbol>>,
     preferred: Option<P<Node>>,
 ) -> Option<P<Node>> {
+    // Preserve an already-bodied preferred declaration (e.g. SetAccessor vs sibling GetAccessor).
+    if let Some(pref) = preferred
+        && get_source_file_of_node(pref).is_some_and(|sf| !sf.is_declaration_file())
+        && extract_callable_from_decl(pref).is_some_and(|f| f.body().is_some())
+    {
+        return Some(pref);
+    }
     if let Some(sym) = sym_opt {
         if let Some(vd) = sym.value_declaration()
             && get_source_file_of_node(vd).is_some_and(|sf| !sf.is_declaration_file())
@@ -832,7 +839,11 @@ impl SemanticFacade<'_> {
 
     /// Reports a `missing-package` gap when a call's callee imports from an unresolved package specifier.
     pub fn check_call_missing_package_gap(&mut self, call_node: P<Node>) -> Option<GapItem> {
-        let callee_expr = call_node.expression()?;
+        let callee_expr = match call_node.kind() {
+            Kind::CallExpression | Kind::NewExpression => call_node.expression()?,
+            Kind::TaggedTemplateExpression => call_node.as_tagged_template_expression().tag(),
+            _ => return None,
+        };
         let prov = find_provenance_for_expr(self.checker_mut(), callee_expr, false)?;
         if !is_bare_package_specifier(&prov.specifier_text) {
             return None;

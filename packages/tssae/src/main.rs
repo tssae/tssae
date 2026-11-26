@@ -3,6 +3,7 @@ mod calls_values;
 mod cfg;
 mod comments;
 mod instance_identity;
+mod ir_calls;
 mod native_adapter;
 mod observe;
 mod package_impl;

@@ -41,6 +41,8 @@ pub enum UnknownReason {
     NoEnclosingFunction,
     MissingBehaviorSummary,
     OpenExternalHierarchy,
+    DynamicCallee,
+    MissingPackage,
 }
 
 impl UnknownReason {
@@ -68,6 +70,8 @@ impl UnknownReason {
             Self::NoEnclosingFunction => "no-enclosing-function",
             Self::MissingBehaviorSummary => "missing-behavior-summary",
             Self::OpenExternalHierarchy => "open-external-hierarchy",
+            Self::DynamicCallee => "dynamic-callee",
+            Self::MissingPackage => "missing-package",
         }
     }
 }

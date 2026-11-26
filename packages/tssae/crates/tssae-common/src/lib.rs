@@ -11,6 +11,7 @@ pub use handles::{
     SignatureId, SymbolId, SyntaxId, TypeId, ValueId, VertexId,
 };
 pub use model::{
-    DeclarationSummaryData, SemanticModel, SignatureSummaryData, SyntaxCatalog, SyntaxNodeSummary,
-    TypeSummaryData,
+    ClassMemberFact, ClassOrInterfaceKind, DeclarationSummaryData, ImplementationFact,
+    ImplementationSourceKind, MemberTargetHierarchy, ResolvedImplementationFact, SemanticModel,
+    SignatureSummaryData, SyntaxCatalog, SyntaxNodeSummary, TypeHierarchyNode, TypeSummaryData,
 };

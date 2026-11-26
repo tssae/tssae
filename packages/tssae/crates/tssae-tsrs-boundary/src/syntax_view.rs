@@ -450,6 +450,7 @@ impl FileSyntaxIndex {
     pub fn build(file_id: FileId, rel_file: String, sf: P<SourceFile>) -> Self {
         fn visit(
             file_id: FileId,
+            sf: P<SourceFile>,
             node: P<Node>,
             node_to_local: &mut FxHashMap<P<Node>, LocalSyntaxId>,
             local_to_node: &mut Vec<P<Node>>,
@@ -463,16 +464,35 @@ impl FileSyntaxIndex {
                 if let Some(kind) = classify_catalog_scope_kind(node.kind()) {
                     let local_scope = u32::try_from(scope_catalog.len()).unwrap_or(u32::MAX);
                     let root_syntax = SyntaxId::from_parts(file_id, local);
+                    let span_start = if node.pos().source_offset().is_some() {
+                        get_token_pos_of_node(node, sf, false)
+                    } else {
+                        0
+                    };
+                    let span_end = node
+                        .end()
+                        .source_offset()
+                        .unwrap_or(span_start)
+                        .max(span_start);
                     scope_catalog.push(ScopeCatalogEntry {
                         id: scope_ir_id(file_id, local_scope),
                         local_syntax: local,
                         root_syntax,
                         kind,
+                        span_start,
+                        span_end,
                     });
                 }
             }
             node.for_each_child(&mut |child| {
-                visit(file_id, child, node_to_local, local_to_node, scope_catalog);
+                visit(
+                    file_id,
+                    sf,
+                    child,
+                    node_to_local,
+                    local_to_node,
+                    scope_catalog,
+                );
                 false
             });
         }
@@ -484,6 +504,7 @@ impl FileSyntaxIndex {
 
         visit(
             file_id,
+            sf,
             sf.as_node(),
             &mut node_to_local,
             &mut local_to_node,
@@ -901,6 +922,7 @@ pub fn parse_syntax_kind(name: &str) -> Option<Kind> {
         "Identifier" => Some(Kind::Identifier),
         "CallExpression" => Some(Kind::CallExpression),
         "NewExpression" => Some(Kind::NewExpression),
+        "TaggedTemplateExpression" => Some(Kind::TaggedTemplateExpression),
         "ReturnStatement" => Some(Kind::ReturnStatement),
         "VariableDeclaration" => Some(Kind::VariableDeclaration),
         "BinaryExpression" => Some(Kind::BinaryExpression),

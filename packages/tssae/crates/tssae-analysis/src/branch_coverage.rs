@@ -915,6 +915,7 @@ mod tests {
             syntax_to_vertex,
             expr_to_vertex: FxHashMap::default(),
             expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
             branches,
             value_count: 1,
         }

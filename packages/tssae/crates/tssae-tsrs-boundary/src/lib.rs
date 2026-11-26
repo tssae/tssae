@@ -4,6 +4,7 @@
 //! comment scanning, and [`semantic_facade::SemanticFacade`] for symbols, types,
 //! signatures, assignability, and module/project-reference mapping.
 
+pub mod hierarchy;
 pub mod impl_resolution;
 #[deny(clippy::wildcard_enum_match_arm)]
 pub mod ir_lower;
@@ -27,6 +28,7 @@ pub use semantic_facade::{
     FacadeParameterIndexSelection, FacadeSignatureParameter, FacadeSignatureProjection,
     FacadeSignatureSelect, FacadeTypeProjection, FacadeTypeProperty, FacadeTypeSelect,
     FacadeTypeSummary, NotACallError, ResolvedModuleSummary, SemanticFacade, SemanticModelBridge,
+    SymbolRegistry,
 };
 pub use syntax_view::{
     CommentKind, FileIdRegistry, FileSyntaxIndex, FindSyntaxFilter, RangeMatchMode, ScannedComment,

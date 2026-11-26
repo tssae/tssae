@@ -12,72 +12,18 @@ use tsrs_ast::{
 use tsrs_checker::{Signature, TypeFlags};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
-
 use tssae_tsrs_boundary::{FacadeImplementationOutcome, is_first_party_source_file};
 
 use crate::cfg::{EvidenceItem, GapItem, resolve_enclosing_function};
-use crate::package_impl::{
-    ResolvedImplTargetPayload, check_call_missing_package_gap, resolve_first_party_for_call_target,
-    to_resolved_impl_payload,
-};
+use crate::package_impl::{check_call_missing_package_gap, resolve_first_party_for_call_target};
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{SourceLocation, node_location, slice_source_text};
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CallSiteParameterBindingPayload {
-    pub argument_index: usize,
-    pub argument: String,
-    pub parameter_name: Option<String>,
-    pub parameter_declaration: Option<String>,
-    pub is_rest: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectCallInfoPayload {
-    pub call: String,
-    pub syntax: String,
-    pub location: SourceLocation,
-    pub caller_declaration: Option<String>,
-    pub parameter_bindings: Vec<CallSiteParameterBindingPayload>,
-    pub return_target: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeclarationCallersRow {
-    pub declaration: String,
-    pub calls: Vec<String>,
-    pub call_sites: Vec<DirectCallInfoPayload>,
-    pub gaps: Vec<GapItem>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CallTargetInfoPayload {
-    pub declaration: String,
-    pub name: Option<String>,
-    pub location: Option<SourceLocation>,
-    pub is_external: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub implementation: Option<ResolvedImplTargetPayload>,
-    pub parameter_bindings: Vec<CallSiteParameterBindingPayload>,
-    pub return_expressions: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CallTargetsRow {
-    pub call: String,
-    pub targets: Vec<String>,
-    pub resolved_targets: Vec<CallTargetInfoPayload>,
-    pub return_target: String,
-    pub evidence: Vec<EvidenceItem>,
-    pub gaps: Vec<GapItem>,
-}
-
 #[derive(Clone)]
+#[expect(
+    dead_code,
+    reason = "Fields retained while legacy valuePropagation/call_effects/instance_identity await Tickets 10-12 migration."
+)]
 pub struct ResolvedTargetDescriptor {
     pub decl_node: P<Node>,
     pub fn_node: Option<P<Node>>,
@@ -96,6 +42,10 @@ pub struct CallResolutionOutcome {
 }
 
 #[derive(Clone)]
+#[expect(
+    dead_code,
+    reason = "Fields retained while legacy instance_identity awaits Ticket 11 migration."
+)]
 pub struct IndexedCallSite {
     pub call_node: P<Node>,
     pub location: SourceLocation,
@@ -714,52 +664,6 @@ fn collect_returns_in_block(node: P<Node>, out: &mut Vec<P<Node>>) {
     });
 }
 
-fn build_parameter_bindings(
-    snapshot: &mut crate::serve::SnapshotState,
-    project_id: &str,
-    checker: &mut CheckerHandle,
-    call_node: P<Node>,
-    fn_node: Option<P<Node>>,
-) -> Vec<CallSiteParameterBindingPayload> {
-    let args = call_node.arguments();
-    let params = fn_node.map_or(&[][..], |f| f.parameters());
-    let mut bindings = Vec::with_capacity(args.len());
-
-    for (idx, &arg) in args.iter().enumerate() {
-        let arg_ref = snapshot.alloc_syntax(project_id, arg);
-        let matched_param = params.get(idx).copied().or_else(|| {
-            params.last().copied().filter(|last| {
-                last.kind() == Kind::Parameter
-                    && last
-                        .as_parameter_declaration()
-                        .dot_dot_dot_token()
-                        .is_some()
-            })
-        });
-        let (param_name, param_decl_ref, is_rest) =
-            matched_param.map_or((None, None, false), |p| {
-                let is_rest = p.kind() == Kind::Parameter
-                    && p.as_parameter_declaration().dot_dot_dot_token().is_some();
-                let sym = canonical_symbol_for_node(checker, p);
-                let name = p
-                    .name()
-                    .and_then(node_text)
-                    .or_else(|| sym.map(|s| s.name().to_string()));
-                let decl_ref = snapshot.alloc_declaration(project_id, p, sym);
-                (name, Some(decl_ref), is_rest)
-            });
-        bindings.push(CallSiteParameterBindingPayload {
-            argument_index: idx,
-            argument: arg_ref,
-            parameter_name: param_name,
-            parameter_declaration: param_decl_ref,
-            is_rest,
-        });
-    }
-
-    bindings
-}
-
 pub fn get_or_build_call_graph(
     snapshot: &mut crate::serve::SnapshotState,
     project_id: &str,
@@ -861,229 +765,6 @@ fn collect_call_sites_in_node(
         collect_call_sites_in_node(cwd, program, checker, sf, rel_file, child, out);
         false
     });
-}
-
-pub fn run_callers_of(
-    snapshot: &mut crate::serve::SnapshotState,
-    project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    targets: &[String],
-    lookup_files: Option<&[String]>,
-) -> Result<Vec<DeclarationCallersRow>, crate::serve::RpcErr> {
-    let mut decl_inputs = Vec::with_capacity(targets.len());
-    for handle_id in targets {
-        let entry = snapshot.get_entry(project_id, handle_id)?;
-        let crate::serve::HandlePayload::Declaration { node, symbol } = entry.payload else {
-            return Err(crate::serve::RpcErr::new(
-                "INVALID_REFERENCE_KIND",
-                format!("Program reference {handle_id} is not a declaration reference."),
-            ));
-        };
-        let canonical_sym = symbol
-            .map(|s| unwrap_aliased_symbol(checker, s))
-            .or_else(|| canonical_symbol_for_node(checker, node));
-        decl_inputs.push((handle_id.clone(), node, canonical_sym));
-    }
-
-    let graph = get_or_build_call_graph(snapshot, project_id, program, checker, lookup_files);
-    let mut rows = Vec::with_capacity(decl_inputs.len());
-
-    for (decl_id, decl_node, sym_opt) in decl_inputs {
-        let mut gaps = Vec::new();
-        if is_dynamic_signature_decl_kind(decl_node.kind()) {
-            let loc = node_location_rel(&snapshot.cwd, decl_node);
-            gaps.push(GapItem {
-                kind: "dynamic-callee",
-                message: format!(
-                    "Cannot exhaustively determine callers of {:?} without concrete dispatch targets.",
-                    decl_node.kind()
-                ),
-                at: loc,
-            });
-        }
-
-        let mut matching_indices = BTreeSet::new();
-        if let Some(sym) = sym_opt
-            && let Some(indices) = graph.by_symbol.get(&sym)
-        {
-            matching_indices.extend(indices.iter().copied());
-        }
-        if let Some(indices) = graph.by_decl.get(&decl_node) {
-            matching_indices.extend(indices.iter().copied());
-        }
-
-        let mut calls = Vec::with_capacity(matching_indices.len());
-        let mut call_sites = Vec::with_capacity(matching_indices.len());
-        let target_fn_node = extract_callable_from_decl(decl_node);
-
-        for idx in matching_indices {
-            let site = &graph.sites[idx];
-            let call_ref = snapshot.alloc_call(project_id, site.call_node);
-            let syntax_ref = snapshot.alloc_syntax(project_id, site.call_node);
-            let caller_declaration = site
-                .caller_decl
-                .map(|(fn_node, sym)| snapshot.alloc_declaration(project_id, fn_node, sym));
-            let matched_fn = site
-                .resolution
-                .targets
-                .iter()
-                .find(|t| t.decl_node == decl_node || (sym_opt.is_some() && t.symbol == sym_opt))
-                .and_then(|t| t.fn_node)
-                .or(target_fn_node);
-            let parameter_bindings =
-                build_parameter_bindings(snapshot, project_id, checker, site.call_node, matched_fn);
-
-            calls.push(call_ref.clone());
-            call_sites.push(DirectCallInfoPayload {
-                call: call_ref,
-                syntax: syntax_ref.clone(),
-                location: site.location.clone(),
-                caller_declaration,
-                parameter_bindings,
-                return_target: syntax_ref,
-            });
-        }
-
-        rows.push(DeclarationCallersRow {
-            declaration: decl_id,
-            calls,
-            call_sites,
-            gaps,
-        });
-    }
-
-    Ok(rows)
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "Resolves direct call targets alongside cross-package implementation lookup and evidence."
-)]
-pub fn run_callees_of(
-    snapshot: &mut crate::serve::SnapshotState,
-    project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    targets: &[String],
-) -> Result<Vec<CallTargetsRow>, crate::serve::RpcErr> {
-    let mut call_nodes = Vec::with_capacity(targets.len());
-    for handle_id in targets {
-        let node = snapshot.get_call_node(project_id, handle_id)?;
-        call_nodes.push((handle_id.clone(), node));
-    }
-
-    let workspace_programs = snapshot.workspace_programs();
-    let sourcemap_cache = snapshot.sourcemap_cache.clone();
-    let cwd = snapshot.cwd.clone();
-    let mut rows = Vec::with_capacity(call_nodes.len());
-    for (call_id, call_node) in call_nodes {
-        let mut outcome = resolve_call_targets(&cwd, program, checker, call_node);
-        let return_target = snapshot.alloc_syntax(project_id, call_node);
-
-        let mut target_refs = Vec::with_capacity(outcome.targets.len());
-        let mut resolved_targets = Vec::with_capacity(outcome.targets.len());
-        let mut evidence = Vec::new();
-
-        for target in outcome.targets {
-            let decl_ref = snapshot.alloc_declaration(project_id, target.decl_node, target.symbol);
-            let is_first_party_body = target.fn_node.is_some_and(|f| f.body().is_some())
-                && get_source_file_of_node(target.decl_node).is_some_and(|sf| {
-                    !sf.is_declaration_file() && is_first_party_source_file(&cwd, program, sf)
-                });
-
-            let impl_outcome = resolve_first_party_for_call_target(
-                &cwd,
-                program,
-                checker,
-                &workspace_programs,
-                &sourcemap_cache,
-                Some(target.decl_node),
-                call_node,
-            );
-
-            let (effective_fn, implementation) = match impl_outcome {
-                FacadeImplementationOutcome::Resolved(impl_target) => {
-                    let resolved_fn = impl_target.fn_node.or({
-                        if is_first_party_body {
-                            target.fn_node
-                        } else {
-                            None
-                        }
-                    });
-                    if !is_first_party_body {
-                        evidence.push(EvidenceItem::simple(
-                            "source",
-                            format!(
-                                "Resolved first-party implementation '{}' for '{}'",
-                                impl_target.file,
-                                target.name.as_deref().unwrap_or("<anonymous>")
-                            ),
-                            Some(impl_target.location.clone()),
-                        ));
-                    }
-                    let info = to_resolved_impl_payload(snapshot, project_id, impl_target);
-                    (resolved_fn, Some(info))
-                }
-                FacadeImplementationOutcome::External { .. } => (None, None),
-                FacadeImplementationOutcome::Inconclusive { mut gaps, .. } => {
-                    if !is_first_party_body {
-                        outcome.gaps.append(&mut gaps);
-                    }
-                    (
-                        if is_first_party_body {
-                            target.fn_node
-                        } else {
-                            None
-                        },
-                        None,
-                    )
-                }
-            };
-
-            let parameter_bindings =
-                build_parameter_bindings(snapshot, project_id, checker, call_node, effective_fn);
-            let return_expressions = effective_fn
-                .map_or_default(collect_return_expressions)
-                .into_iter()
-                .map(|expr| snapshot.alloc_syntax(project_id, expr))
-                .collect();
-
-            if let Some(loc) = target.location.clone() {
-                evidence.push(EvidenceItem::simple(
-                    "source",
-                    format!(
-                        "{}: {}",
-                        target.reason,
-                        target.name.as_deref().unwrap_or("<anonymous>")
-                    ),
-                    Some(loc),
-                ));
-            }
-
-            target_refs.push(decl_ref.clone());
-            resolved_targets.push(CallTargetInfoPayload {
-                declaration: decl_ref,
-                name: target.name,
-                location: target.location,
-                is_external: target.is_external,
-                implementation,
-                parameter_bindings,
-                return_expressions,
-            });
-        }
-
-        rows.push(CallTargetsRow {
-            call: call_id,
-            targets: target_refs,
-            resolved_targets,
-            return_target,
-            evidence,
-            gaps: outcome.gaps,
-        });
-    }
-
-    Ok(rows)
 }
 
 #[derive(Clone, Serialize)]

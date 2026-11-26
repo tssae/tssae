@@ -15,14 +15,13 @@ use tssae_tsrs_boundary::{
     FacadeTypeSelect, FacadeTypeSummary, FindSyntaxFilter, SemanticFacade, SourceRangeSpec,
     SyntaxLookupOptions, SyntaxView,
 };
-pub use tssae_tsrs_boundary::{
-    node_location, safe_expression, safe_initializer, slice_source_text,
-};
+pub use tssae_tsrs_boundary::{node_location, safe_expression, safe_initializer};
 
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
 use crate::ir_effects::{
     CallEffectsRow, InstanceCleanupScopeRow, run_call_effects, run_instance_cleanup,
 };
+use crate::ir_impls::{ImplementationResolutionRow, run_resolve_implementations};
 use crate::ir_instances::{
     InstanceProjectionRow, InstanceResolutionRow, InstanceSelect, run_project_instances,
     run_resolve_instances,
@@ -30,7 +29,6 @@ use crate::ir_instances::{
 use crate::ir_values::{ValuePropagationResultPayload, run_value_propagation};
 use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
-use crate::package_impl::{ImplementationResolutionRow, run_resolve_implementations};
 use crate::serve::{
     BranchCoverageItem, BranchCoverageRequest, FunctionBranchesItem, HandlePayload, RpcErr,
     SnapshotState, run_branch_coverage, run_list_branches,

@@ -39,12 +39,11 @@ import type { BehaviorSummaryPack } from "./summaries.ts";
 import type {
   DiagnosticLocation,
   Evidence,
-  Model,
   SyntaxNodeResult,
   SyntaxRef,
 } from "./types.ts";
 
-/** Any individual query result, model, or fact item that carries per-item provenance. */
+/** Any individual query result, behavior summary, or fact item that carries per-item provenance. */
 export type SelectableQueryResult =
   | ValuePropagationPath
   | ValuePropagationTargetResult
@@ -69,7 +68,6 @@ export type SelectableQueryResult =
   | ProjectedCallRow<CallProjectionSelection>
   | ProjectedCallResolutionRow<CallProjectionSelection>
   | ProjectedInstanceRow<InstanceProjectionSelection>
-  | Model
   | BehaviorSummaryPack
   | FactResult;
 
@@ -110,7 +108,6 @@ export function normalizeEvidenceItem(item: Evidence): Evidence {
     kind: item.kind,
     message: item.message,
     ...(item.at !== undefined ? { at: normalizeLocation(item.at) } : {}),
-    ...(item.modelId !== undefined ? { modelId: item.modelId } : {}),
     ...(item.summaryId !== undefined ? { summaryId: item.summaryId } : {}),
     ...(item.summarySource !== undefined
       ? { summarySource: item.summarySource }
@@ -136,7 +133,6 @@ function evidenceKey(item: Evidence): string {
     loc !== undefined
       ? `${loc.file}:${loc.start}:${loc.end}:${loc.line}:${loc.column}:${loc.endLine}:${loc.endColumn}`
       : null,
-    item.modelId ?? null,
     item.summaryId ?? null,
     item.summarySource ?? null,
     item.declaration ?? null,
@@ -160,7 +156,7 @@ export function dedupeEvidence(
   return out;
 }
 
-/** Associates per-item provenance evidence with a materialized query result, model, or fact object. */
+/** Associates per-item provenance evidence with a materialized query result, behavior summary, or fact object. */
 export function registerProvenance<T extends object>(
   item: T,
   evidence: readonly Evidence[],
@@ -171,7 +167,7 @@ export function registerProvenance<T extends object>(
   return item;
 }
 
-/** Returns the normalized provenance evidence recorded on a query result, model, or fact item. */
+/** Returns the normalized provenance evidence recorded on a query result, behavior summary, or fact item. */
 export function evidenceOf(item: SelectableQueryResult): readonly Evidence[] {
   if (typeof item !== "object" || item === null) {
     return [];
@@ -197,7 +193,6 @@ function isEvidenceItem(value: unknown): value is Evidence {
     (candidate.kind === "source" ||
       candidate.kind === "type" ||
       candidate.kind === "note" ||
-      candidate.kind === "model" ||
       candidate.kind === "summary") &&
     typeof candidate.message === "string"
   );

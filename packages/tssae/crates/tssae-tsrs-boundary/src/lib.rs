@@ -18,9 +18,10 @@ pub use impl_resolution::{
     is_first_party_workspace_path,
 };
 pub use ir_lower::{
-    LoweredScope, lower_class_default_constructor_to_ir, lower_class_static_init_to_ir,
-    lower_class_to_ir, lower_scope_to_ir, lower_scope_to_ir_with_index, normalize_cfg_scope_node,
-    normalize_function_node, resolve_enclosing_function,
+    LoweredScope, is_class_scope_node, lower_class_default_constructor_to_ir,
+    lower_class_static_init_to_ir, lower_class_to_ir, lower_scope_to_ir,
+    lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
+    resolve_enclosing_cfg_owner, resolve_enclosing_function,
 };
 
 pub use semantic_facade::{

@@ -59,7 +59,7 @@ export {
   type LibraryAdapter,
 } from "./facts.ts";
 export { isSameInstance } from "./instance-identity.ts";
-export { defineModel, openProject } from "./session.ts";
+export { openProject } from "./session.ts";
 export {
   defineSummaries,
   type BehaviorSummaryEntry,
@@ -95,9 +95,6 @@ export type {
   CallEffectsTargetRef,
   CallbackInvocationInfo,
   CleanupCoverageStatus,
-  CleanupModelOperation,
-  CleanupModelOperationKind,
-  CleanupModelTarget,
   CleanupScopeRef,
   CleanupSiteInfo,
   FieldEffect,
@@ -107,7 +104,6 @@ export type {
   ImplicitExceptionCleanupOutcome,
   InstanceCleanupOptions,
   InstanceCleanupScopeResult,
-  LifecycleEventBehavior,
   TargetInstanceCleanupResult,
 } from "./call-effects.ts";
 export {
@@ -161,8 +157,6 @@ export type {
 } from "./package-impl.ts";
 export type {
   FullInstanceProjectionFields,
-  InstanceModelBehavior,
-  InstanceModelMatch,
   InstanceOriginKind,
   InstanceProjectionSelection,
   InstanceResolutionResult,
@@ -193,7 +187,6 @@ export {
   type InstanceRef,
   type LookupFilesOptions,
   type MemoryStats,
-  type Model,
   type NativeAdapterObservation,
   type ObserveLimit,
   type ObserveLimitInput,

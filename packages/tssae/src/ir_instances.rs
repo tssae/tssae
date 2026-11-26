@@ -12,10 +12,11 @@ use tssae_analysis::{
         ResolveInstancesBatchOutcome, ResolvedInstanceOrigin, resolve_instances_on_ir,
     },
 };
-use tssae_common::{FileId, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId};
+use tssae_common::{
+    EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId,
+};
 use tssae_tsrs_boundary::normalize_path;
 
-use crate::cfg::{EvidenceItem, GapItem};
 use crate::ir_calls::SnapshotIrEnv;
 use crate::observe::ObserveCollector;
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};

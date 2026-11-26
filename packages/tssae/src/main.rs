@@ -1,20 +1,11 @@
-#[allow(dead_code)]
-mod call_effects;
-#[allow(dead_code)]
-mod calls_values;
-#[allow(dead_code)]
-mod cfg;
 mod comments;
-#[allow(dead_code)]
-mod instance_identity;
 mod ir_calls;
 mod ir_effects;
+mod ir_impls;
 mod ir_instances;
 mod ir_values;
 mod native_adapter;
 mod observe;
-#[allow(dead_code)]
-mod package_impl;
 mod projection;
 mod projects;
 mod serve;

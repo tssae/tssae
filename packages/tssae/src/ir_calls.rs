@@ -2,7 +2,7 @@ use std::{cell::Cell, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use tsrs_ast::{Kind, Node, SourceFile, Symbol, get_source_file_of_node};
+use tsrs_ast::{Node, SourceFile, Symbol};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
 use tssae_analysis::{
@@ -16,16 +16,18 @@ use tssae_analysis::{
     summaries::BehaviorSummaryIndex,
 };
 use tssae_common::{
-    DeclarationIdentity, DeclarationSummaryData, DiagnosticLocation, FileId, GapItem,
+    DeclarationIdentity, DeclarationSummaryData, DiagnosticLocation, EvidenceItem, FileId, GapItem,
     ImplementationFact, ImplementationSourceKind, MemberTargetHierarchy, SemanticModel,
     SignatureId, SummaryLookupStats, SummarySource, SymbolId, SyntaxCatalog, SyntaxId,
     SyntaxScopeInfo, TypeId, TypeSummaryData, UnknownReason, WriteSyntaxInfo,
 };
-use tssae_tsrs_boundary::{FirstPartyResolutionSource, SemanticModelBridge, normalize_path};
+use tssae_tsrs_boundary::{
+    FirstPartyResolutionSource, SemanticModelBridge, is_class_scope_node, normalize_path,
+    resolve_enclosing_cfg_owner,
+};
 
-use crate::cfg::{EvidenceItem, resolve_enclosing_function};
+use crate::ir_impls::ResolvedImplTargetPayload;
 use crate::observe::ObserveCollector;
-use crate::package_impl::ResolvedImplTargetPayload;
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
 
@@ -324,10 +326,7 @@ impl IrProvider for SnapshotIrEnv<'_> {
                 None,
             )
         })?;
-        if matches!(
-            scope_node.kind(),
-            Kind::ClassDeclaration | Kind::ClassExpression
-        ) {
+        if is_class_scope_node(scope_node) {
             return self
                 .semantic
                 .lower_scope_to_ir(scope_node, scope_syntax.local_id().0);
@@ -386,20 +385,6 @@ impl IrProvider for SnapshotIrEnv<'_> {
         self.ensure_file_ir_entry(file)
             .map_or_default(|entry| entry.scope_catalog.clone())
     }
-}
-
-fn resolve_enclosing_cfg_owner(node: P<Node>) -> Option<P<Node>> {
-    if let Some(fn_node) = resolve_enclosing_function(node) {
-        return Some(fn_node);
-    }
-    let mut cur = node.parent();
-    while let Some(p) = cur {
-        if p.kind() == Kind::ClassStaticBlockDeclaration {
-            return Some(p);
-        }
-        cur = p.parent();
-    }
-    get_source_file_of_node(node).map(|sf| sf.as_node())
 }
 
 struct MaterializedBinding {

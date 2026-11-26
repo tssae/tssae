@@ -17,9 +17,10 @@ use tssae_adapter_api::{
     NativeContribution, NativeFactRequest, NativeLibrary, NodeKind, NodeOperation, SourceLocation,
 };
 
-use crate::calls_values::{
-    canonical_symbol_for_node, node_location_rel, node_text, unwrap_expr_wrappers,
+use tssae_tsrs_boundary::{
+    node_location_relative as node_location_rel, node_text, unwrap_expr_wrappers,
 };
+
 use crate::observe::{EngineStepDetail, ObserveCollector, elapsed_ms};
 use crate::projection::{safe_expression, safe_initializer};
 use crate::projects::{is_project_source_file, relative_to_cwd, resolve_against_cwd};
@@ -900,6 +901,30 @@ fn resolve_decl_for_ref(
 ) -> Option<(Option<String>, P<Node>)> {
     let (name, primary) = resolve_decl_raw(checker, node)?;
     can_follow_declaration(cwd, primary).then_some((name, primary))
+}
+
+fn canonical_symbol_for_node(checker: &mut CheckerHandle, node: P<Node>) -> Option<P<Symbol>> {
+    let raw = if node.kind() == Kind::ShorthandPropertyAssignment {
+        checker
+            .get_shorthand_assignment_value_symbol(Some(node))
+            .or_else(|| checker.get_symbol_at_location_exported(node))
+    } else if let Some(parent) = node.parent()
+        && parent.kind() == Kind::ShorthandPropertyAssignment
+    {
+        checker
+            .get_shorthand_assignment_value_symbol(Some(parent))
+            .or_else(|| checker.get_symbol_at_location_exported(node))
+    } else {
+        checker
+            .get_symbol_at_location_exported(node)
+            .or_else(|| {
+                node.name()
+                    .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
+            })
+            .or_else(|| node.symbol())
+    };
+    raw.map(|s| unwrap_alias(checker, s))
+        .filter(|&s| s != checker.get_unknown_symbol())
 }
 
 fn unwrap_alias(checker: &mut CheckerHandle, mut symbol: P<Symbol>) -> P<Symbol> {

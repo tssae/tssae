@@ -156,7 +156,6 @@ const consumerSource = `import assert from "node:assert/strict";
 
 import {
   TssaeError,
-  defineModel,
   defineSummaries,
   evidenceOf,
   extractBasisEvidence,
@@ -176,13 +175,9 @@ import {
   type SyntaxRef,
 } from "tssae";
 
-const resourceModel = defineModel({
-  id: "acceptance-connection-model",
-  description: "Local connections must be closed on all paths.",
-});
-
 const resourceSummaries = defineSummaries({
   id: "acceptance-connection-summaries",
+  description: "Local connections must be closed on all paths.",
   entries: [
     {
       match: { memberPath: ["createConnection"] },
@@ -205,7 +200,6 @@ const openMetrics: EngineCallIoMetrics[] = [];
 const session = await openProject({
   cwd: process.cwd(),
   tsconfig: "tsconfig.json",
-  models: [resourceModel],
   summaries: { packs: [resourceSummaries] },
   observe: "summary",
   onRpcMetrics: (m) => openMetrics.push(m),
@@ -435,7 +429,7 @@ try {
 
   // 5. Evidence traceability & external declaration-only gap handling
   const basis: readonly DiagnosticBasis[] = [
-    resourceModel,
+    resourceSummaries,
     loadRowTarget,
     propPath,
     loadRowCallSyn,
@@ -444,7 +438,7 @@ try {
   assert.ok(evidenceOf(propPath).length > 0);
   assert.ok(
     combinedEvidence.some(
-      (ev) => ev.kind === "model" && ev.modelId === "acceptance-connection-model",
+      (ev) => ev.kind === "summary" && ev.summaryId === "acceptance-connection-summaries",
     ),
   );
   const originMap = new Map(

@@ -17,7 +17,6 @@ import {
   type FactConflictDetails,
   type FactConflictParty,
   type Gap,
-  type Model,
   type ProgramObjectKind,
   type ProgramRef,
   type ProjectSummary,
@@ -132,8 +131,6 @@ export type EngineFactExtractionOptions<
 /** Read-only query context exposed to TypeScript `LibraryAdapter` providers. */
 export type AdapterContext = {
   readonly project: ProjectSummary;
-  readonly models: readonly Model[];
-  getModel: (id: string) => Model | undefined;
   findSyntax: ProjectContext["findSyntax"];
   typeAt: ProjectContext["typeAt"];
   listBranches: ProjectContext["listBranches"];

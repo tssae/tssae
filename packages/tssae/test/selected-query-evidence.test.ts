@@ -6,7 +6,6 @@ import {
   defineAdapter,
   defineFactProvider,
   defineFactType,
-  defineModel,
   defineSummaries,
   extractBasisEvidence,
   openProject,
@@ -15,21 +14,22 @@ import {
 } from "tssae";
 
 void describe("tssae selected query evidence", () => {
-  void it("threads provenance from selected CallTargetInfo, ValuePropagationPath/TargetResult, SyntaxNodeResult, and Model while excluding unselected candidates", async () => {
+  void it("threads provenance from selected CallTargetInfo, ValuePropagationPath/TargetResult, SyntaxNodeResult, and BehaviorSummaryPack while excluding unselected candidates", async () => {
     await withTempHost(
       { host: "sdk-queries/selected-evidence-propagation" },
       async (host) => {
         await host.typecheck();
 
-        const policyModel = defineModel({
+        const policySummary = defineSummaries({
           id: "restricted-data-policy",
           description: "Restricted loader outputs must not reach public sinks.",
+          entries: [],
         });
 
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [policyModel],
+          summaries: { packs: [policySummary] },
         });
         try {
           const ctx = session.project();
@@ -117,9 +117,6 @@ void describe("tssae selected query evidence", () => {
           );
           assert.ok(matchedSink);
 
-          const model = ctx.getModel("restricted-data-policy");
-          assert.ok(model);
-
           const customNote: Evidence = {
             kind: "note",
             message: "Business rule: restricted data cannot enter sink().",
@@ -127,7 +124,7 @@ void describe("tssae selected query evidence", () => {
           };
 
           const basis: readonly DiagnosticBasis[] = [
-            model,
+            policySummary,
             restrictedLoader.targetInfo,
             selectedPath,
             restrictedLoader.callSyntax,
@@ -139,8 +136,9 @@ void describe("tssae selected query evidence", () => {
           const evidence = extractBasisEvidence(basis);
 
           assert.deepEqual(evidence[0], {
-            kind: "model",
-            modelId: "restricted-data-policy",
+            kind: "summary",
+            summaryId: "restricted-data-policy",
+            summarySource: "local",
             message: "Restricted loader outputs must not reach public sinks.",
           });
 

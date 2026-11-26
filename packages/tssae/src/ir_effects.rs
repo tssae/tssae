@@ -19,10 +19,11 @@ use tssae_analysis::{
     },
     instance_identity::{InstanceOriginKind, ResolvedInstanceOrigin},
 };
-use tssae_common::{FileId, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId};
+use tssae_common::{
+    EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId,
+};
 use tssae_tsrs_boundary::normalize_path;
 
-use crate::cfg::{EvidenceItem, GapItem};
 use crate::ir_calls::SnapshotIrEnv;
 use crate::ir_instances::InstanceHandleData;
 use crate::observe::ObserveCollector;

@@ -4,7 +4,6 @@ import { describe, it } from "node:test";
 import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
-  defineModel,
   defineSummaries,
   isSameInstance,
   openProject,
@@ -840,37 +839,6 @@ void describe("tssae instance identity", () => {
           await session.close();
         }
       },
-    );
-  });
-
-  void it("validates Model instanceBehaviors definitions", () => {
-    assert.throws(
-      () =>
-        defineModel({
-          id: "bad-match",
-          instanceBehaviors: [
-            {
-              kind: "allocates-fresh-instance",
-              match: {},
-            },
-          ],
-        }),
-      (err) => err instanceof TssaeError && err.code === "INVALID_CONFIG",
-    );
-
-    assert.throws(
-      () =>
-        defineModel({
-          id: "bad-arg-index",
-          instanceBehaviors: [
-            {
-              kind: "forwards-argument",
-              match: { member: "_register" },
-              argumentIndex: -1,
-            },
-          ],
-        }),
-      (err) => err instanceof TssaeError && err.code === "INVALID_CONFIG",
     );
   });
 

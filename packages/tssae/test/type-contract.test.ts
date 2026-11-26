@@ -524,6 +524,20 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2339/u,
         },
+        {
+          name: "getModel does not exist on ProjectContext",
+          body: `
+            void ctx.getModel("legacy");
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "models does not exist on ProjectContext",
+          body: `
+            void ctx.models;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

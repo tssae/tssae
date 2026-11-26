@@ -23,24 +23,21 @@ use tssae_analysis::{
     ir::{FileIrEntry, FunctionIr, SnapshotIrCache},
     summaries::BehaviorSummaryIndex,
 };
-use tssae_common::{BranchId, FileId, SummaryConfigPayload, UnknownReason};
+use tssae_common::{BranchId, EvidenceItem, FileId, GapItem, SummaryConfigPayload, UnknownReason};
 use tssae_tsrs_boundary::{
     FileIdRegistry, FileSyntaxIndex, ResolvedPackageInfo, collect_resolved_packages_for_program,
     lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
     resolve_enclosing_function,
 };
 
-use crate::calls_values::ProjectCallGraph;
-use crate::cfg::{EvidenceItem, FunctionCfg, GapItem};
 use crate::comments::{ScannedComment, scan_snapshot_comments};
-use crate::instance_identity::FieldWriteIndex;
 use crate::ir_instances::InstanceHandleData;
 use crate::native_adapter::{
     NativeAdapterObservation, NativeAdapterPackageInput, NativeAdapterRegistry, NativeAdapterStatus,
 };
 use crate::observe::{EngineRpcMetrics, ObserveCollector, ObserveRequestConfig, elapsed_ms};
 use crate::projection::{QueryStep, execute_query_batch};
-pub use crate::projection::{SourceLocation, node_location, slice_source_text};
+pub use crate::projection::{SourceLocation, node_location};
 use crate::projects::{
     ProjectSummary, UpdateSnapshotInput, normalize_path, open_projects_snapshot, relative_to_cwd,
     release_tsrs_snapshot, update_projects_snapshot,
@@ -354,13 +351,10 @@ pub struct SnapshotState {
     pub instances: Vec<InstanceHandleData>,
     pub instance_handles: FxHashMap<(String, String), String>,
     pub file_ids: Arc<RwLock<FileIdRegistry>>,
-    pub cfg_cache: FxHashMap<(String, P<Node>), Result<Arc<FunctionCfg>, GapItem>>,
     pub ir_cache: SnapshotIrCache,
     pub file_syntax_indices: FxHashMap<FileId, Arc<FileSyntaxIndex>>,
     pub symbol_registry: tssae_tsrs_boundary::SymbolRegistry,
-    pub call_graph_cache: FxHashMap<String, Arc<ProjectCallGraph>>,
     pub ir_call_graph_cache: FxHashMap<String, Arc<tssae_analysis::call_resolution::IrCallGraph>>,
-    pub field_write_index: FxHashMap<String, Arc<FieldWriteIndex>>,
     pub sourcemap_cache: SourceMapCache,
     pub native_adapters: NativeAdapterRegistry,
     pub native_fact_cache: crate::native_adapter::NativeFactCache,
@@ -693,28 +687,6 @@ impl SnapshotState {
 
         result.map(|ir| (ir, file_index))
     }
-
-    pub fn get_or_build_cfg(
-        &mut self,
-        project_id: &str,
-        fn_node: P<Node>,
-    ) -> Result<Arc<FunctionCfg>, GapItem> {
-        let key = (project_id.to_string(), fn_node);
-        if let Some(cached) = self.cfg_cache.get(&key) {
-            return cached.clone();
-        }
-        let Some(sf) = get_source_file_of_node(fn_node) else {
-            return Err(GapItem {
-                kind: "missing-source-file",
-                message: "Function node has no associated source file.".to_string(),
-                at: None,
-            });
-        };
-        let rel_file = relative_to_cwd(&self.cwd, sf.file_name());
-        let built = FunctionCfg::build_scope(sf, &rel_file, fn_node).map(Arc::new);
-        self.cfg_cache.insert(key, built.clone());
-        built
-    }
 }
 
 struct EngineServer {
@@ -886,13 +858,10 @@ impl EngineServer {
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
                 file_ids: Arc::clone(&self.file_ids),
-                cfg_cache: FxHashMap::default(),
                 ir_cache: SnapshotIrCache::new(),
                 file_syntax_indices: FxHashMap::default(),
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
-                call_graph_cache: FxHashMap::default(),
                 ir_call_graph_cache: FxHashMap::default(),
-                field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),
@@ -1045,13 +1014,10 @@ impl EngineServer {
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
                 file_ids: Arc::clone(&self.file_ids),
-                cfg_cache: FxHashMap::default(),
                 ir_cache,
                 file_syntax_indices: FxHashMap::default(),
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
-                call_graph_cache: FxHashMap::default(),
                 ir_call_graph_cache: FxHashMap::default(),
-                field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
                 native_adapters,
                 native_fact_cache: crate::native_adapter::NativeFactCache::default(),

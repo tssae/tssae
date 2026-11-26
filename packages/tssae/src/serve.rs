@@ -11,15 +11,21 @@ use serde_json::Value;
 use tsrs_api::{Session, SessionOptions, session::SnapshotData};
 use tsrs_ast::{Node, Symbol, get_source_file_of_node};
 use tsrs_checker::{Signature, Type};
+use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
 use tsrs_project::ID as ProjectId;
 use tsrs_vfs::{FS, bundled, osvfs};
-
-use crate::calls_values::ProjectCallGraph;
-use crate::cfg::{
-    EvidenceItem, FunctionCfg, GapItem, normalize_cfg_scope_node, normalize_function_node,
+use tssae_analysis::branch_coverage::{
+    BranchBypassPath, BranchCoverageOutcome, evaluate_branch_coverage,
+};
+use tssae_common::{BranchId, UnknownReason};
+use tssae_tsrs_boundary::{
+    LoweredScope, lower_scope_to_ir, normalize_cfg_scope_node, normalize_function_node,
     resolve_enclosing_function,
 };
+
+use crate::calls_values::ProjectCallGraph;
+use crate::cfg::{EvidenceItem, FunctionCfg, GapItem};
 use crate::comments::{ScannedComment, scan_snapshot_comments};
 use crate::instance_identity::{FieldWriteIndex, InstanceHandleData};
 use crate::native_adapter::{
@@ -184,12 +190,48 @@ pub struct FunctionBranchesItem {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BranchCoverageItem {
-    pub target: String,
-    pub status: &'static str,
-    pub evidence: Vec<EvidenceItem>,
-    pub gaps: Vec<GapItem>,
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum BranchCoverageItem {
+    #[serde(rename_all = "camelCase")]
+    Proved {
+        target: String,
+        target_reachable: bool,
+        evidence: Vec<EvidenceItem>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Disproved {
+        target: String,
+        target_reachable: bool,
+        counterexample_path: BranchBypassPath,
+        evidence: Vec<EvidenceItem>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Inconclusive {
+        target: String,
+        target_reachable: bool,
+        gaps: Vec<GapItem>,
+        evidence: Vec<EvidenceItem>,
+    },
+}
+
+impl BranchCoverageItem {
+    #[must_use]
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Proved { target, .. }
+            | Self::Disproved { target, .. }
+            | Self::Inconclusive { target, .. } => target,
+        }
+    }
+
+    #[must_use]
+    pub const fn status_str(&self) -> &'static str {
+        match self {
+            Self::Proved { .. } => "proved",
+            Self::Disproved { .. } => "disproved",
+            Self::Inconclusive { .. } => "inconclusive",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -261,6 +303,7 @@ pub struct SnapshotState {
     pub instances: Vec<InstanceHandleData>,
     pub instance_handles: FxHashMap<(String, String), String>,
     pub cfg_cache: FxHashMap<(String, P<Node>), Result<Arc<FunctionCfg>, GapItem>>,
+    pub ir_cache: FxHashMap<(String, P<Node>), Result<Arc<LoweredScope>, GapItem>>,
     pub call_graph_cache: FxHashMap<String, Arc<ProjectCallGraph>>,
     pub field_write_index: FxHashMap<String, Arc<FieldWriteIndex>>,
     pub sourcemap_cache: SourceMapCache,
@@ -524,6 +567,24 @@ impl SnapshotState {
         Ok(branch)
     }
 
+    pub fn get_or_build_ir(
+        &mut self,
+        project_id: &str,
+        program: &'static Program,
+        checker: &mut CheckerHandle,
+        scope_node: P<Node>,
+    ) -> Result<Arc<LoweredScope>, GapItem> {
+        let key = (project_id.to_string(), scope_node);
+        if let Some(cached) = self.ir_cache.get(&key) {
+            return cached.clone();
+        }
+        let local_scope = u32::try_from(self.ir_cache.len()).unwrap_or(u32::MAX);
+        let built =
+            lower_scope_to_ir(&self.cwd, program, checker, scope_node, local_scope).map(Arc::new);
+        self.ir_cache.insert(key, built.clone());
+        built
+    }
+
     pub fn get_or_build_cfg(
         &mut self,
         project_id: &str,
@@ -697,6 +758,7 @@ impl EngineServer {
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
                 cfg_cache: FxHashMap::default(),
+                ir_cache: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -802,6 +864,7 @@ impl EngineServer {
                 instances: Vec::new(),
                 instance_handles: FxHashMap::default(),
                 cfg_cache: FxHashMap::default(),
+                ir_cache: FxHashMap::default(),
                 call_graph_cache: FxHashMap::default(),
                 field_write_index: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -907,6 +970,8 @@ impl EngineServer {
 pub fn run_list_branches(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
+    checker: &mut CheckerHandle,
     targets: &[String],
 ) -> Result<Vec<FunctionBranchesItem>, RpcErr> {
     let mut fn_nodes = Vec::with_capacity(targets.len());
@@ -924,23 +989,28 @@ pub fn run_list_branches(
     }
 
     let mut items = Vec::with_capacity(fn_nodes.len());
-    for (target_id, fn_node) in fn_nodes {
-        match snapshot.get_or_build_cfg(project_id, fn_node) {
-            Ok(cfg) => {
-                let mut branch_items = Vec::with_capacity(cfg.branches.len());
-                for (edge_index, branch) in cfg.branches.iter().enumerate() {
+    for (target_id, scope_node) in fn_nodes {
+        match snapshot.get_or_build_ir(project_id, program, checker, scope_node) {
+            Ok(lowered) => {
+                let mut branch_items = Vec::with_capacity(lowered.ir.branches.len());
+                for branch in &lowered.ir.branches {
                     let branch_ref = snapshot.alloc_branch(
                         project_id,
                         BranchHandle {
-                            function_node: fn_node,
-                            edge_index,
+                            function_node: scope_node,
+                            edge_index: usize::try_from(branch.id.0).unwrap_or(0),
                         },
                     );
-                    let condition = snapshot.alloc_syntax(project_id, branch.condition_node);
+                    let cond_node = lowered
+                        .syntax_to_node
+                        .get(&branch.condition_syntax)
+                        .copied()
+                        .unwrap_or(scope_node);
+                    let condition = snapshot.alloc_syntax(project_id, cond_node);
                     branch_items.push(BranchEdgeItem {
                         branch_ref,
-                        kind: branch.kind,
-                        direction: branch.direction,
+                        kind: branch.kind.as_str(),
+                        direction: branch.direction.as_str(),
                         condition,
                         condition_text: branch.condition_text.clone(),
                         location: branch.location.clone(),
@@ -950,7 +1020,7 @@ pub fn run_list_branches(
                 items.push(FunctionBranchesItem {
                     target: target_id,
                     branches: branch_items,
-                    gaps: cfg.gaps.clone(),
+                    gaps: Vec::new(),
                 });
             }
             Err(gap) => {
@@ -966,22 +1036,28 @@ pub fn run_list_branches(
     Ok(items)
 }
 
-pub fn run_branch_coverage(
-    snapshot: &mut SnapshotState,
+pub struct BranchCoverageRequest<'a> {
+    pub project_id: &'a str,
+    pub program: &'static Program,
+    pub function_handle: Option<&'a str>,
+    pub scope_handle: Option<&'a str>,
+    pub branch_handles: &'a [String],
+    pub target_handles: &'a [String],
+}
+
+fn resolve_explicit_scope(
+    snapshot: &SnapshotState,
     project_id: &str,
     function_handle: Option<&str>,
     scope_handle: Option<&str>,
-    branch_handles: &[String],
-    target_handles: &[String],
-) -> Result<Vec<BranchCoverageItem>, RpcErr> {
+) -> Result<Option<P<Node>>, RpcErr> {
     if function_handle.is_some() && scope_handle.is_some() {
         return Err(RpcErr::new(
             "INVALID_CONFIG",
             "branchCoverage accepts either 'function' or 'scope', not both.".to_string(),
         ));
     }
-
-    let explicit_scope = if let Some(fn_id) = function_handle {
+    if let Some(fn_id) = function_handle {
         let node = snapshot.get_syntax_node(project_id, fn_id)?;
         let Some(fn_node) = normalize_function_node(node) else {
             return Err(RpcErr::new(
@@ -989,8 +1065,9 @@ pub fn run_branch_coverage(
                 format!("Program reference {fn_id} is not a function-like syntax node."),
             ));
         };
-        Some(fn_node)
-    } else if let Some(scope_id) = scope_handle {
+        return Ok(Some(fn_node));
+    }
+    if let Some(scope_id) = scope_handle {
         let node = snapshot.get_syntax_node(project_id, scope_id)?;
         let Some(scope_node) = normalize_cfg_scope_node(node) else {
             return Err(RpcErr::new(
@@ -1000,19 +1077,67 @@ pub fn run_branch_coverage(
                 ),
             ));
         };
-        Some(scope_node)
-    } else {
-        None
-    };
+        return Ok(Some(scope_node));
+    }
+    Ok(None)
+}
 
-    let mut resolved_branches = Vec::with_capacity(branch_handles.len());
-    for branch_id in branch_handles {
-        resolved_branches.push(snapshot.get_branch(project_id, branch_id)?);
+fn outcome_to_branch_coverage_item(
+    target: String,
+    outcome: BranchCoverageOutcome,
+) -> BranchCoverageItem {
+    match outcome {
+        BranchCoverageOutcome::Proved {
+            target_reachable,
+            evidence,
+        } => BranchCoverageItem::Proved {
+            target,
+            target_reachable,
+            evidence,
+        },
+        BranchCoverageOutcome::Disproved {
+            target_reachable,
+            counterexample_path,
+            evidence,
+        } => BranchCoverageItem::Disproved {
+            target,
+            target_reachable,
+            counterexample_path,
+            evidence,
+        },
+        BranchCoverageOutcome::Inconclusive {
+            target_reachable,
+            gaps,
+            evidence,
+        } => BranchCoverageItem::Inconclusive {
+            target,
+            target_reachable,
+            gaps,
+            evidence,
+        },
+    }
+}
+
+pub fn run_branch_coverage(
+    snapshot: &mut SnapshotState,
+    checker: &mut CheckerHandle,
+    req: &BranchCoverageRequest<'_>,
+) -> Result<Vec<BranchCoverageItem>, RpcErr> {
+    let explicit_scope = resolve_explicit_scope(
+        snapshot,
+        req.project_id,
+        req.function_handle,
+        req.scope_handle,
+    )?;
+
+    let mut resolved_branches = Vec::with_capacity(req.branch_handles.len());
+    for branch_id in req.branch_handles {
+        resolved_branches.push(snapshot.get_branch(req.project_id, branch_id)?);
     }
 
-    let mut resolved_targets = Vec::with_capacity(target_handles.len());
-    for target_id in target_handles {
-        let node = snapshot.get_syntax_node(project_id, target_id)?;
+    let mut resolved_targets = Vec::with_capacity(req.target_handles.len());
+    for target_id in req.target_handles {
+        let node = snapshot.get_syntax_node(req.project_id, target_id)?;
         let Some(sf) = get_source_file_of_node(node) else {
             return Err(RpcErr::new(
                 "ENGINE_ERROR",
@@ -1027,56 +1152,70 @@ pub fn run_branch_coverage(
     let mut items = Vec::with_capacity(resolved_targets.len());
     for (target_id, target_node, target_loc) in resolved_targets {
         let scope_fn = explicit_scope.or_else(|| resolve_enclosing_function(target_node));
-        let Some(fn_node) = scope_fn else {
-            items.push(BranchCoverageItem {
+        let Some(scope_node) = scope_fn else {
+            let gap = GapItem::from_reason(
+                UnknownReason::NoEnclosingFunction,
+                "Target is not inside a function body.".to_string(),
+                Some(target_loc),
+            );
+            let evidence = vec![EvidenceItem::simple(
+                "note",
+                gap.message.clone(),
+                gap.at.clone(),
+            )];
+            items.push(BranchCoverageItem::Inconclusive {
                 target: target_id,
-                status: "unknown",
-                evidence: Vec::new(),
-                gaps: vec![GapItem {
-                    kind: "no-enclosing-function",
-                    message: "Target is not inside a function body.".to_string(),
-                    at: Some(target_loc),
-                }],
+                target_reachable: false,
+                gaps: vec![gap],
+                evidence,
             });
             continue;
         };
 
-        let cfg = match snapshot.get_or_build_cfg(project_id, fn_node) {
-            Ok(cfg) => cfg,
-            Err(gap) => {
-                items.push(BranchCoverageItem {
-                    target: target_id,
-                    status: "unknown",
-                    evidence: Vec::new(),
-                    gaps: vec![gap],
-                });
-                continue;
-            }
-        };
+        let lowered =
+            match snapshot.get_or_build_ir(req.project_id, req.program, checker, scope_node) {
+                Ok(lowered) => lowered,
+                Err(gap) => {
+                    let evidence = vec![EvidenceItem::simple(
+                        "note",
+                        gap.message.clone(),
+                        gap.at.clone(),
+                    )];
+                    items.push(BranchCoverageItem::Inconclusive {
+                        target: target_id,
+                        target_reachable: false,
+                        gaps: vec![gap],
+                        evidence,
+                    });
+                    continue;
+                }
+            };
 
-        let mut selected_edges = Vec::new();
+        let mut selected_branches = Vec::new();
         let mut extra_gaps = Vec::new();
         for branch in &resolved_branches {
-            if branch.function_node == fn_node {
-                selected_edges.push(branch.edge_index);
+            if branch.function_node == scope_node {
+                let bid = BranchId(u32::try_from(branch.edge_index).unwrap_or(u32::MAX));
+                selected_branches.push(bid);
             } else if explicit_scope.is_some() {
-                extra_gaps.push(GapItem {
-                    kind: "foreign-branch-reference",
-                    message:
-                        "Branch reference belongs to a different function than the target scope."
-                            .to_string(),
-                    at: Some(target_loc.clone()),
-                });
+                extra_gaps.push(GapItem::from_reason(
+                    UnknownReason::ForeignBranchReference,
+                    "Branch reference belongs to a different function than the target scope."
+                        .to_string(),
+                    Some(target_loc.clone()),
+                ));
             }
         }
 
-        let outcome = cfg.evaluate_coverage(target_node, &target_loc, &selected_edges, &extra_gaps);
-        items.push(BranchCoverageItem {
-            target: target_id,
-            status: outcome.status.as_str(),
-            evidence: outcome.evidence,
-            gaps: outcome.gaps,
-        });
+        let target_syntax = lowered.node_to_syntax.get(&target_node).copied();
+        let outcome = evaluate_branch_coverage(
+            &lowered.ir,
+            target_syntax,
+            &target_loc,
+            &selected_branches,
+            &extra_gaps,
+        );
+        items.push(outcome_to_branch_coverage_item(target_id, outcome));
     }
 
     Ok(items)

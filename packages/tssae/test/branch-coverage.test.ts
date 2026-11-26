@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { withTempHost } from "@tssae/test-hosts";
+import { writeHostFiles, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   openProject,
@@ -102,9 +102,10 @@ void describe("tssae branchCoverage", () => {
               status: item.status,
               evidenceCount: item.evidence.length,
             });
-            if (item.status === "bypass") {
+            if (item.status === "disproved") {
               assert.equal(executeCalls[0]!.location.line, 16);
               assert.ok(item.evidence.length >= 1);
+              assert.ok(item.counterexamplePath.steps.length >= 1);
             }
           }
         }
@@ -113,8 +114,8 @@ void describe("tssae branchCoverage", () => {
       }
 
       assert.deepEqual(observed, [
-        { fn: "guardedEarlyReturn", status: "covered", evidenceCount: 1 },
-        { fn: "bypassPossible", status: "bypass", evidenceCount: 2 },
+        { fn: "guardedEarlyReturn", status: "proved", evidenceCount: 1 },
+        { fn: "bypassPossible", status: "disproved", evidenceCount: 2 },
       ]);
     });
   });
@@ -263,14 +264,14 @@ void describe("tssae branchCoverage", () => {
         }
 
         assert.deepEqual(results, {
-          "multiAuthIfElse:onlyApi": "bypass",
-          "multiAuthIfElse:onlySession": "bypass",
-          "multiAuthIfElse:both": "covered",
-          "switchWithDefault:onlyBearer": "bypass",
-          "switchWithDefault:bothCases": "covered",
-          "switchFallthrough:onlyBearer": "bypass",
-          "switchFallthrough:bothCases": "covered",
-          "switchNoDefault:onlyBearer": "bypass",
+          "multiAuthIfElse:onlyApi": "disproved",
+          "multiAuthIfElse:onlySession": "disproved",
+          "multiAuthIfElse:both": "proved",
+          "switchWithDefault:onlyBearer": "disproved",
+          "switchWithDefault:bothCases": "proved",
+          "switchFallthrough:onlyBearer": "disproved",
+          "switchFallthrough:bothCases": "proved",
+          "switchNoDefault:onlyBearer": "disproved",
         });
         assert.ok(
           witnessMessages["multiAuthIfElse:onlyApi"].some((msg) =>
@@ -354,24 +355,25 @@ void describe("tssae branchCoverage", () => {
 
         assert.equal(conditionTypeText, "boolean");
         assert.deepEqual(statuses, {
-          call_0: "covered",
-          call_1: "covered",
-          call_2: "covered",
-          call_3: "covered",
-          call_4: "covered",
-          method_wrong_branch: "bypass",
+          call_0: "proved",
+          call_1: "proved",
+          call_2: "proved",
+          call_3: "proved",
+          call_4: "proved",
+          method_wrong_branch: "disproved",
         });
       },
     );
   });
 
-  void it("returns unreachable for dead targets and unknown with Gaps for unmodeled control flow", async () => {
+  void it("distinguishes unreachable targets (proved with targetReachable=false) and inconclusive critical-path gaps", async () => {
     await withTempHost(
       { host: "sdk-queries/branch-unreachable-unknown" },
       async (host) => {
         await host.typecheck();
 
         const statuses: Record<string, string> = {};
+        const reachability: Record<string, boolean> = {};
         const gapKinds: Record<string, readonly string[]> = {};
         const allGaps: Array<{
           readonly at?: unknown;
@@ -419,39 +421,72 @@ void describe("tssae branchCoverage", () => {
               targets: [executeCall.ref],
             });
             statuses[label] = res!.status;
-            allGaps.push(...res!.gaps);
+            reachability[label] = res!.targetReachable;
+            if (res!.status === "inconclusive") {
+              allGaps.push(...res!.gaps);
+            }
           }
 
           const tryCase = findFn("function tryCatchHandler(");
           tryBranchCount = tryCase.group.branches.length;
-          const [tryRes] = await ctx.branchCoverage({
+          // With guard branches selected, `if (isAuthorized(req))` still dominates `execute(req)`
+          const [tryGuardedRes] = await ctx.branchCoverage({
             function: tryCase.fn.ref,
             branches: tryCase.group.branches.map((b) => b.ref),
             targets: [tryCase.executeCall.ref],
           });
+          statuses["tryCatchGuarded"] = tryGuardedRes!.status;
+          reachability["tryCatchGuarded"] = tryGuardedRes!.targetReachable;
+
+          // Without guard branches selected, the bypass path goes through `try/catch`
+          const [tryRes] = await ctx.branchCoverage({
+            function: tryCase.fn.ref,
+            branches: [],
+            targets: [tryCase.executeCall.ref],
+          });
           statuses["tryCatch"] = tryRes!.status;
-          gapKinds["tryCatch"] = tryRes!.gaps.map((g) => g.kind);
-          allGaps.push(...tryRes!.gaps);
+          if (tryRes!.status === "inconclusive") {
+            gapKinds["tryCatch"] = tryRes!.gaps.map((g) => g.kind);
+            allGaps.push(...tryRes!.gaps);
+          }
 
           const loopCase = findFn("function loopHandler(");
-          const [loopRes] = await ctx.branchCoverage({
+          const [loopGuardedRes] = await ctx.branchCoverage({
             function: loopCase.fn.ref,
             branches: loopCase.group.branches.map((b) => b.ref),
             targets: [loopCase.executeCall.ref],
           });
+          statuses["loopGuarded"] = loopGuardedRes!.status;
+
+          const [loopRes] = await ctx.branchCoverage({
+            function: loopCase.fn.ref,
+            branches: [],
+            targets: [loopCase.executeCall.ref],
+          });
           statuses["loop"] = loopRes!.status;
-          gapKinds["loop"] = loopRes!.gaps.map((g) => g.kind);
-          allGaps.push(...loopRes!.gaps);
+          if (loopRes!.status === "inconclusive") {
+            gapKinds["loop"] = loopRes!.gaps.map((g) => g.kind);
+            allGaps.push(...loopRes!.gaps);
+          }
 
           const genCase = findFn("function* generatorHandler(");
-          const [genRes] = await ctx.branchCoverage({
+          const [genGuardedRes] = await ctx.branchCoverage({
             function: genCase.fn.ref,
             branches: genCase.group.branches.map((b) => b.ref),
             targets: [genCase.executeCall.ref],
           });
+          statuses["generatorGuarded"] = genGuardedRes!.status;
+
+          const [genRes] = await ctx.branchCoverage({
+            function: genCase.fn.ref,
+            branches: [],
+            targets: [genCase.executeCall.ref],
+          });
           statuses["generator"] = genRes!.status;
-          gapKinds["generator"] = genRes!.gaps.map((g) => g.kind);
-          allGaps.push(...genRes!.gaps);
+          if (genRes!.status === "inconclusive") {
+            gapKinds["generator"] = genRes!.gaps.map((g) => g.kind);
+            allGaps.push(...genRes!.gaps);
+          }
 
           // Outer function querying target inside nested closure must not confuse scopes
           const outerCase = findFn("function outerWithClosure(");
@@ -461,8 +496,10 @@ void describe("tssae branchCoverage", () => {
             targets: [outerCase.executeCall.ref],
           });
           statuses["outerForInnerTarget"] = outerRes!.status;
-          gapKinds["outerForInnerTarget"] = outerRes!.gaps.map((g) => g.kind);
-          allGaps.push(...outerRes!.gaps);
+          if (outerRes!.status === "inconclusive") {
+            gapKinds["outerForInnerTarget"] = outerRes!.gaps.map((g) => g.kind);
+            allGaps.push(...outerRes!.gaps);
+          }
 
           // Querying the inner arrow function directly works
           const innerArrow = fns.find(
@@ -481,14 +518,23 @@ void describe("tssae branchCoverage", () => {
 
         assert.equal(tryBranchCount, 2);
         assert.deepEqual(statuses, {
-          deadAfterReturn: "unreachable",
-          deadIfFalse: "unreachable",
-          deadAfterSwitch: "unreachable",
-          tryCatch: "unknown",
-          loop: "unknown",
-          generator: "unknown",
-          outerForInnerTarget: "unknown",
-          innerDirect: "bypass",
+          deadAfterReturn: "proved",
+          deadIfFalse: "proved",
+          deadAfterSwitch: "proved",
+          tryCatchGuarded: "proved",
+          tryCatch: "inconclusive",
+          loopGuarded: "proved",
+          loop: "inconclusive",
+          generatorGuarded: "proved",
+          generator: "inconclusive",
+          outerForInnerTarget: "inconclusive",
+          innerDirect: "disproved",
+        });
+        assert.deepEqual(reachability, {
+          deadAfterReturn: false,
+          deadIfFalse: false,
+          deadAfterSwitch: false,
+          tryCatchGuarded: true,
         });
         assert.deepEqual(gapKinds, {
           tryCatch: ["unmodeled-try-catch"],
@@ -538,8 +584,9 @@ void describe("tssae branchCoverage", () => {
           targets: [secondExecute.ref],
         });
         foreignResultStatus = res!.status;
+        assert.equal(res!.status, "inconclusive");
         foreignGapKind = res!.gaps[0]?.kind;
-        assert.equal(foreignResultStatus, "unknown");
+        assert.equal(foreignResultStatus, "inconclusive");
         assert.equal(foreignGapKind, "foreign-branch-reference");
       } finally {
         await session1.close();
@@ -647,21 +694,22 @@ void describe("tssae branchCoverage", () => {
             });
             localStatuses[fnName] = localCov!.status;
             localGapCounts[fnName] =
-              localBranches!.gaps.length + localCov!.gaps.length;
+              localBranches!.gaps.length +
+              (localCov!.status === "inconclusive" ? localCov!.gaps.length : 0);
           }
         } finally {
           await session.close();
         }
 
         assert.deepEqual(wholeFnStatuses, {
-          loopWithBypass: "unknown",
-          tryLoopWithGuard: "unknown",
-          loopWithContinueGuard: "unknown",
+          loopWithBypass: "inconclusive",
+          tryLoopWithGuard: "inconclusive",
+          loopWithContinueGuard: "inconclusive",
         });
         assert.deepEqual(localStatuses, {
-          loopWithBypass: "bypass",
-          tryLoopWithGuard: "covered",
-          loopWithContinueGuard: "covered",
+          loopWithBypass: "disproved",
+          tryLoopWithGuard: "proved",
+          loopWithContinueGuard: "proved",
         });
         assert.deepEqual(localGapCounts, {
           loopWithBypass: 0,
@@ -670,5 +718,202 @@ void describe("tssae branchCoverage", () => {
         });
       },
     );
+  });
+
+  void it("excludes unrelated unknown constructs from gaps, proves guarded targets despite off-path unknowns, and reports known bypasses over parallel unknowns", async () => {
+    await withTempHost({}, async (host) => {
+      writeHostFiles(host.rootDir, {
+        "package.json": JSON.stringify(
+          { name: "ir-unrelated-gaps", private: true, type: "module" },
+          null,
+          2,
+        ),
+        "tsconfig.json": JSON.stringify(
+          {
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          },
+          null,
+          2,
+        ),
+        "src/cases.ts": `declare function isAuthorized(req: string): boolean;
+declare function log(msg: string): void;
+declare function execute(req: string): void;
+
+export function unrelatedUnknownAroundGuard(
+  req: string,
+  debug: boolean,
+  items: readonly string[],
+): void {
+  if (debug) {
+    for (const item of items) {
+      log(item);
+    }
+    return;
+  }
+  if (!isAuthorized(req)) {
+    return;
+  }
+  execute(req);
+  for (const item of items) {
+    log(item);
+  }
+}
+
+export function knownBypassWithParallelUnknown(
+  req: string,
+  useLoop: boolean,
+  items: readonly string[],
+): void {
+  if (useLoop) {
+    for (const item of items) {
+      if (isAuthorized(item)) {
+        log(item);
+      }
+    }
+  } else if (isAuthorized(req)) {
+    log(req);
+  }
+  execute(req);
+}
+
+export function criticalVsOffPathUnknown(
+  req: string,
+  debug: boolean,
+  items: readonly string[],
+): void {
+  if (debug) {
+    try {
+      log(req);
+    } catch {
+      log("err");
+    }
+    return;
+  }
+  for (const item of items) {
+    if (isAuthorized(item)) {
+      return;
+    }
+  }
+  execute(req);
+}
+
+export function optionalChainShortCircuit(
+  cfg: { readonly run?: (req: string) => void } | undefined,
+  req: string,
+): void {
+  cfg?.run?.(req);
+}
+`,
+      });
+      await host.typecheck();
+
+      const session = await openProject({
+        cwd: host.rootDir,
+        tsconfig: "tsconfig.json",
+      });
+      try {
+        const ctx = session.project();
+        const fns = await ctx.findSyntax({
+          files: ["src/cases.ts"],
+          kinds: ["FunctionDeclaration"],
+        });
+        const calls = await ctx.findSyntax({
+          files: ["src/cases.ts"],
+          kinds: ["CallExpression"],
+        });
+        const branchGroups = await ctx.listBranches(fns.map((f) => f.ref));
+
+        const findCase = (name: string) => {
+          const idx = fns.findIndex((f) =>
+            f.text.includes(`function ${name}(`),
+          );
+          assert.ok(idx >= 0, `expected ${name}`);
+          const fn = fns[idx]!;
+          const target = calls.find(
+            (c) =>
+              c.text.startsWith("execute(") &&
+              insideSpan(c.location, fn.location),
+          );
+          return { fn, branches: branchGroups[idx]!.branches, target };
+        };
+
+        // 1. Unrelated loop in returning branch + loop after target do NOT degrade proved
+        {
+          const c = findCase("unrelatedUnknownAroundGuard");
+          const authFalse = c.branches.find(
+            (b) =>
+              b.conditionText === "!isAuthorized(req)" &&
+              b.direction === "false",
+          )!;
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [authFalse.ref],
+            targets: [c.target!.ref],
+          });
+          assert.equal(res!.status, "proved");
+          assert.equal(res!.targetReachable, true);
+        }
+
+        // 2. Known explicit bypass alongside parallel unknown loop yields "disproved" with counterexamplePath
+        {
+          const c = findCase("knownBypassWithParallelUnknown");
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [],
+            targets: [c.target!.ref],
+          });
+          assert.ok(res);
+          assert.equal(res.status, "disproved");
+          if (res.status === "disproved") {
+            assert.ok(res.counterexamplePath.steps.length >= 2);
+            assert.ok(res.counterexamplePath.evidence.length >= 2);
+          }
+        }
+
+        // 3. Critical-path loop yields "inconclusive" with ONLY unmodeled-loop (not off-path try-catch)
+        {
+          const c = findCase("criticalVsOffPathUnknown");
+          const authFalse = c.branches.find(
+            (b) =>
+              b.conditionText === "isAuthorized(item)" &&
+              b.direction === "false",
+          );
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: authFalse ? [authFalse.ref] : [],
+            targets: [c.target!.ref],
+          });
+          assert.ok(res);
+          assert.equal(res.status, "inconclusive");
+          if (res.status === "inconclusive") {
+            assert.deepEqual(
+              res.gaps.map((g) => g.kind),
+              ["unmodeled-loop"],
+            );
+          }
+        }
+
+        // 4. Optional chaining `?.` exposes optionalChain continue/shortCircuit branches
+        {
+          const c = findCase("optionalChainShortCircuit");
+          const optBranches = c.branches.filter(
+            (b) => b.kind === "optionalChain",
+          );
+          assert.ok(
+            optBranches.some((b) => b.direction === "continue") &&
+              optBranches.some((b) => b.direction === "shortCircuit"),
+          );
+        }
+      } finally {
+        await session.close();
+      }
+    });
   });
 });

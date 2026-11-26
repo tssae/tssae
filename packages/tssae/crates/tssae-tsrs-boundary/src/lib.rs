@@ -5,6 +5,8 @@
 //! signatures, assignability, and module/project-reference mapping.
 
 pub mod impl_resolution;
+#[deny(clippy::wildcard_enum_match_arm)]
+pub mod ir_lower;
 pub mod semantic_facade;
 pub mod syntax_view;
 
@@ -12,6 +14,10 @@ pub use impl_resolution::{
     DeclarationProvenance, FacadeImplementationInput, FacadeImplementationOutcome,
     FacadeImplementationTarget, FirstPartyResolutionSource, SourceMapCache,
     is_first_party_source_file, is_first_party_workspace_path,
+};
+pub use ir_lower::{
+    LoweredScope, lower_scope_to_ir, normalize_cfg_scope_node, normalize_function_node,
+    resolve_enclosing_function,
 };
 
 pub use semantic_facade::{

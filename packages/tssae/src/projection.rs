@@ -35,8 +35,8 @@ use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
 use crate::package_impl::{ImplementationResolutionRow, run_resolve_implementations};
 use crate::serve::{
-    BranchCoverageItem, FunctionBranchesItem, HandlePayload, RpcErr, SnapshotState,
-    run_branch_coverage, run_list_branches,
+    BranchCoverageItem, BranchCoverageRequest, FunctionBranchesItem, HandlePayload, RpcErr,
+    SnapshotState, run_branch_coverage, run_list_branches,
 };
 
 /// Three-state projected field distinguishing omitted keys, explicit `null`, and present values.
@@ -779,9 +779,9 @@ fn execute_step(
         | QueryStep::SyntaxOf { .. }) => execute_projection_step(
             snapshot, project_id, program, checker, other, step_start, observer,
         ),
-        QueryStep::ListBranches { targets } => {
-            execute_list_branches_step(snapshot, project_id, &targets, step_start, observer)
-        }
+        QueryStep::ListBranches { targets } => execute_list_branches_step(
+            snapshot, project_id, program, checker, &targets, step_start, observer,
+        ),
         QueryStep::BranchCoverage {
             function,
             scope,
@@ -790,6 +790,8 @@ fn execute_step(
         } => execute_branch_coverage_step(
             snapshot,
             project_id,
+            program,
+            checker,
             function.as_deref(),
             scope.as_deref(),
             &branches,
@@ -1197,11 +1199,13 @@ fn execute_type_at_location_step(
 fn execute_list_branches_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
+    checker: &mut CheckerHandle,
     targets: &[String],
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
 ) -> Result<StepResult, RpcErr> {
-    let items = run_list_branches(snapshot, project_id, targets)?;
+    let items = run_list_branches(snapshot, project_id, program, checker, targets)?;
     let raw_details = if observer.is_detail() {
         items
             .iter()
@@ -1232,6 +1236,8 @@ fn execute_list_branches_step(
 fn execute_branch_coverage_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
+    program: &'static Program,
+    checker: &mut CheckerHandle,
     function: Option<&str>,
     scope: Option<&str>,
     branches: &[String],
@@ -1239,7 +1245,18 @@ fn execute_branch_coverage_step(
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
 ) -> Result<StepResult, RpcErr> {
-    let items = run_branch_coverage(snapshot, project_id, function, scope, branches, targets)?;
+    let items = run_branch_coverage(
+        snapshot,
+        checker,
+        &BranchCoverageRequest {
+            project_id,
+            program,
+            function_handle: function,
+            scope_handle: scope,
+            branch_handles: branches,
+            target_handles: targets,
+        },
+    )?;
     let raw_details = if observer.is_detail() {
         items
             .iter()
@@ -1248,7 +1265,7 @@ fn execute_branch_coverage_step(
                 file: None,
                 line: None,
                 column: None,
-                summary: format!("{} -> {}", item.target, item.status),
+                summary: format!("{} -> {}", item.target(), item.status_str()),
             })
             .collect()
     } else {

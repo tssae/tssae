@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 tssae-common = { path = "crates/tssae-common" }
+tssae-analysis = { path = "crates/tssae-analysis" }
 tssae-tsrs-boundary = { path = "crates/tssae-tsrs-boundary" }
 tssae-adapter-api = { path = "../adapter-api" }
 rustc-hash = "2"

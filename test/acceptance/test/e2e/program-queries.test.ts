@@ -336,9 +336,16 @@ try {
       targets: [deadSinkCallSyn.ref],
     }),
   ]);
-  assert.equal(covPositive[0]?.status, "covered");
-  assert.equal(covNegative[0]?.status, "bypass");
-  assert.equal(covDead[0]?.status, "unreachable");
+  assert.equal(covPositive[0]?.status, "proved");
+  assert.equal(covPositive[0]?.targetReachable, true);
+  assert.equal(covNegative[0]?.status, "disproved");
+  assert.equal(covNegative[0]?.targetReachable, true);
+  assert.ok(
+    covNegative[0]?.status === "disproved" &&
+      covNegative[0].counterexamplePath.steps.length > 0,
+  );
+  assert.equal(covDead[0]?.status, "proved");
+  assert.equal(covDead[0]?.targetReachable, false);
 
   // 3. Value propagation + retained object fields (positive & negative)
   const appVars = await ctx.findSyntax({
@@ -624,9 +631,9 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
 
       assert.equal(summary.callersFound, 1);
       assert.deepEqual(summary.branchStatuses, [
-        "covered",
-        "bypass",
-        "unreachable",
+        "proved",
+        "disproved",
+        "proved",
       ]);
       assert.deepEqual(summary.propRetained, ["id", "name"]);
       assert.deepEqual(summary.sameInstance, [true, false]);

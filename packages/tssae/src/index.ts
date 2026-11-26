@@ -58,12 +58,14 @@ export {
 export { isSameInstance } from "./instance-identity.ts";
 export { defineModel, openProject } from "./session.ts";
 export type {
+  BranchBypassPath,
   BranchCoverageItem,
   BranchCoverageOptions,
   BranchCoverageStatus,
   BranchDirection,
   BranchEdgeInfo,
   BranchKind,
+  ControlFlowPathStep,
   FunctionBranchesResult,
 } from "./branch-coverage.ts";
 export type {

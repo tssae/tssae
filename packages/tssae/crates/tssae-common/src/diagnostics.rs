@@ -118,8 +118,6 @@ pub struct EvidenceItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<DiagnosticLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_source: Option<String>,
@@ -138,28 +136,9 @@ impl EvidenceItem {
             kind,
             message,
             at,
-            model_id: None,
             summary_id: None,
             summary_source: None,
             declaration: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn model(
-        message: String,
-        at: Option<DiagnosticLocation>,
-        model_id: String,
-        declaration: String,
-    ) -> Self {
-        Self {
-            kind: "model",
-            message,
-            at,
-            model_id: Some(model_id),
-            summary_id: None,
-            summary_source: None,
-            declaration: Some(declaration),
         }
     }
 
@@ -175,7 +154,6 @@ impl EvidenceItem {
             kind: "summary",
             message,
             at,
-            model_id: None,
             summary_id: Some(summary_id),
             summary_source: Some(summary_source),
             declaration,

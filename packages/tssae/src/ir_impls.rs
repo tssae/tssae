@@ -1,13 +1,10 @@
 use serde::Serialize;
-use tsrs_ast::Node;
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
+use tssae_common::{EvidenceItem, GapItem};
 use tssae_tsrs_boundary::{
     FacadeImplementationInput, FacadeImplementationOutcome, FacadeImplementationTarget,
-    FirstPartyResolutionSource, SemanticFacade, SourceMapCache,
+    FirstPartyResolutionSource, SemanticFacade,
 };
 
-use crate::cfg::{EvidenceItem, GapItem};
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
 
 #[derive(Clone, Serialize)]
@@ -68,36 +65,11 @@ pub fn to_resolved_impl_payload(
     }
 }
 
-pub fn resolve_first_party_for_call_target(
-    cwd: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    workspace_programs: &[&'static Program],
-    sourcemap_cache: &SourceMapCache,
-    decl_node: Option<P<Node>>,
-    call_node: P<Node>,
-) -> FacadeImplementationOutcome {
-    let mut facade = SemanticFacade::new(cwd, program, checker);
-    let input = decl_node.map_or(FacadeImplementationInput::Node(call_node), |decl| {
-        FacadeImplementationInput::Declaration(decl, decl.symbol())
-    });
-    facade.resolve_implementation(input, workspace_programs, sourcemap_cache)
-}
-
-pub fn check_call_missing_package_gap(
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    cwd: &str,
-    call_node: P<Node>,
-) -> Option<GapItem> {
-    SemanticFacade::new(cwd, program, checker).check_call_missing_package_gap(call_node)
-}
-
 pub fn run_resolve_implementations(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: &'static tsrs_compiler::Program,
+    checker: &mut tsrs_compiler::CheckerHandle,
     targets: &[String],
 ) -> Result<Vec<ImplementationResolutionRow>, RpcErr> {
     let mut inputs = Vec::with_capacity(targets.len());

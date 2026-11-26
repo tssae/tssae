@@ -3,7 +3,6 @@ import { performance } from "node:perf_hooks";
 import type { ControlFlowPathStep } from "./branch-coverage.ts";
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { recordSyntaxLocation, registerProvenance } from "./evidence.ts";
-import type { InstanceModelMatch } from "./instance-identity.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
 import { validateProgramRefs } from "./projection.ts";
 import type { SummaryDiscoverySource } from "./summaries.ts";
@@ -18,42 +17,8 @@ import {
   type Gap,
   type InstanceRef,
   type LookupFilesOptions,
-  type Model,
   type SyntaxRef,
 } from "./types.ts";
-
-export type CleanupModelOperationKind =
-  | "disposes-target"
-  | "replaces-previous-value"
-  | "registers-into-container"
-  | "detaches-from-container";
-
-export type CleanupModelTarget =
-  | "receiver"
-  | { readonly argumentIndex: number };
-
-/**
- * Declares how a method call or property assignment disposes, replaces, registers, or detaches resource instances.
- */
-export type CleanupModelOperation = {
-  readonly kind: CleanupModelOperationKind;
-  readonly match: InstanceModelMatch;
-  readonly target?: CleanupModelTarget;
-  readonly containerTarget?: CleanupModelTarget;
-  readonly description?: string;
-};
-
-/**
- * Declares an API whose callback argument executes at the end of a resource/child lifecycle.
- */
-export type LifecycleEventBehavior = {
-  readonly kind: "lifecycle-end-callback";
-  readonly match: InstanceModelMatch;
-  /** 0-based argument index of the lifecycle-end callback. Defaults to `0`. */
-  readonly callbackArgumentIndex?: number;
-  readonly eventName?: string;
-  readonly description?: string;
-};
 
 export type CleanupScopeRef = SyntaxRef | CallRef | DeclarationRef;
 
@@ -70,7 +35,12 @@ export type CleanupSiteInfo = {
   readonly instance: InstanceRef;
   readonly instanceKey: string;
   readonly allocationLocation: DiagnosticLocation | null;
-  readonly operationKind: CleanupModelOperationKind | (string & {});
+  readonly operationKind:
+    | "disposes-target"
+    | "replaces-previous-value"
+    | "registers-into-container"
+    | "detaches-from-container"
+    | (string & {});
   readonly syntax: SyntaxRef;
   readonly location: DiagnosticLocation;
   readonly viaCall: CallRef | null;
@@ -379,176 +349,6 @@ type EngineBatchResult = {
     readonly items: readonly unknown[];
   }[];
 };
-
-function assertNonEmptyOptionalString(
-  value: unknown,
-  field: string,
-  modelId: string,
-  section: string,
-): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.${field} must be a non-empty string when provided.`,
-    );
-  }
-  return value;
-}
-
-function validateMatchObject(
-  modelId: string,
-  section: string,
-  match: unknown,
-): void {
-  if (typeof match !== "object" || match === null) {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.match must be an object.`,
-    );
-  }
-  const m = match as Record<string, unknown>;
-  const symbol = assertNonEmptyOptionalString(
-    m.symbol,
-    "match.symbol",
-    modelId,
-    section,
-  );
-  const container = assertNonEmptyOptionalString(
-    m.container,
-    "match.container",
-    modelId,
-    section,
-  );
-  const member = assertNonEmptyOptionalString(
-    m.member,
-    "match.member",
-    modelId,
-    section,
-  );
-  assertNonEmptyOptionalString(m.module, "match.module", modelId, section);
-
-  if (symbol === undefined && container === undefined && member === undefined) {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.match must specify at least one of symbol, container, or member.`,
-    );
-  }
-}
-
-function validateModelTargetSpec(
-  modelId: string,
-  section: string,
-  field: string,
-  target: unknown,
-): void {
-  if (target === undefined || target === "receiver") return;
-  if (
-    typeof target === "object" &&
-    target !== null &&
-    "argumentIndex" in target
-  ) {
-    const idx = (target as { readonly argumentIndex: unknown }).argumentIndex;
-    if (typeof idx === "number" && Number.isInteger(idx) && idx >= 0) {
-      return;
-    }
-  }
-  throw new TssaeError(
-    "INVALID_CONFIG",
-    `Model "${modelId}" ${section}.${field} must be "receiver" or { argumentIndex: <non-negative integer> }.`,
-  );
-}
-
-/** Validates `cleanupOperations` and `lifecycleEvents` declared on a `Model`. */
-export function validateCleanupAndLifecycleModels(
-  modelId: string,
-  cleanupOperations: readonly CleanupModelOperation[] | undefined,
-  lifecycleEvents: readonly LifecycleEventBehavior[] | undefined,
-): void {
-  if (cleanupOperations !== undefined) {
-    if (!Array.isArray(cleanupOperations)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Model "${modelId}" cleanupOperations must be an array when provided.`,
-      );
-    }
-    for (const [index, op] of cleanupOperations.entries()) {
-      const section = `cleanupOperations[${String(index)}]`;
-      if (
-        typeof op !== "object" ||
-        op === null ||
-        (op.kind !== "disposes-target" &&
-          op.kind !== "replaces-previous-value" &&
-          op.kind !== "registers-into-container" &&
-          op.kind !== "detaches-from-container")
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section} has invalid kind.`,
-        );
-      }
-      validateMatchObject(modelId, section, op.match);
-      validateModelTargetSpec(modelId, section, "target", op.target);
-      validateModelTargetSpec(
-        modelId,
-        section,
-        "containerTarget",
-        op.containerTarget,
-      );
-      if (op.description !== undefined && typeof op.description !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.description must be a string.`,
-        );
-      }
-    }
-  }
-
-  if (lifecycleEvents !== undefined) {
-    if (!Array.isArray(lifecycleEvents)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Model "${modelId}" lifecycleEvents must be an array when provided.`,
-      );
-    }
-    for (const [index, ev] of lifecycleEvents.entries()) {
-      const section = `lifecycleEvents[${String(index)}]`;
-      if (
-        typeof ev !== "object" ||
-        ev === null ||
-        ev.kind !== "lifecycle-end-callback"
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section} has invalid kind.`,
-        );
-      }
-      validateMatchObject(modelId, section, ev.match);
-      if (
-        ev.callbackArgumentIndex !== undefined &&
-        (!Number.isInteger(ev.callbackArgumentIndex) ||
-          ev.callbackArgumentIndex < 0)
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.callbackArgumentIndex must be a non-negative integer.`,
-        );
-      }
-      if (ev.eventName !== undefined && typeof ev.eventName !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.eventName must be a string.`,
-        );
-      }
-      if (ev.description !== undefined && typeof ev.description !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.description must be a string.`,
-        );
-      }
-    }
-  }
-}
 
 function mapCleanupSite(
   raw: RawCleanupSite,
@@ -887,7 +687,6 @@ export function createCallEffectsCache(): CallEffectsCache {
 export function createCallEffectsQueries(deps: {
   readonly client: EngineClient;
   readonly cache: CallEffectsCache;
-  readonly models?: readonly Model[];
   readonly sessionToken: symbol;
   readonly snapshotId: number;
   readonly projectId: string;
@@ -1151,7 +950,7 @@ export function createCallEffectsQueries(deps: {
               }
             }
             const resolvedScopeLoc = scopeLoc ?? cleanupLocations[0]!;
-            const modelIds = [
+            const summaryIds = [
               ...new Set(
                 tr.cleanupSites
                   .map((s) => s.summaryId)
@@ -1172,7 +971,7 @@ export function createCallEffectsQueries(deps: {
                 : {}),
               scopeLocation: resolvedScopeLoc,
               cleanupLocations,
-              modelIds,
+              summaryIds,
               summary: `Instance ${tr.instanceKey} is cleaned on all paths (${cleanupLocations.length} site(s))`,
               evidence: tr.evidence,
             };

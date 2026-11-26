@@ -7,7 +7,7 @@ import {
   defineAdapter,
   defineFactProvider,
   defineFactType,
-  defineModel,
+  defineSummaries,
   openProject,
   type BranchRef,
   type CallRef,
@@ -66,19 +66,22 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
         },
       },
       async (host) => {
-        const model = defineModel({
-          id: "resource-model",
-          instanceBehaviors: [
+        const resourceSummaries = defineSummaries({
+          id: "resource-summaries",
+          entries: [
             {
-              kind: "allocates-fresh-instance",
-              match: { symbol: "createClient" },
+              match: { memberPath: ["createClient"] },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
+              },
             },
-          ],
-          cleanupOperations: [
             {
-              kind: "disposes-target",
-              match: { member: "dispose" },
-              target: "receiver",
+              match: { memberPath: ["dispose"] },
+              effects: {
+                completeness: "complete",
+                resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+              },
             },
           ],
         });
@@ -107,7 +110,7 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [model],
+          summaries: { packs: [resourceSummaries] },
           adapters: [callTagAdapter],
         });
 

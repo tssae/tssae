@@ -4,7 +4,7 @@ import {
   defineAdapter,
   defineFactProvider,
   defineFactType,
-  defineModel,
+  defineSummaries,
   isSameInstance,
   extractBasisEvidence,
   openProject,
@@ -24,36 +24,48 @@ import {
   type TypeRef,
 } from "tssae";
 
-const extModel = defineModel({
-  id: "ext-model",
-  instanceBehaviors: [
+const extSummaries = defineSummaries({
+  id: "ext-summaries",
+  entries: [
     {
-      kind: "allocates-fresh-instance",
-      match: { container: "IMenuService", member: "createMenu" },
+      match: { memberPath: ["IMenuService", "prototype", "createMenu"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
     },
     {
-      kind: "forwards-argument",
-      match: { container: "Disposable", member: "_register" },
-      argumentIndex: 0,
-    },
-  ],
-  cleanupOperations: [
-    {
-      kind: "disposes-target",
-      match: { member: "dispose" },
-      target: "receiver",
+      match: { memberPath: ["Disposable", "prototype", "_register"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "forwards-instance", from: { argIndex: 0 } },
+      },
     },
     {
-      kind: "replaces-previous-value",
-      match: { container: "MutableDisposable", member: "value" },
-      target: "receiver",
+      match: { memberPath: ["dispose"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
     },
-  ],
-  lifecycleEvents: [
     {
-      kind: "lifecycle-end-callback",
-      match: { symbol: "onDidDisconnect" },
-      callbackArgumentIndex: 0,
+      match: { memberPath: ["MutableDisposable", "prototype", "value"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "replaces-previous-value", target: "receiver" }],
+      },
+    },
+    {
+      match: { memberPath: ["onDidDisconnect"] },
+      calls: {
+        completeness: "complete",
+        invokesCallbacks: [
+          {
+            callbackArgIndex: 0,
+            timing: "lifecycle-end",
+          },
+        ],
+      },
     },
   ],
 });
@@ -119,6 +131,11 @@ const sampleAdapter = defineAdapter({
 });
 
 export const sampleExplainPath: ExplainCleanupPath | undefined = undefined;
+export function inspectExplainSummaryIds(
+  path: ExplainCleanupPath | undefined,
+): readonly string[] | undefined {
+  return path?.summaryIds;
+}
 
 export async function runExternalConsumer(cwd: string): Promise<void> {
   const session = await openProject({
@@ -126,7 +143,7 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     tsconfig: "tsconfig.json",
     adapters: [sampleAdapter],
     additionalInputs: ["allowed-packages.json"],
-    models: [extModel],
+    summaries: { packs: [extSummaries] },
   });
   try {
     const ctx = session.project();

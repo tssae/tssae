@@ -12,10 +12,9 @@ use tssae_analysis::{
         ValuePropagationStepData, ValuePropagationTargetOutcome, trace_value_propagation,
     },
 };
-use tssae_common::{FileId, GapItem, LocalSyntaxId, SemanticModel, SyntaxId};
+use tssae_common::{EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SyntaxId};
 use tssae_tsrs_boundary::normalize_path;
 
-use crate::cfg::EvidenceItem;
 use crate::ir_calls::SnapshotIrEnv;
 use crate::observe::ObserveCollector;
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};

@@ -55,6 +55,28 @@ pub fn resolve_enclosing_function(node: P<Node>) -> Option<P<Node>> {
     None
 }
 
+/// Returns whether `node` is a class declaration or class expression scope root.
+#[must_use]
+pub fn is_class_scope_node(node: P<Node>) -> bool {
+    matches!(node.kind(), Kind::ClassDeclaration | Kind::ClassExpression)
+}
+
+/// Resolves the closest enclosing IR owner for `node`: function, class static block, or source file.
+#[must_use]
+pub fn resolve_enclosing_cfg_owner(node: P<Node>) -> Option<P<Node>> {
+    if let Some(fn_node) = resolve_enclosing_function(node) {
+        return Some(fn_node);
+    }
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == Kind::ClassStaticBlockDeclaration {
+            return Some(p);
+        }
+        cur = p.parent();
+    }
+    get_source_file_of_node(node).map(|sf| sf.as_node())
+}
+
 /// Normalizes a function-like node or its direct body `Block` to the owning function-like node.
 #[must_use]
 pub fn normalize_function_node(node: P<Node>) -> Option<P<Node>> {

@@ -22,7 +22,6 @@ import {
 import {
   createCallEffectsCache,
   createCallEffectsQueries,
-  validateCleanupAndLifecycleModels,
 } from "./call-effects.ts";
 import {
   createCallsValuesCache,
@@ -50,7 +49,6 @@ import {
 import {
   createInstanceIdentityCache,
   createInstanceIdentityQueries,
-  validateInstanceBehaviors,
 } from "./instance-identity.ts";
 import { resolveNativeAdapterPackages } from "./native-adapters.ts";
 import {
@@ -81,7 +79,6 @@ import {
   type FindSyntaxOptions,
   type Gap,
   type MemoryStats,
-  type Model,
   type NativeAdapterObservation,
   type OpenProjectOptions,
   type ProgramObjectKind,
@@ -121,7 +118,6 @@ type EngineUpdateResult = EngineOpenResult & {
 type NormalizedSessionConfig = {
   readonly tsconfig?: string;
   readonly projects?: readonly string[];
-  readonly models: readonly Model[];
   readonly adapters: readonly LibraryAdapter[];
   readonly adapterPackages: readonly string[];
   readonly summaries: NormalizedSummaryOptions;
@@ -165,58 +161,6 @@ type EngineBatchResult = {
   }[];
 };
 
-function registerModelProvenance(model: Model): Model {
-  const message =
-    typeof model.description === "string" && model.description.trim() !== ""
-      ? model.description
-      : `Project model "${model.id}"`;
-  return registerProvenance(model, [
-    {
-      kind: "model",
-      modelId: model.id,
-      message,
-    },
-  ]);
-}
-
-function validateModels(models: readonly Model[]): readonly Model[] {
-  const seen = new Set<string>();
-  for (const model of models) {
-    defineModel(model);
-    if (seen.has(model.id)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Duplicate model id: "${model.id}".`,
-      );
-    }
-    seen.add(model.id);
-  }
-  return [...models];
-}
-
-/** Validates a project model definition and attaches provenance metadata. */
-export function defineModel(model: Model): Model {
-  if (typeof model.id !== "string" || model.id.trim() === "") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      "Model id must be a non-empty string.",
-    );
-  }
-  if (model.version !== undefined && typeof model.version !== "string") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${model.id}" version must be a string when provided.`,
-    );
-  }
-  validateInstanceBehaviors(model.id, model.instanceBehaviors);
-  validateCleanupAndLifecycleModels(
-    model.id,
-    model.cleanupOperations,
-    model.lifecycleEvents,
-  );
-  return registerModelProvenance(model);
-}
-
 function validateAdapterPackageNames(
   packageNames: readonly string[],
 ): readonly string[] {
@@ -246,7 +190,6 @@ function normalizeOpenOptions(
   options: OpenProjectOptions,
 ): NormalizedSessionConfig {
   resolveProjectEntries(options);
-  const models = validateModels(options.models ?? []);
   const configuredAdapters = options.adapters ?? [];
   const adapters = validateAdapters(
     configuredAdapters.filter(
@@ -267,7 +210,6 @@ function normalizeOpenOptions(
     ...(options.projects !== undefined
       ? { projects: [...options.projects] }
       : {}),
-    models,
     adapters,
     adapterPackages,
     summaries,
@@ -315,24 +257,6 @@ function summarizeAdapter(adapter: LibraryAdapter) {
     provides: adapter.provides
       .map((provider) => provider.factType.id)
       .toSorted(),
-  };
-}
-
-function summarizeModel(model: Model) {
-  return {
-    id: model.id,
-    version: model.version ?? null,
-    description: model.description ?? null,
-    facts: model.facts ?? null,
-    ...(model.instanceBehaviors !== undefined
-      ? { instanceBehaviors: model.instanceBehaviors }
-      : {}),
-    ...(model.cleanupOperations !== undefined
-      ? { cleanupOperations: model.cleanupOperations }
-      : {}),
-    ...(model.lifecycleEvents !== undefined
-      ? { lifecycleEvents: model.lifecycleEvents }
-      : {}),
   };
 }
 
@@ -473,9 +397,6 @@ function resolveNextConfig(
   current: NormalizedSessionConfig,
   options?: SessionUpdateOptions,
 ): NormalizedSessionConfig {
-  const models = options?.models
-    ? validateModels(options.models)
-    : current.models;
   const adapters = options?.adapters
     ? validateAdapters(
         options.adapters.filter(
@@ -507,7 +428,6 @@ function resolveNextConfig(
     }
     return {
       projects: [...options.entries],
-      models,
       adapters,
       adapterPackages,
       summaries,
@@ -517,7 +437,6 @@ function resolveNextConfig(
   return {
     ...(current.tsconfig !== undefined ? { tsconfig: current.tsconfig } : {}),
     ...(current.projects !== undefined ? { projects: current.projects } : {}),
-    models,
     adapters,
     adapterPackages,
     summaries,
@@ -546,12 +465,6 @@ function collectInvalidatedBy(
   const nextEntries = resolveProjectEntries(nextConfig);
   if (stableSerialize(prevEntries) !== stableSerialize(nextEntries)) {
     reasons.push("entries");
-  }
-  if (
-    stableSerialize(prevConfig.models.map(summarizeModel)) !==
-    stableSerialize(nextConfig.models.map(summarizeModel))
-  ) {
-    reasons.push("models");
   }
   if (
     stableSerialize(prevConfig.additionalInputs) !==
@@ -794,7 +707,6 @@ export async function openProject(
   function createProjectContext(
     project: ProjectSummary,
     activeSnapshotId: number,
-    models: readonly Model[],
     contextOptions?: ProjectContextOptions,
   ): ProjectContext {
     const assertActiveSnapshot = (): void => {
@@ -905,7 +817,6 @@ export async function openProject(
     const callEffectsQueries = createCallEffectsQueries({
       client,
       cache: callEffectsCache,
-      models,
       sessionToken,
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
@@ -960,7 +871,6 @@ export async function openProject(
     const adapterCallEffectsQueries = createCallEffectsQueries({
       client,
       cache: callEffectsCache,
-      models,
       sessionToken,
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
@@ -1421,8 +1331,6 @@ export async function openProject(
       );
       return {
         project,
-        models,
-        getModel: (id: string) => models.find((model) => model.id === id),
         ...adapterProjectionQueries,
         ...adapterCallsValuesQueries,
         ...adapterPackageImplQueries,
@@ -1570,8 +1478,6 @@ export async function openProject(
 
     return {
       project,
-      models,
-      getModel: (id: string) => models.find((model) => model.id === id),
       ...projectionQueries,
       ...callsValuesQueries,
       ...callEffectsQueries,
@@ -1703,11 +1609,7 @@ export async function openProject(
     get projectContexts(): readonly ProjectContext[] {
       assertOpen();
       return currentProjects.map((project) =>
-        createProjectContext(
-          project,
-          currentSnapshotId,
-          normalizedConfig.models,
-        ),
+        createProjectContext(project, currentSnapshotId),
       );
     },
     project: (
@@ -1715,12 +1617,7 @@ export async function openProject(
       contextOptions?: ProjectContextOptions,
     ): ProjectContext => {
       const resolved = resolveProjectTarget(target);
-      return createProjectContext(
-        resolved,
-        currentSnapshotId,
-        normalizedConfig.models,
-        contextOptions,
-      );
+      return createProjectContext(resolved, currentSnapshotId, contextOptions);
     },
     scanComments: async (
       scanOptions?: ScanCommentsOptions,

@@ -10,10 +10,8 @@ import type {
 import type {
   CallEffectsOptions,
   CallEffectsResult,
-  CleanupModelOperation,
   InstanceCleanupOptions,
   InstanceCleanupScopeResult,
-  LifecycleEventBehavior,
 } from "./call-effects.ts";
 import type {
   CallTargetsResult,
@@ -28,7 +26,6 @@ import type {
   FactType,
 } from "./facts.ts";
 import type {
-  InstanceModelBehavior,
   InstanceProjectionSelection,
   InstanceResolutionResult,
   InstanceTargetRef,
@@ -247,10 +244,9 @@ export type DiagnosticLocation = {
 };
 
 export type Evidence = {
-  readonly kind: "source" | "type" | "note" | "model" | "summary";
+  readonly kind: "source" | "type" | "note" | "summary";
   readonly message: string;
   readonly at?: DiagnosticLocation;
-  readonly modelId?: string;
   readonly summaryId?: string;
   readonly summarySource?: SummaryDiscoverySource;
   readonly declaration?: string;
@@ -298,16 +294,6 @@ export type SourceFileOrigin = {
   readonly projects: readonly SourceFileProjectOrigin[];
 };
 
-export type Model = {
-  readonly id: string;
-  readonly version?: string;
-  readonly description?: string;
-  readonly facts?: Readonly<Record<string, unknown>>;
-  readonly instanceBehaviors?: readonly InstanceModelBehavior[];
-  readonly cleanupOperations?: readonly CleanupModelOperation[];
-  readonly lifecycleEvents?: readonly LifecycleEventBehavior[];
-};
-
 export type EngineProviderExtractionStats = {
   readonly extractions: number;
   readonly candidates: number;
@@ -328,7 +314,7 @@ export type ExplainCleanupPath = {
   readonly allocationLocation?: DiagnosticLocation;
   readonly scopeLocation: DiagnosticLocation;
   readonly cleanupLocations: readonly DiagnosticLocation[];
-  readonly modelIds: readonly string[];
+  readonly summaryIds: readonly string[];
   readonly summary: string;
   readonly evidence: readonly Evidence[];
 };
@@ -423,8 +409,6 @@ export type TypeAtResult = {
 /** Typed query context bound to one opened project and active snapshot. */
 export type ProjectContext = {
   readonly project: ProjectSummary;
-  readonly models: readonly Model[];
-  getModel: (id: string) => Model | undefined;
   findSyntax: (
     options: FindSyntaxOptions,
   ) => Promise<readonly SyntaxNodeResult[]>;
@@ -509,7 +493,6 @@ export type OpenProjectOptions = {
   readonly cwd: string;
   readonly tsconfig?: string;
   readonly projects?: readonly string[];
-  readonly models?: readonly Model[];
   readonly adapters?: readonly ConfiguredAdapter[];
   readonly summaries?: SummaryOptions;
   readonly additionalInputs?: readonly string[];
@@ -538,7 +521,6 @@ export type SessionUpdateOptions = {
   readonly created?: readonly string[];
   readonly deleted?: readonly string[];
   readonly adapterResolutionRoot?: string;
-  readonly models?: readonly Model[];
   readonly adapters?: readonly ConfiguredAdapter[];
   readonly summaries?: SummaryOptions;
   readonly entries?: readonly string[];

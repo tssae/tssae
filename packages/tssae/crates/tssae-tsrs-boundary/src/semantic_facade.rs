@@ -7,8 +7,8 @@ use tsrs_checker::{LiteralValue, Signature, Type, TypeDataTag, TypeFlags, TypeFo
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, resolve_project_reference_path};
 use tssae_common::{
-    DeclarationSummaryData, DiagnosticLocation, GapItem, SemanticModel, SymbolId, SyntaxId, TypeId,
-    TypeSummaryData, UnknownReason,
+    DeclarationSummaryData, DiagnosticLocation, GapItem, SemanticModel, SignatureId, SymbolId,
+    SyntaxId, TypeId, TypeSummaryData, UnknownReason,
 };
 
 use crate::syntax_view::{
@@ -703,6 +703,8 @@ pub struct SemanticModelBridge<'a> {
     symbol_ids: RefCell<FxHashMap<P<Symbol>, SymbolId>>,
     types: RefCell<InternedTypeMap>,
     type_ids: RefCell<FxHashMap<P<Type>, TypeId>>,
+    signatures: RefCell<FxHashMap<SignatureId, P<Signature>>>,
+    signature_ids: RefCell<FxHashMap<P<Signature>, SignatureId>>,
 }
 
 impl<'a> SemanticModelBridge<'a> {
@@ -717,7 +719,14 @@ impl<'a> SemanticModelBridge<'a> {
             symbol_ids: RefCell::new(FxHashMap::default()),
             types: RefCell::new(FxHashMap::default()),
             type_ids: RefCell::new(FxHashMap::default()),
+            signatures: RefCell::new(FxHashMap::default()),
+            signature_ids: RefCell::new(FxHashMap::default()),
         }
+    }
+
+    #[must_use]
+    pub const fn cwd(&self) -> &'a str {
+        self.cwd
     }
 
     pub fn intern_syntax(&self, node: P<Node>) -> Option<SyntaxId> {
@@ -744,6 +753,57 @@ impl<'a> SemanticModelBridge<'a> {
         self.types.borrow_mut().insert(id, (ty, enclosing));
         self.type_ids.borrow_mut().insert(ty, id);
         id
+    }
+
+    pub fn intern_signature(&self, sig: P<Signature>) -> SignatureId {
+        if let Some(&id) = self.signature_ids.borrow().get(&sig) {
+            return id;
+        }
+        let next = u32::try_from(self.signatures.borrow().len()).unwrap_or(u32::MAX);
+        let id = SignatureId(next);
+        self.signatures.borrow_mut().insert(id, sig);
+        self.signature_ids.borrow_mut().insert(sig, id);
+        id
+    }
+
+    pub fn symbol_id_for_node(&self, node: P<Node>) -> Option<SymbolId> {
+        let sym = {
+            let mut checker = self.checker.borrow_mut();
+            let resolved = resolve_symbol_for_node(&mut checker, node).symbol;
+            drop(checker);
+            resolved?
+        };
+        Some(self.intern_symbol(sym))
+    }
+
+    pub fn type_id_for_node(&self, node: P<Node>) -> Option<TypeId> {
+        let enclosing = node.parent().or(Some(node));
+        let ty = {
+            let mut checker = self.checker.borrow_mut();
+            let ty = checker.get_type_at_location(node);
+            drop(checker);
+            ty
+        };
+        Some(self.intern_type(ty, enclosing))
+    }
+
+    pub fn signature_id_for_node(&self, node: P<Node>) -> Option<SignatureId> {
+        if !matches!(
+            node.kind(),
+            Kind::CallExpression | Kind::NewExpression | Kind::TaggedTemplateExpression
+        ) {
+            return None;
+        }
+        let sig = self
+            .checker
+            .borrow_mut()
+            .get_resolved_signature_exported(node);
+        let unresolved = is_unresolved_signature(&mut self.checker.borrow_mut(), sig);
+        if unresolved {
+            None
+        } else {
+            Some(self.intern_signature(sig))
+        }
     }
 }
 
@@ -780,6 +840,11 @@ impl SemanticModel for SemanticModelBridge<'_> {
             union_members: summary.union_members,
             is_unresolved: summary.is_unresolved,
         })
+    }
+
+    fn signature_at_syntax(&self, syntax: SyntaxId) -> Option<SignatureId> {
+        let node = self.syntax.borrow().get_node(syntax)?;
+        self.signature_id_for_node(node)
     }
 
     fn resolve_declaration(&self, syntax: SyntaxId) -> Option<DeclarationSummaryData> {

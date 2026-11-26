@@ -239,7 +239,19 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     if (firstEffect !== undefined) {
       const writeSyn: SyntaxRef = firstEffect.syntax;
       const recvSyn: SyntaxRef = firstEffect.receiverSyntax;
-      await ctx.branchCoverage({ branches: [], targets: [writeSyn] });
+      const [cov] = await ctx.branchCoverage({
+        branches: [],
+        targets: [writeSyn],
+      });
+      if (cov !== undefined) {
+        if (cov.status === "disproved") {
+          void cov.counterexamplePath.steps.length;
+        } else if (cov.status === "inconclusive") {
+          void cov.gaps.length;
+        } else {
+          void cov.targetReachable;
+        }
+      }
       await ctx.resolveInstances([recvSyn]);
     }
     const firstCleanup = cleanupResults[0];

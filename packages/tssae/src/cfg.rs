@@ -8,32 +8,10 @@ use crate::serve::{SourceLocation, node_location, slice_source_text};
 pub use tssae_common::{EvidenceItem, GapItem};
 
 #[derive(Clone)]
-pub struct BranchDescriptor {
-    pub kind: &'static str,
-    pub direction: &'static str,
-    pub condition_node: P<Node>,
-    pub condition_text: String,
-    pub location: SourceLocation,
-    pub statement_location: SourceLocation,
-}
-
-#[derive(Clone, Copy)]
-pub enum CoverageStatus {
-    Covered,
-    Bypass,
-    Unreachable,
-    Unknown,
-}
-
-impl CoverageStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Covered => "covered",
-            Self::Bypass => "bypass",
-            Self::Unreachable => "unreachable",
-            Self::Unknown => "unknown",
-        }
-    }
+struct BranchDescriptor {
+    direction: &'static str,
+    condition_text: String,
+    location: SourceLocation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,12 +30,6 @@ pub struct CleanupCfgOutcome {
     pub gaps: Vec<GapItem>,
 }
 
-pub struct CoverageOutcome {
-    pub status: CoverageStatus,
-    pub evidence: Vec<EvidenceItem>,
-    pub gaps: Vec<GapItem>,
-}
-
 #[derive(Clone, Copy)]
 enum EdgeKind {
     Ordinary,
@@ -70,7 +42,7 @@ pub struct FunctionCfg {
     entry: usize,
     successors: Vec<Vec<(usize, EdgeKind)>>,
     ast_to_cfg: FxHashMap<P<Node>, usize>,
-    pub branches: Vec<BranchDescriptor>,
+    branches: Vec<BranchDescriptor>,
     switch_locations: Vec<SourceLocation>,
     pub gaps: Vec<GapItem>,
 }
@@ -102,16 +74,6 @@ pub fn normalize_function_node(node: P<Node>) -> Option<P<Node>> {
         && parent.body() == Some(node)
     {
         return Some(parent);
-    }
-    None
-}
-
-pub fn normalize_cfg_scope_node(node: P<Node>) -> Option<P<Node>> {
-    if let Some(fn_node) = normalize_function_node(node) {
-        return Some(fn_node);
-    }
-    if node.kind() == Kind::Block || tsrs_ast::is_statement(node) {
-        return Some(node);
     }
     None
 }
@@ -200,106 +162,6 @@ impl FunctionCfg {
             switch_locations: builder.switch_locations,
             gaps: builder.gaps,
         })
-    }
-
-    pub fn evaluate_coverage(
-        &self,
-        target_node: P<Node>,
-        target_location: &SourceLocation,
-        selected_edges: &[usize],
-        extra_gaps: &[GapItem],
-    ) -> CoverageOutcome {
-        let mut combined_gaps = self.gaps.clone();
-        combined_gaps.extend(extra_gaps.iter().cloned());
-
-        let Some(&target_vertex) = self.ast_to_cfg.get(&target_node) else {
-            if combined_gaps.is_empty() {
-                combined_gaps.push(GapItem {
-                    kind: "target-outside-cfg",
-                    message: "Target node is not part of the modeled function body control flow."
-                        .to_string(),
-                    at: Some(target_location.clone()),
-                });
-            }
-            return CoverageOutcome {
-                status: CoverageStatus::Unknown,
-                evidence: Vec::new(),
-                gaps: combined_gaps,
-            };
-        };
-
-        if !combined_gaps.is_empty() {
-            let mut evidence = Vec::new();
-            for gap in &combined_gaps {
-                evidence.push(EvidenceItem::simple(
-                    "note",
-                    gap.message.clone(),
-                    gap.at.clone(),
-                ));
-            }
-            return CoverageOutcome {
-                status: CoverageStatus::Unknown,
-                evidence,
-                gaps: combined_gaps,
-            };
-        }
-
-        let reachable_all = self.reachable(&FxHashSet::default());
-        if !reachable_all[target_vertex] {
-            return CoverageOutcome {
-                status: CoverageStatus::Unreachable,
-                evidence: vec![EvidenceItem::simple(
-                    "source",
-                    "Target is unreachable from function entry in modeled control flow."
-                        .to_string(),
-                    Some(target_location.clone()),
-                )],
-                gaps: Vec::new(),
-            };
-        }
-
-        let mut cut_set = FxHashSet::default();
-        for &edge_idx in selected_edges {
-            if edge_idx < self.branches.len() {
-                cut_set.insert(edge_idx);
-            }
-        }
-
-        if !cut_set.is_empty() {
-            let reachable_without_cut = self.reachable(&cut_set);
-            if !reachable_without_cut[target_vertex] {
-                let mut evidence = Vec::new();
-                let mut seen = FxHashSet::default();
-                for &edge_idx in selected_edges {
-                    if edge_idx < self.branches.len() && seen.insert(edge_idx) {
-                        let branch = &self.branches[edge_idx];
-                        evidence.push(EvidenceItem::simple(
-                            "source",
-                            format!(
-                                "Path covered via {} branch of \"{}\".",
-                                branch.direction, branch.condition_text
-                            ),
-                            Some(branch.location.clone()),
-                        ));
-                    }
-                }
-                return CoverageOutcome {
-                    status: CoverageStatus::Covered,
-                    evidence,
-                    gaps: Vec::new(),
-                };
-            }
-        }
-
-        let witness = self
-            .find_bypass_witness(target_vertex, &cut_set)
-            .unwrap_or_default();
-        let evidence = self.build_bypass_evidence(&witness, target_location);
-        CoverageOutcome {
-            status: CoverageStatus::Bypass,
-            evidence,
-            gaps: Vec::new(),
-        }
     }
 
     pub fn evaluate_cleanup_coverage(
@@ -454,47 +316,6 @@ impl FunctionCfg {
         visited
     }
 
-    fn find_bypass_witness(
-        &self,
-        target_vertex: usize,
-        cut_set: &FxHashSet<usize>,
-    ) -> Option<Vec<EdgeKind>> {
-        let mut visited = vec![false; self.successors.len()];
-        let mut parent: Vec<Option<(usize, EdgeKind)>> = vec![None; self.successors.len()];
-        let mut queue = VecDeque::new();
-
-        visited[self.entry] = true;
-        queue.push_back(self.entry);
-
-        while let Some(u) = queue.pop_front() {
-            if u == target_vertex {
-                let mut edges = Vec::new();
-                let mut cursor = u;
-                while let Some((prev, edge)) = parent[cursor] {
-                    edges.push(edge);
-                    cursor = prev;
-                }
-                edges.reverse();
-                return Some(edges);
-            }
-
-            for &(v, edge) in &self.successors[u] {
-                if let EdgeKind::Branch(idx) = edge
-                    && cut_set.contains(&idx)
-                {
-                    continue;
-                }
-                if !visited[v] {
-                    visited[v] = true;
-                    parent[v] = Some((u, edge));
-                    queue.push_back(v);
-                }
-            }
-        }
-
-        None
-    }
-
     fn build_bypass_evidence(
         &self,
         witness_edges: &[EdgeKind],
@@ -576,22 +397,19 @@ impl CfgBuilder<'_> {
 
     fn push_branch(
         &mut self,
-        kind: &'static str,
+        _kind: &'static str,
         direction: &'static str,
-        condition_node: P<Node>,
+        _condition_node: P<Node>,
         location: SourceLocation,
-        statement_location: SourceLocation,
+        _statement_location: SourceLocation,
         condition_text_override: Option<String>,
     ) -> usize {
         let idx = self.branches.len();
         let condition_text = condition_text_override.unwrap_or_else(|| self.text_of(&location));
         self.branches.push(BranchDescriptor {
-            kind,
             direction,
-            condition_node,
             condition_text,
             location,
-            statement_location,
         });
         idx
     }

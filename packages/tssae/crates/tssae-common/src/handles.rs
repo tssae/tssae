@@ -62,6 +62,10 @@ pub struct ValueId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct VertexId(pub u32);
 
+/// Control-flow branch record index within a function IR.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct BranchId(pub u32);
+
 /// Analysis-level instance identity handle.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct InstanceId(pub u32);

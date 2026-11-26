@@ -372,6 +372,24 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2322|TS2345/u,
         },
+        {
+          name: "counterexamplePath cannot be read on BranchCoverageItem before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.counterexamplePath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on BranchCoverageItem before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

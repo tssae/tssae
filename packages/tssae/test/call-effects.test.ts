@@ -541,7 +541,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
                   })
                 : null;
 
-            const branchStatus = coverage[0]?.status ?? "unknown";
+            const branchStatus = coverage[0]?.status ?? "inconclusive";
             const rawPropagated = rawProp.reachableTargets.length > 0;
             const parsedDataPropagated =
               (dataProp?.reachableTargets.length ?? 0) > 0;
@@ -553,7 +553,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             };
 
             if (
-              branchStatus !== "covered" ||
+              branchStatus !== "proved" ||
               rawPropagated ||
               !parsedDataPropagated
             ) {
@@ -568,12 +568,12 @@ void describe("tssae call-effects and instanceCleanup", () => {
         }
 
         assert.deepEqual(routeAudit.unsafeRoute, {
-          branchStatus: "covered",
+          branchStatus: "proved",
           rawPropagated: true,
           parsedDataPropagated: false,
         });
         assert.deepEqual(routeAudit.safeRoute, {
-          branchStatus: "covered",
+          branchStatus: "proved",
           rawPropagated: false,
           parsedDataPropagated: true,
         });
@@ -648,7 +648,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             });
             postCallGuardStatus[fnName] = cov!.status;
 
-            if (cov!.status !== "covered") {
+            if (cov!.status !== "proved") {
               flaggedFns.push(fnName);
             }
           }
@@ -700,9 +700,9 @@ void describe("tssae call-effects and instanceCleanup", () => {
         assert.ok(dynEff.gaps.some((g) => g.kind === "dynamic-callee"));
 
         // branchCoverage distinguishes unguarded vs guarded post-call clear
-        assert.equal(postCallGuardStatus.flushJobBuggy, "bypass");
-        assert.equal(postCallGuardStatus.flushJobDynamic, "bypass");
-        assert.equal(postCallGuardStatus.flushJobFixed, "covered");
+        assert.equal(postCallGuardStatus.flushJobBuggy, "disproved");
+        assert.equal(postCallGuardStatus.flushJobDynamic, "disproved");
+        assert.equal(postCallGuardStatus.flushJobFixed, "proved");
 
         // flushJobFixed's clear also records structural guard
         const fixedEff = effectsByFn.get("flushJobFixed")!;
@@ -951,14 +951,14 @@ void describe("tssae call-effects and instanceCleanup", () => {
             branches: [guardBranch.ref],
             targets: [guardedWrite.syntax],
           });
-          assert.equal(guardedCov?.status, "covered");
+          assert.equal(guardedCov?.status, "proved");
 
           const [unguardedCov] = await ctx.branchCoverage({
             scope: unguardedWrite.cfgScope!,
             branches: [],
             targets: [unguardedWrite.syntax],
           });
-          assert.equal(unguardedCov?.status, "bypass");
+          assert.equal(unguardedCov?.status, "disproved");
 
           const evidence = extractBasisEvidence([
             indirectInv,

@@ -64,6 +64,7 @@ pub trait SyntaxCatalog {
 pub trait SemanticModel {
     fn symbol_at_syntax(&self, syntax: SyntaxId) -> Option<SymbolId>;
     fn type_at_syntax(&self, syntax: SyntaxId) -> Option<TypeSummaryData>;
+    fn signature_at_syntax(&self, syntax: SyntaxId) -> Option<SignatureId>;
     fn resolve_declaration(&self, syntax: SyntaxId) -> Option<DeclarationSummaryData>;
     fn is_assignable_to(&self, source: TypeId, target: TypeId) -> bool;
     fn base_types(&self, ty: TypeId) -> Vec<TypeId>;

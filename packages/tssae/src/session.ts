@@ -1328,7 +1328,7 @@ export async function openProject(
           );
         }
         const mapped = toBranchCoverageItem(raw, targetRef);
-        if (recordRuleQuery) {
+        if (recordRuleQuery && mapped.status === "inconclusive") {
           recordGaps(mapped.gaps);
         }
         results.push(mapped);

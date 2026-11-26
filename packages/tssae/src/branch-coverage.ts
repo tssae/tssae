@@ -18,7 +18,8 @@ export type BranchKind =
   | "conditional"
   | "logicalAnd"
   | "logicalOr"
-  | "nullishCoalescing";
+  | "nullishCoalescing"
+  | "optionalChain";
 
 export type BranchDirection =
   | "true"
@@ -28,11 +29,19 @@ export type BranchDirection =
   | "shortCircuit"
   | "continue";
 
-export type BranchCoverageStatus =
-  | "covered"
-  | "bypass"
-  | "unreachable"
-  | "unknown";
+export type BranchCoverageStatus = "proved" | "disproved" | "inconclusive";
+
+/** Single control-flow anchor on a concrete counterexample bypass path. */
+export type ControlFlowPathStep = {
+  readonly location: DiagnosticLocation;
+  readonly description: string;
+};
+
+/** Concrete explicit counterexample path bypassing the selected guard branches to reach a target. */
+export type BranchBypassPath = {
+  readonly steps: readonly ControlFlowPathStep[];
+  readonly evidence: readonly Evidence[];
+};
 
 /** A single control-flow branch edge discovered within a function body. */
 export type BranchEdgeInfo = {
@@ -63,10 +72,24 @@ export type BranchCoverageOptions = {
 /** Result of a `branchCoverage` query for a single target syntax node. */
 export type BranchCoverageItem = {
   readonly target: SyntaxRef;
-  readonly status: BranchCoverageStatus;
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+  /** Whether the target node is reachable from scope entry in explicit control flow. */
+  readonly targetReachable: boolean;
+} & (
+  | {
+      readonly status: "proved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly counterexamplePath: BranchBypassPath;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 export type EngineBranchEdgeItem = {
   readonly ref: string;
@@ -86,10 +109,23 @@ export type EngineFunctionBranchesItem = {
 
 export type EngineBranchCoverageItem = {
   readonly target: string;
-  readonly status: BranchCoverageStatus;
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+  readonly targetReachable: boolean;
+} & (
+  | {
+      readonly status: "proved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly counterexamplePath: BranchBypassPath;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 /** Validates that a program handle belongs to the active session, snapshot, and project. */
 export function assertValidProgramRef(
@@ -164,13 +200,38 @@ export function toBranchCoverageItem(
   item: EngineBranchCoverageItem,
   target: SyntaxRef,
 ): BranchCoverageItem {
-  return registerProvenance(
-    {
-      target,
-      status: item.status,
-      evidence: item.evidence,
-      gaps: item.gaps,
-    },
-    item.evidence,
-  );
+  switch (item.status) {
+    case "proved":
+      return registerProvenance(
+        {
+          target,
+          targetReachable: item.targetReachable,
+          status: "proved",
+          evidence: item.evidence,
+        },
+        item.evidence,
+      );
+    case "disproved":
+      return registerProvenance(
+        {
+          target,
+          targetReachable: item.targetReachable,
+          status: "disproved",
+          counterexamplePath: item.counterexamplePath,
+          evidence: item.evidence,
+        },
+        [...item.counterexamplePath.evidence, ...item.evidence],
+      );
+    case "inconclusive":
+      return registerProvenance(
+        {
+          target,
+          targetReachable: item.targetReachable,
+          status: "inconclusive",
+          gaps: item.gaps,
+          evidence: item.evidence,
+        },
+        item.evidence,
+      );
+  }
 }

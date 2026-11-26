@@ -1004,6 +1004,7 @@ dependencies = [
  "tsrs_scanner",
  "tsrs_vfs",
  "tssae-adapter-api",
+ "tssae-analysis",
  "tssae-common",
  "tssae-tsrs-boundary",
 ]

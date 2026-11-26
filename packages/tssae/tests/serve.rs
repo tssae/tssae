@@ -325,7 +325,8 @@ fn serves_list_branches_and_branch_coverage_statuses() {
                     { "op": "branchCoverage", "function": body_fns[0], "branches": [joint_true_branches[0]], "targets": [sink_calls[0]] },
                     { "op": "branchCoverage", "function": body_fns[0], "branches": joint_true_branches, "targets": [sink_calls[0]] },
                     { "op": "branchCoverage", "function": body_fns[1], "branches": collect_all_refs(1), "targets": [sink_calls[1]] },
-                    { "op": "branchCoverage", "function": body_fns[2], "branches": collect_all_refs(2), "targets": [sink_calls[2]] }
+                    { "op": "branchCoverage", "function": body_fns[2], "branches": collect_all_refs(2), "targets": [sink_calls[2]] },
+                    { "op": "branchCoverage", "function": body_fns[2], "branches": [], "targets": [sink_calls[2]] }
                 ]
             }
         }),
@@ -336,12 +337,23 @@ fn serves_list_branches_and_branch_coverage_statuses() {
         "branchCoverage failed: {cov_resp}"
     );
     let results = cov_resp["result"]["results"].as_array().expect("results");
-    assert_eq!(results[0]["items"][0]["status"], json!("bypass"));
-    assert_eq!(results[1]["items"][0]["status"], json!("covered"));
-    assert_eq!(results[2]["items"][0]["status"], json!("unreachable"));
-    assert_eq!(results[3]["items"][0]["status"], json!("unknown"));
+    assert_eq!(results[0]["items"][0]["status"], json!("disproved"));
+    assert_eq!(results[0]["items"][0]["targetReachable"], json!(true));
+    assert!(
+        results[0]["items"][0]["counterexamplePath"]["steps"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(results[1]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[1]["items"][0]["targetReachable"], json!(true));
+    assert_eq!(results[2]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[2]["items"][0]["targetReachable"], json!(false));
+    assert_eq!(results[3]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[3]["items"][0]["targetReachable"], json!(true));
+    assert_eq!(results[4]["items"][0]["status"], json!("inconclusive"));
+    assert_eq!(results[4]["items"][0]["targetReachable"], json!(true));
     assert_eq!(
-        results[3]["items"][0]["gaps"][0]["kind"],
+        results[4]["items"][0]["gaps"][0]["kind"],
         json!("unmodeled-try-catch")
     );
 

@@ -891,7 +891,6 @@ export async function openProject(
     const instanceQueries = createInstanceIdentityQueries({
       client,
       cache: instanceCache,
-      models,
       sessionToken,
       snapshotId: activeSnapshotId,
       projectId: project.projectId,

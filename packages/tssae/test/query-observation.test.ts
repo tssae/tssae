@@ -7,6 +7,7 @@ import {
   defineFactProvider,
   defineFactType,
   defineModel,
+  defineSummaries,
   openProject,
   syntaxLocationOf,
   type CleanupCoverageEvent,
@@ -278,10 +279,27 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
           ],
         });
 
+        const summaries = defineSummaries({
+          id: "cleanup-obs-summaries",
+          entries: [
+            {
+              match: {
+                package: "@acme/lifecycle",
+                memberPath: ["createExternalResource"],
+              },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
+              },
+            },
+          ],
+        });
+
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
           models: [model],
+          summaries: { packs: [summaries] },
         });
         try {
           const cleanupEvents: CleanupCoverageEvent[] = [];
@@ -312,6 +330,10 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
             );
           const instances = await ctx.resolveInstances(resourceVars);
           const instRefs = instances
+            .filter(
+              (r): r is Extract<typeof r, { readonly status: "proved" }> =>
+                r.status === "proved",
+            )
             .map((r) => r.instance)
             .filter((i): i is NonNullable<typeof i> => i !== null);
 

@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { registerProvenance } from "./evidence.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
 import { validateProgramRefs, type SelectedKeys } from "./projection.ts";
+import type { SummaryDiscoverySource } from "./summaries.ts";
 import {
   TssaeError,
   makeProgramRef,
@@ -15,7 +15,6 @@ import {
   type Gap,
   type LookupFilesOptions,
   type InstanceRef,
-  type Model,
   type SyntaxRef,
 } from "./types.ts";
 
@@ -55,9 +54,8 @@ export type InstanceTargetRef = SyntaxRef | DeclarationRef | CallRef;
 
 export type InstanceOriginKind =
   | "allocation"
-  | "model-allocation"
-  | "parameter"
-  | "unresolved";
+  | "summary-allocation"
+  | "parameter";
 
 export type ResolvedInstanceInfo = {
   readonly ref: InstanceRef;
@@ -65,27 +63,43 @@ export type ResolvedInstanceInfo = {
   readonly originKind: InstanceOriginKind;
   readonly allocationLocation: DiagnosticLocation | null;
   readonly originSyntax: SyntaxRef | null;
-  readonly modelId: string | null;
+  readonly summaryId: string | null;
   readonly evidence: readonly Evidence[];
 };
 
 export type InstanceResolutionResult = {
   readonly target: InstanceTargetRef;
-  readonly instance: InstanceRef | null;
-  readonly instanceKey: string | null;
-  readonly allocationLocation: DiagnosticLocation | null;
-  readonly originKind: InstanceOriginKind | null;
-  readonly instances: readonly ResolvedInstanceInfo[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly status: "proved";
+      readonly instance: InstanceRef | null;
+      readonly instanceKey: string | null;
+      readonly allocationLocation: DiagnosticLocation | null;
+      readonly originKind: InstanceOriginKind | null;
+      readonly instances: readonly [
+        ResolvedInstanceInfo,
+        ...ResolvedInstanceInfo[],
+      ];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly instances: readonly ResolvedInstanceInfo[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 export type InstanceProjectionSelection = {
   readonly instanceKey?: true;
   readonly originKind?: true;
   readonly allocationLocation?: true;
   readonly originSyntax?: true;
-  readonly modelId?: true;
+  readonly summaryId?: true;
   readonly evidence?: true;
 };
 
@@ -94,7 +108,7 @@ export type FullInstanceProjectionFields = {
   readonly originKind: InstanceOriginKind;
   readonly allocationLocation: DiagnosticLocation | null;
   readonly originSyntax: SyntaxRef | null;
-  readonly modelId: string | null;
+  readonly summaryId: string | null;
   readonly evidence: readonly Evidence[];
 };
 
@@ -114,20 +128,34 @@ type RawResolvedInstanceInfo = {
   readonly originKind: InstanceOriginKind;
   readonly allocationLocation: DiagnosticLocation | null;
   readonly originSyntax: string | null;
-  readonly modelId: string | null;
+  readonly summaryId: string | null;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly evidence: readonly Evidence[];
 };
 
-type RawInstanceResolutionRow = {
-  readonly target: string;
-  readonly instance: string | null;
-  readonly instanceKey: string | null;
-  readonly allocationLocation: DiagnosticLocation | null;
-  readonly originKind: InstanceOriginKind | null;
-  readonly instances: readonly RawResolvedInstanceInfo[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+type RawInstanceResolutionRow =
+  | {
+      readonly status: "proved";
+      readonly target: string;
+      readonly instance: string | null;
+      readonly instanceKey: string | null;
+      readonly allocationLocation: DiagnosticLocation | null;
+      readonly originKind: InstanceOriginKind | null;
+      readonly instances: readonly RawResolvedInstanceInfo[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly target: string;
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly target: string;
+      readonly instances: readonly RawResolvedInstanceInfo[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    };
 
 type RawInstanceProjectionRow = {
   readonly instance: string;
@@ -136,28 +164,14 @@ type RawInstanceProjectionRow = {
   readonly originKind?: InstanceOriginKind;
   readonly allocationLocation?: DiagnosticLocation | null;
   readonly originSyntax?: string | null;
-  readonly modelId?: string | null;
+  readonly summaryId?: string | null;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly evidence?: readonly Evidence[];
 };
 
 type EngineBatchResult = {
   readonly results: readonly {
     readonly items: readonly unknown[];
-  }[];
-};
-
-type EngineModelPayload = {
-  readonly id: string;
-  readonly instanceBehaviors: readonly {
-    readonly kind: "allocates-fresh-instance" | "forwards-argument";
-    readonly match: {
-      readonly symbol?: string;
-      readonly container?: string;
-      readonly member?: string;
-      readonly module?: string;
-    };
-    readonly argumentIndex?: number;
-    readonly description?: string;
   }[];
 };
 
@@ -276,45 +290,6 @@ export function isSameInstance(
   );
 }
 
-function serializeModelsForEngine(
-  models: readonly Model[],
-): readonly EngineModelPayload[] {
-  const payload: EngineModelPayload[] = [];
-  for (const model of models) {
-    if (!model.instanceBehaviors || model.instanceBehaviors.length === 0) {
-      continue;
-    }
-    payload.push({
-      id: model.id,
-      instanceBehaviors: model.instanceBehaviors.map((behavior) => ({
-        kind: behavior.kind,
-        match: {
-          ...(behavior.match.symbol !== undefined
-            ? { symbol: behavior.match.symbol }
-            : {}),
-          ...(behavior.match.container !== undefined
-            ? { container: behavior.match.container }
-            : {}),
-          ...(behavior.match.member !== undefined
-            ? { member: behavior.match.member }
-            : {}),
-          ...(behavior.match.module !== undefined
-            ? { module: behavior.match.module }
-            : {}),
-        },
-        ...(behavior.kind === "forwards-argument" &&
-        behavior.argumentIndex !== undefined
-          ? { argumentIndex: behavior.argumentIndex }
-          : {}),
-        ...(behavior.description !== undefined
-          ? { description: behavior.description }
-          : {}),
-      })),
-    });
-  }
-  return payload;
-}
-
 export type InstanceIdentityCache = {
   readonly resolutionCache: Map<string, Promise<InstanceResolutionResult>>;
   clear: () => void;
@@ -330,11 +305,47 @@ export function createInstanceIdentityCache(): InstanceIdentityCache {
   };
 }
 
-/** Creates instance-identity resolution and projection query methods bound to an active snapshot, project, and models. */
+function materializeResolvedInstances(
+  rawInstances: readonly RawResolvedInstanceInfo[],
+  sessionToken: symbol,
+  projectId: string,
+  snapshotId: number,
+): ResolvedInstanceInfo[] {
+  return rawInstances.map((entry) =>
+    registerProvenance(
+      {
+        ref: makeProgramRef(
+          "instance",
+          sessionToken,
+          projectId,
+          snapshotId,
+          entry.ref,
+        ),
+        instanceKey: entry.instanceKey,
+        originKind: entry.originKind,
+        allocationLocation: entry.allocationLocation,
+        originSyntax:
+          entry.originSyntax !== null
+            ? makeProgramRef(
+                "syntax",
+                sessionToken,
+                projectId,
+                snapshotId,
+                entry.originSyntax,
+              )
+            : null,
+        summaryId: entry.summaryId,
+        evidence: entry.evidence,
+      },
+      entry.evidence,
+    ),
+  );
+}
+
+/** Creates instance-identity resolution and projection query methods bound to an active snapshot and project. */
 export function createInstanceIdentityQueries(deps: {
   readonly client: EngineClient;
   readonly cache: InstanceIdentityCache;
-  readonly models: readonly Model[];
   readonly sessionToken: symbol;
   readonly snapshotId: number;
   readonly projectId: string;
@@ -353,7 +364,6 @@ export function createInstanceIdentityQueries(deps: {
   const {
     client,
     cache,
-    models,
     sessionToken,
     snapshotId,
     projectId,
@@ -364,12 +374,6 @@ export function createInstanceIdentityQueries(deps: {
     getRpcOptions,
     onQueryCompleted,
   } = deps;
-
-  const engineModels = serializeModelsForEngine(models);
-  const modelsDigest = createHash("sha256")
-    .update(JSON.stringify(engineModels))
-    .digest("hex")
-    .slice(0, 16);
 
   return {
     resolveInstances: async (
@@ -390,7 +394,7 @@ export function createInstanceIdentityQueries(deps: {
       const missing: InstanceTargetRef[] = [];
       const seenMissing = new Set<string>();
       for (const target of targets) {
-        const key = `${snapshotId}:${projectId}:${modelsDigest}:${lookupScopeKey}:${target.handleId}`;
+        const key = `${snapshotId}:${projectId}:${lookupScopeKey}:${target.handleId}`;
         if (!cache.resolutionCache.has(key) && !seenMissing.has(key)) {
           seenMissing.add(key);
           missing.push(target);
@@ -411,7 +415,6 @@ export function createInstanceIdentityQueries(deps: {
               {
                 op: "resolveInstances",
                 targets: missing.map((t) => t.handleId),
-                models: engineModels,
                 ...(lookupFiles !== undefined ? { lookupFiles } : {}),
               },
             ],
@@ -420,7 +423,7 @@ export function createInstanceIdentityQueries(deps: {
         );
 
         for (const [index, target] of missing.entries()) {
-          const key = `${snapshotId}:${projectId}:${modelsDigest}:${lookupScopeKey}:${target.handleId}`;
+          const key = `${snapshotId}:${projectId}:${lookupScopeKey}:${target.handleId}`;
           const rowPromise = batchPromise.then((batch) => {
             const items = (batch.results[0]?.items ??
               []) as readonly RawInstanceResolutionRow[];
@@ -431,56 +434,70 @@ export function createInstanceIdentityQueries(deps: {
                 `Engine omitted resolveInstances result for "${target.handleId}".`,
               );
             }
-            const instances: ResolvedInstanceInfo[] = raw.instances.map(
-              (entry) =>
-                registerProvenance(
-                  {
-                    ref: makeProgramRef(
+            if (raw.status === "proved") {
+              const instances = materializeResolvedInstances(
+                raw.instances,
+                sessionToken,
+                projectId,
+                snapshotId,
+              );
+              const [firstInst, ...restInst] = instances;
+              if (!firstInst) {
+                throw new TssaeError(
+                  "ENGINE_ERROR",
+                  `Engine returned proved resolveInstances result with no instances for "${target.handleId}".`,
+                );
+              }
+              const primaryRef =
+                raw.instance !== null
+                  ? makeProgramRef(
                       "instance",
                       sessionToken,
                       projectId,
                       snapshotId,
-                      entry.ref,
-                    ),
-                    instanceKey: entry.instanceKey,
-                    originKind: entry.originKind,
-                    allocationLocation: entry.allocationLocation,
-                    originSyntax:
-                      entry.originSyntax !== null
-                        ? makeProgramRef(
-                            "syntax",
-                            sessionToken,
-                            projectId,
-                            snapshotId,
-                            entry.originSyntax,
-                          )
-                        : null,
-                    modelId: entry.modelId,
-                    evidence: entry.evidence,
-                  },
-                  entry.evidence,
-                ),
+                      raw.instance,
+                    )
+                  : null;
+              return registerProvenance(
+                {
+                  target,
+                  status: "proved" as const,
+                  instance: primaryRef,
+                  instanceKey: raw.instanceKey,
+                  allocationLocation: raw.allocationLocation,
+                  originKind: raw.originKind,
+                  instances: [firstInst, ...restInst] as readonly [
+                    ResolvedInstanceInfo,
+                    ...ResolvedInstanceInfo[],
+                  ],
+                  evidence: raw.evidence,
+                },
+                raw.evidence,
+              );
+            }
+            if (raw.status === "disproved") {
+              return registerProvenance(
+                {
+                  target,
+                  status: "disproved" as const,
+                  evidence: raw.evidence,
+                },
+                raw.evidence,
+              );
+            }
+            const instances = materializeResolvedInstances(
+              raw.instances,
+              sessionToken,
+              projectId,
+              snapshotId,
             );
-            const primaryRef =
-              raw.instance !== null
-                ? makeProgramRef(
-                    "instance",
-                    sessionToken,
-                    projectId,
-                    snapshotId,
-                    raw.instance,
-                  )
-                : null;
             return registerProvenance(
               {
                 target,
-                instance: primaryRef,
-                instanceKey: raw.instanceKey,
-                allocationLocation: raw.allocationLocation,
-                originKind: raw.originKind,
+                status: "inconclusive" as const,
                 instances,
-                evidence: raw.evidence,
                 gaps: raw.gaps,
+                evidence: raw.evidence,
               },
               raw.evidence,
             );
@@ -491,7 +508,7 @@ export function createInstanceIdentityQueries(deps: {
 
       const results = await Promise.all(
         targets.map((target) => {
-          const key = `${snapshotId}:${projectId}:${modelsDigest}:${lookupScopeKey}:${target.handleId}`;
+          const key = `${snapshotId}:${projectId}:${lookupScopeKey}:${target.handleId}`;
           return cache.resolutionCache.get(key)!.then((cached) =>
             registerProvenance(
               {
@@ -504,12 +521,15 @@ export function createInstanceIdentityQueries(deps: {
         }),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.status === "inconclusive") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {
         const count = results.reduce(
-          (sum, row) => sum + row.instances.length,
+          (sum, row) =>
+            sum + (row.status === "disproved" ? 0 : row.instances.length),
           0,
         );
         onQueryCompleted(
@@ -563,7 +583,7 @@ export function createInstanceIdentityQueries(deps: {
           row.instanceKey = raw.instanceKey ?? "";
         }
         if (select?.originKind === true) {
-          row.originKind = raw.originKind ?? "unresolved";
+          row.originKind = raw.originKind ?? "allocation";
         }
         if (select?.allocationLocation === true) {
           row.allocationLocation = raw.allocationLocation ?? null;
@@ -580,8 +600,8 @@ export function createInstanceIdentityQueries(deps: {
                 )
               : null;
         }
-        if (select?.modelId === true) {
-          row.modelId = raw.modelId ?? null;
+        if (select?.summaryId === true) {
+          row.summaryId = raw.summaryId ?? null;
         }
         if (select?.evidence === true) {
           row.evidence = raw.evidence ?? [];
@@ -597,11 +617,14 @@ export function createInstanceIdentityQueries(deps: {
           select?.allocationLocation === true &&
           raw.allocationLocation != null
         ) {
-          if (select.modelId === true && raw.modelId != null) {
+          if (select.summaryId === true && raw.summaryId != null) {
             projectedEvidence.push({
-              kind: "model",
-              modelId: raw.modelId,
-              message: `Instance allocated by model "${raw.modelId}"`,
+              kind: "summary",
+              summaryId: raw.summaryId,
+              ...(raw.summarySource !== undefined
+                ? { summarySource: raw.summarySource }
+                : {}),
+              message: `Instance allocated by summary "${raw.summaryId}"`,
               at: raw.allocationLocation,
             });
           } else {
@@ -611,11 +634,14 @@ export function createInstanceIdentityQueries(deps: {
               at: raw.allocationLocation,
             });
           }
-        } else if (select?.modelId === true && raw.modelId != null) {
+        } else if (select?.summaryId === true && raw.summaryId != null) {
           projectedEvidence.push({
-            kind: "model",
-            modelId: raw.modelId,
-            message: `Instance modeled by "${raw.modelId}"`,
+            kind: "summary",
+            summaryId: raw.summaryId,
+            ...(raw.summarySource !== undefined
+              ? { summarySource: raw.summarySource }
+              : {}),
+            message: `Instance summarized by "${raw.summaryId}"`,
           });
         }
         return registerProvenance(

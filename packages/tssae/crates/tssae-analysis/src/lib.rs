@@ -6,6 +6,7 @@
 pub mod branch_coverage;
 pub mod call_resolution;
 pub mod class_overrides;
+pub mod instance_identity;
 pub mod ir;
 pub mod summaries;
 pub mod value_propagation;

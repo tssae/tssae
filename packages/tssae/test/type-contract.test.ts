@@ -471,6 +471,32 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2339/u,
         },
+        {
+          name: "instance cannot be read on InstanceResolutionResult before narrowing to proved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [res] = await ctx.resolveInstances([synRef]);
+            void res?.instance;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on InstanceResolutionResult before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [res] = await ctx.resolveInstances([synRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "modelId does not exist on projectInstances selection",
+          body: `
+            const instRef = undefined as unknown as InstanceRef;
+            await ctx.projectInstances([instRef], { select: { modelId: true } });
+          `,
+          expectedPattern: /TS2353|TS2322/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

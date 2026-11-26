@@ -23,11 +23,11 @@ use crate::call_effects::{
     CallEffectsRow, EffectsModelInput, InstanceCleanupScopeRow, run_call_effects,
     run_instance_cleanup,
 };
-use crate::instance_identity::{
-    InstanceModelInput, InstanceProjectionRow, InstanceResolutionRow, InstanceSelect,
-    run_project_instances, run_resolve_instances,
-};
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
+use crate::ir_instances::{
+    InstanceProjectionRow, InstanceResolutionRow, InstanceSelect, run_project_instances,
+    run_resolve_instances,
+};
 use crate::ir_values::{ValuePropagationResultPayload, run_value_propagation};
 use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
@@ -167,8 +167,6 @@ pub enum QueryStep {
     },
     ResolveInstances {
         targets: Vec<String>,
-        #[serde(default)]
-        models: Vec<InstanceModelInput>,
         #[serde(default, rename = "lookupFiles")]
         lookup_files: Option<Vec<String>>,
     },
@@ -856,7 +854,6 @@ fn execute_extended_step(
     match step {
         QueryStep::ResolveInstances {
             targets,
-            models,
             lookup_files,
         } => {
             let items = run_resolve_instances(
@@ -865,8 +862,8 @@ fn execute_extended_step(
                 program,
                 checker,
                 &targets,
-                &models,
                 lookup_files.as_deref(),
+                observer,
             )?;
             observer.record_step("resolveInstances", step_start, items.len(), Vec::new());
             Ok(StepResult::ResolveInstances { items })

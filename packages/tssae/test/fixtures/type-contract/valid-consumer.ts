@@ -160,8 +160,12 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     const resolvedInstances = await ctx.resolveInstances(callRefs);
     const instRefs: InstanceRef[] = [];
     for (const instRow of resolvedInstances) {
-      if (instRow.instance !== null) {
+      if (instRow.status === "proved" && instRow.instance !== null) {
         instRefs.push(instRow.instance);
+      } else if (instRow.status === "inconclusive") {
+        void instRow.gaps.length;
+      } else {
+        void instRow.evidence.length;
       }
     }
     const projectedInstances = await ctx.projectInstances(instRefs, {
@@ -170,7 +174,7 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
         originKind: true,
         allocationLocation: true,
         originSyntax: true,
-        modelId: true,
+        summaryId: true,
         evidence: true,
       },
     });

@@ -5,6 +5,7 @@ import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   defineModel,
+  defineSummaries,
   evidenceOf,
   extractBasisEvidence,
   isSameInstance,
@@ -14,6 +15,32 @@ import {
   type InstanceRef,
   type SyntaxRef,
 } from "tssae";
+
+const LIFECYCLE_SUMMARIES = defineSummaries({
+  id: "test-lifecycle-summaries",
+  entries: [
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["createExternalResource"],
+      },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["Disposable", "prototype", "_register"],
+      },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "forwards-instance", from: { argIndex: 0 } },
+      },
+    },
+  ],
+});
 
 const LIFECYCLE_MODEL = defineModel({
   id: "test-lifecycle-model",
@@ -98,6 +125,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
           models: [LIFECYCLE_MODEL],
+          summaries: { packs: [LIFECYCLE_SUMMARIES] },
         });
         try {
           const ctx = session.project();
@@ -135,7 +163,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             const target = getVarInitInFn(fnName, varName);
             const [res] = await ctx.resolveInstances([target]);
             assert.ok(
-              res?.instance,
+              res?.status === "proved" && res.instance !== null,
               `expected instance for ${fnName}.${varName}`,
             );
             instancesByName.set(`${fnName}.${varName}`, res.instance);
@@ -390,6 +418,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
           models: [LIFECYCLE_MODEL],
+          summaries: { packs: [LIFECYCLE_SUMMARIES] },
         });
 
         try {
@@ -409,7 +438,9 @@ void describe("tssae call-effects and instanceCleanup", () => {
           assert.ok(connVar?.initializer && disconnectCall);
 
           const [resolved] = await ctx.resolveInstances([connVar.initializer]);
-          assert.ok(resolved?.instance);
+          assert.ok(
+            resolved?.status === "proved" && resolved.instance !== null,
+          );
 
           const [cleanup] = await ctx.instanceCleanup({
             scopes: [disconnectCall.ref],
@@ -746,7 +777,8 @@ void describe("tssae call-effects and instanceCleanup", () => {
           const closeVar = vars.find((v) => v.text.startsWith("close ="))!;
           const scope = closeVar.initializer!;
           const [instRes] = await ctx.resolveInstances([itemVar.initializer!]);
-          const inst = instRes!.instance!;
+          assert.ok(instRes?.status === "proved" && instRes.instance !== null);
+          const inst = instRes.instance;
           const [cleanupRes] = await ctx.instanceCleanup({
             scopes: [scope],
             targets: [inst],
@@ -772,6 +804,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
               ],
             }),
           ],
+          summaries: { packs: [LIFECYCLE_SUMMARIES] },
         });
 
         try {

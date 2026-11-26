@@ -381,7 +381,12 @@ void describe("tssae first-party implementation resolution", () => {
             initOf("seed"),
             initOf("d"),
           ]);
-          assert.ok(seedInst?.instance && mapOutInst?.instance);
+          assert.ok(
+            seedInst?.status === "proved" &&
+              seedInst.instance !== null &&
+              mapOutInst?.status === "proved" &&
+              mapOutInst.instance !== null,
+          );
           assert.equal(
             isSameInstance(seedInst.instance, mapOutInst.instance),
             true,
@@ -699,8 +704,8 @@ void describe("tssae first-party implementation resolution", () => {
             initOf("outJs"),
           ]);
           for (const inst of instances) {
-            assert.equal(inst.instance, null);
-            assert.ok(inst.gaps.length > 0);
+            assert.equal(inst.status, "inconclusive");
+            assert.ok(inst.status === "inconclusive" && inst.gaps.length > 0);
           }
         } finally {
           await session.close();

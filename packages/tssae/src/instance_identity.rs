@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use rustc_hash::FxHashSet;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tsrs_ast::{
     Kind, Node, SourceFile, Symbol, get_source_file_of_node, is_function_like_declaration,
 };
@@ -21,7 +21,7 @@ use tssae_tsrs_boundary::{FacadeImplementationOutcome, is_first_party_source_fil
 use crate::cfg::{EvidenceItem, GapItem, resolve_enclosing_function};
 use crate::package_impl::{check_call_missing_package_gap, resolve_first_party_for_call_target};
 use crate::projects::{is_project_source_file, relative_to_cwd};
-use crate::serve::{RpcErr, SnapshotState, SourceLocation, node_location};
+use crate::serve::{SnapshotState, SourceLocation, node_location};
 
 const MAX_TRACE_DEPTH: usize = 24;
 const MAX_CALL_STACK_DEPTH: usize = 12;
@@ -57,112 +57,6 @@ pub struct InstanceModelInput {
     pub id: String,
     #[serde(default)]
     pub instance_behaviors: Vec<InstanceModelBehaviorInput>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "JSON projection selection flags map 1:1 to SDK select keys."
-)]
-pub struct InstanceSelect {
-    #[serde(default)]
-    pub instance_key: bool,
-    #[serde(default)]
-    pub origin_kind: bool,
-    #[serde(default)]
-    pub allocation_location: bool,
-    #[serde(default)]
-    pub origin_syntax: bool,
-    #[serde(default)]
-    pub model_id: bool,
-    #[serde(default)]
-    pub evidence: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvedInstanceInfoPayload {
-    #[serde(rename = "ref")]
-    pub instance_ref: String,
-    pub instance_key: String,
-    pub origin_kind: &'static str,
-    pub allocation_location: Option<SourceLocation>,
-    pub origin_syntax: Option<String>,
-    pub model_id: Option<String>,
-    pub evidence: Vec<EvidenceItem>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstanceResolutionRow {
-    pub target: String,
-    pub instance: Option<String>,
-    pub instance_key: Option<String>,
-    pub allocation_location: Option<SourceLocation>,
-    pub origin_kind: Option<&'static str>,
-    pub instances: Vec<ResolvedInstanceInfoPayload>,
-    pub evidence: Vec<EvidenceItem>,
-    pub gaps: Vec<GapItem>,
-}
-
-#[derive(Default)]
-pub enum ProjectedInstanceField<T> {
-    #[default]
-    Omitted,
-    Value(Option<T>),
-}
-
-impl<T> ProjectedInstanceField<T> {
-    const fn is_omitted(&self) -> bool {
-        matches!(self, Self::Omitted)
-    }
-
-    fn from_selected(selected: bool, value: Option<T>) -> Self {
-        if selected {
-            Self::Value(value)
-        } else {
-            Self::Omitted
-        }
-    }
-}
-
-impl<T: Serialize> Serialize for ProjectedInstanceField<T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Omitted => serializer.serialize_none(),
-            Self::Value(val) => val.serialize(serializer),
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstanceProjectionRow {
-    pub instance: String,
-    pub gaps: Vec<GapItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instance_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin_kind: Option<&'static str>,
-    #[serde(skip_serializing_if = "ProjectedInstanceField::is_omitted")]
-    pub allocation_location: ProjectedInstanceField<SourceLocation>,
-    #[serde(skip_serializing_if = "ProjectedInstanceField::is_omitted")]
-    pub origin_syntax: ProjectedInstanceField<String>,
-    #[serde(skip_serializing_if = "ProjectedInstanceField::is_omitted")]
-    pub model_id: ProjectedInstanceField<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<Vec<EvidenceItem>>,
-}
-
-#[derive(Clone)]
-pub struct InstanceHandleData {
-    pub instance_key: String,
-    pub origin_kind: &'static str,
-    pub allocation_location: Option<SourceLocation>,
-    pub origin_syntax: Option<P<Node>>,
-    pub model_id: Option<String>,
-    pub evidence: Vec<EvidenceItem>,
 }
 
 #[derive(Clone)]
@@ -793,14 +687,6 @@ impl InstanceResolver<'_> {
         );
         self.field_index = Some(Arc::clone(&index));
         index
-    }
-
-    fn resolve_target(&mut self, node: P<Node>) -> TraceOutcome {
-        let mut active = Vec::new();
-        let mut out = self.resolve_node(node, &[], node, 0, &mut active);
-        out.origins
-            .sort_by(|a, b| a.instance_key.cmp(&b.instance_key));
-        out
     }
 
     pub fn resolve_with_stack(&mut self, node: P<Node>, call_stack: &[CallFrame]) -> TraceOutcome {
@@ -2836,147 +2722,4 @@ fn find_class_getter(class_node: P<Node>, prop_name: &str) -> Option<P<Node>> {
             && member.name().and_then(node_text).as_deref() == Some(prop_name)
             && member.body().is_some()
     })
-}
-
-fn resolve_instance_target_node(
-    snapshot: &SnapshotState,
-    project_id: &str,
-    handle_id: &str,
-) -> Result<P<Node>, RpcErr> {
-    let entry = snapshot.get_entry(project_id, handle_id)?;
-    match entry.payload {
-        crate::serve::HandlePayload::Syntax(node)
-        | crate::serve::HandlePayload::Call(node)
-        | crate::serve::HandlePayload::Declaration { node, .. } => Ok(node),
-        crate::serve::HandlePayload::Signature { .. }
-        | crate::serve::HandlePayload::Type { .. }
-        | crate::serve::HandlePayload::Branch(_)
-        | crate::serve::HandlePayload::Instance(_) => Err(RpcErr::new(
-            "INVALID_REFERENCE_KIND",
-            format!("Program reference {handle_id} cannot be resolved as an instance target."),
-        )),
-    }
-}
-
-pub fn run_resolve_instances(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    targets: &[String],
-    models: &[InstanceModelInput],
-    lookup_files: Option<&[String]>,
-) -> Result<Vec<InstanceResolutionRow>, RpcErr> {
-    let mut target_nodes = Vec::with_capacity(targets.len());
-    for handle_id in targets {
-        target_nodes.push((
-            handle_id.clone(),
-            resolve_instance_target_node(snapshot, project_id, handle_id)?,
-        ));
-    }
-
-    let cwd = snapshot.cwd.clone();
-
-    let mut outcomes = Vec::with_capacity(target_nodes.len());
-    {
-        let mut resolver = InstanceResolver {
-            cwd: &cwd,
-            program,
-            checker,
-            snapshot,
-            project_id,
-            lookup_files,
-            call_graph: None,
-            field_index: None,
-            models,
-        };
-        for (target_id, node) in target_nodes {
-            outcomes.push((target_id, resolver.resolve_target(node)));
-        }
-    }
-
-    let mut rows = Vec::with_capacity(outcomes.len());
-    for (target_id, outcome) in outcomes {
-        let mut resolved_infos = Vec::with_capacity(outcome.origins.len());
-        let mut combined_evidence = Vec::new();
-        for origin in outcome.origins {
-            let origin_syntax = origin
-                .origin_node
-                .map(|n| snapshot.alloc_syntax(project_id, n));
-            let inst_ref = snapshot.alloc_instance(
-                project_id,
-                InstanceHandleData {
-                    instance_key: origin.instance_key.clone(),
-                    origin_kind: origin.origin_kind,
-                    allocation_location: origin.allocation_location.clone(),
-                    origin_syntax: origin.origin_node,
-                    model_id: origin.model_id.clone(),
-                    evidence: origin.evidence.clone(),
-                },
-            );
-            for ev in &origin.evidence {
-                combined_evidence.push(ev.clone());
-            }
-            resolved_infos.push(ResolvedInstanceInfoPayload {
-                instance_ref: inst_ref,
-                instance_key: origin.instance_key,
-                origin_kind: origin.origin_kind,
-                allocation_location: origin.allocation_location,
-                origin_syntax,
-                model_id: origin.model_id,
-                evidence: origin.evidence,
-            });
-        }
-
-        let primary = resolved_infos.first();
-        rows.push(InstanceResolutionRow {
-            target: target_id,
-            instance: primary.map(|p| p.instance_ref.clone()),
-            instance_key: primary.map(|p| p.instance_key.clone()),
-            allocation_location: primary.and_then(|p| p.allocation_location.clone()),
-            origin_kind: primary.map(|p| p.origin_kind),
-            instances: resolved_infos,
-            evidence: combined_evidence,
-            gaps: outcome.gaps,
-        });
-    }
-
-    Ok(rows)
-}
-
-pub fn run_project_instances(
-    snapshot: &mut SnapshotState,
-    project_id: &str,
-    targets: &[String],
-    select: &InstanceSelect,
-) -> Result<Vec<InstanceProjectionRow>, RpcErr> {
-    let mut entries = Vec::with_capacity(targets.len());
-    for handle_id in targets {
-        let data = snapshot.get_instance(project_id, handle_id)?.clone();
-        entries.push((handle_id.clone(), data));
-    }
-
-    let mut rows = Vec::with_capacity(entries.len());
-    for (handle_id, data) in entries {
-        let origin_syntax = ProjectedInstanceField::from_selected(
-            select.origin_syntax,
-            data.origin_syntax
-                .map(|n| snapshot.alloc_syntax(project_id, n)),
-        );
-        rows.push(InstanceProjectionRow {
-            instance: handle_id,
-            gaps: Vec::new(),
-            instance_key: select.instance_key.then_some(data.instance_key),
-            origin_kind: select.origin_kind.then_some(data.origin_kind),
-            allocation_location: ProjectedInstanceField::from_selected(
-                select.allocation_location,
-                data.allocation_location,
-            ),
-            origin_syntax,
-            model_id: ProjectedInstanceField::from_selected(select.model_id, data.model_id),
-            evidence: select.evidence.then_some(data.evidence),
-        });
-    }
-
-    Ok(rows)
 }

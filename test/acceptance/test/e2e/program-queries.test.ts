@@ -386,7 +386,14 @@ try {
     aliasAVar.initializer,
     connBCallSyn.ref,
   ]);
-  assert.ok(instA?.instance && instAliasA?.instance && instB?.instance);
+  assert.ok(
+    instA?.status === "proved" &&
+      instA.instance !== null &&
+      instAliasA?.status === "proved" &&
+      instAliasA.instance !== null &&
+      instB?.status === "proved" &&
+      instB.instance !== null,
+  );
   assert.equal(isSameInstance(instA.instance, instAliasA.instance), true);
   assert.equal(isSameInstance(instA.instance, instB.instance), false);
 
@@ -395,7 +402,7 @@ try {
       instanceKey: true,
       originKind: true,
       allocationLocation: true,
-      modelId: true,
+      summaryId: true,
       evidence: true,
     },
   });

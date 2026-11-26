@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use tsrs_ast::{
     Kind, Node, SourceFile, Symbol, get_source_file_of_node, is_function_like_declaration,
@@ -19,11 +19,11 @@ use crate::cfg::{
     CleanupCfgStatus, EvidenceItem, GapItem, normalize_function_node, resolve_enclosing_function,
 };
 use crate::instance_identity::{
-    CallFrame, CalleeDeclMetadata, InstanceHandleData, InstanceModelBehaviorInput,
-    InstanceModelInput, InstanceModelMatchInput, InstanceResolver, ResolvedOrigin,
-    collect_callee_decl_metadata, extract_call_receiver, is_external_declaration,
-    score_model_match,
+    CallFrame, CalleeDeclMetadata, InstanceModelBehaviorInput, InstanceModelInput,
+    InstanceModelMatchInput, InstanceResolver, ResolvedOrigin, collect_callee_decl_metadata,
+    extract_call_receiver, is_external_declaration, score_model_match,
 };
+use crate::ir_instances::InstanceHandleData;
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
 
@@ -2341,7 +2341,8 @@ fn alloc_cleanup_site_payload(
             origin_kind: action.origin.origin_kind,
             allocation_location: action.origin.allocation_location.clone(),
             origin_syntax: action.origin.origin_node,
-            model_id: action.origin.model_id.clone(),
+            summary_id: action.origin.model_id.clone(),
+            summary_source: None,
             evidence: action.origin.evidence.clone(),
         },
     );
@@ -2415,6 +2416,57 @@ fn alloc_field_effect_payload(
         cfg_scope,
         guards,
         evidence: raw.evidence.clone(),
+    }
+}
+
+// Ticket 11->12 compatibility bridge: align legacy `model-allocation` instance keys from
+// un-migrated `call_effects.rs` with `summary-allocation` keys already interned by IR
+// `resolveInstances` at the same allocation site and call stack.
+fn build_summary_site_key_map(
+    snapshot: &SnapshotState,
+    project_id: &str,
+) -> FxHashMap<String, String> {
+    let mut map = FxHashMap::default();
+    for ((proj, _), handle_id) in &snapshot.instance_handles {
+        if proj != project_id {
+            continue;
+        }
+        let Ok(data) = snapshot.get_instance(project_id, handle_id) else {
+            continue;
+        };
+        if data.origin_kind != "summary-allocation" {
+            continue;
+        }
+        let Some(summary_id) = &data.summary_id else {
+            continue;
+        };
+        let prefix = format!("summary:{summary_id}:");
+        if let Some(site_key) = data.instance_key.strip_prefix(&prefix) {
+            map.insert(site_key.to_string(), data.instance_key.clone());
+        }
+    }
+    map
+}
+
+fn remap_cleanup_origins_to_summary_keys(
+    actions: &mut [RecordedCleanupAction],
+    summary_key_by_site: &FxHashMap<String, String>,
+) {
+    for action in actions {
+        if action.origin.origin_kind != "model-allocation" {
+            continue;
+        }
+        let Some(loc) = &action.origin.allocation_location else {
+            continue;
+        };
+        let marker = format!("@{}:{}..{}", loc.file, loc.start, loc.end);
+        let Some(pos) = action.origin.instance_key.find(&marker) else {
+            continue;
+        };
+        let site_key = &action.origin.instance_key[pos + 1..];
+        if let Some(summary_key) = summary_key_by_site.get(site_key) {
+            action.origin.instance_key.clone_from(summary_key);
+        }
     }
 }
 
@@ -2519,7 +2571,14 @@ pub fn run_instance_cleanup(
         drop(engine);
     }
 
-    for item in eval_items {
+    let summary_key_by_site = build_summary_site_key_map(snapshot, project_id);
+
+    for mut item in eval_items {
+        if !summary_key_by_site.is_empty() {
+            remap_cleanup_origins_to_summary_keys(&mut item.disposals, &summary_key_by_site);
+            remap_cleanup_origins_to_summary_keys(&mut item.registrations, &summary_key_by_site);
+            remap_cleanup_origins_to_summary_keys(&mut item.detachments, &summary_key_by_site);
+        }
         let mut cfgs = Vec::new();
         let mut cfg_build_gaps = Vec::new();
         for &fn_node in &item.resolved_fns {

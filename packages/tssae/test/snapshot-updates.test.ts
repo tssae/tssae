@@ -154,7 +154,10 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
           const [instResolution] = await ctx1.resolveInstances([
             createSyntax.ref,
           ]);
-          const instanceRef = instResolution?.instance;
+          const instanceRef =
+            instResolution?.status === "proved"
+              ? instResolution.instance
+              : null;
           assert.ok(instanceRef);
 
           const staleSyntaxRef: SyntaxRef = pickSyntax.ref;

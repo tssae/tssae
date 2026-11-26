@@ -4,6 +4,7 @@ mod cfg;
 mod comments;
 mod instance_identity;
 mod ir_calls;
+mod ir_instances;
 mod ir_values;
 mod native_adapter;
 mod observe;

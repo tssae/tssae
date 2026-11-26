@@ -311,7 +311,9 @@ void describe("tssae selected query evidence", () => {
           assert.ok(covItem);
 
           const [instRes] = await ctx.resolveInstances([makeCall.ref]);
-          assert.ok(instRes && instRes.instance !== null);
+          assert.ok(
+            instRes && instRes.status === "proved" && instRes.instance !== null,
+          );
           const instInfo = instRes.instances[0]!;
 
           const [projInstWithLoc] = await ctx.projectInstances(

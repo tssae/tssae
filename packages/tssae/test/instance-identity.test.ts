@@ -5,6 +5,7 @@ import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
   defineModel,
+  defineSummaries,
   isSameInstance,
   openProject,
   type InstanceRef,
@@ -60,13 +61,17 @@ void describe("tssae instance identity", () => {
             resultsByVar.set(targetNames[idx]!, row);
           }
 
-          const fac1Ref = resultsByVar.get("fac1")?.instance;
+          assert.ok(resolved[0]?.status === "proved");
+          const fac1Row = resultsByVar.get("fac1");
+          const fac1Ref =
+            fac1Row?.status === "proved" ? fac1Row.instance : null;
           assert.ok(fac1Ref, "fac1 should resolve to an InstanceRef");
           const [projected] = await ctx.projectInstances([fac1Ref], {
             select: {
               instanceKey: true,
               allocationLocation: true,
               originKind: true,
+              summaryId: true,
               evidence: true,
             },
           });
@@ -74,17 +79,24 @@ void describe("tssae instance identity", () => {
           projectedKey = projected.instanceKey;
           projectedAllocFile = projected.allocationLocation?.file;
           assert.equal(projected.originKind, "allocation");
+          assert.equal(projected.summaryId, null);
           assert.ok(projected.evidence.some((e) => e.kind === "source"));
         } finally {
           await session.close();
         }
 
-        const get = (name: string): InstanceResolutionResult => {
+        const get = (
+          name: string,
+        ): Extract<InstanceResolutionResult, { readonly status: "proved" }> => {
           const res = resultsByVar.get(name);
           assert.ok(res, `Missing result for ${name}`);
-          assert.ok(res.instance, `Expected resolved instance for ${name}`);
+          assert.equal(
+            res.status,
+            "proved",
+            `Expected proved result for ${name}, got ${JSON.stringify(res)}`,
+          );
+          assert.ok(res.instance, `Expected single instance for ${name}`);
           assert.equal(res.originKind, "allocation");
-          assert.deepEqual(res.gaps, []);
           assert.ok(
             res.evidence.some((e) => e.kind === "source"),
             `Expected source evidence for ${name}`,
@@ -151,8 +163,8 @@ void describe("tssae instance identity", () => {
         await host.typecheck();
 
         const resultsByName = new Map<string, InstanceResolutionResult>();
-        let ownStore: InstanceRef | undefined;
-        let ownOther: InstanceRef | undefined;
+        let ownStoreKeys: string[] = [];
+        let ownOtherKey = "";
 
         const session = await openProject({
           cwd: host.rootDir,
@@ -194,7 +206,11 @@ void describe("tssae instance identity", () => {
 
           const resolved = await ctx.resolveInstances(targets);
           for (const [idx, row] of resolved.entries()) {
-            assert.deepEqual(row.gaps, []);
+            assert.equal(
+              row.status,
+              "proved",
+              `Expected proved for ${targetNames[idx]}, got ${JSON.stringify(row)}`,
+            );
             resultsByName.set(targetNames[idx]!, row);
           }
 
@@ -210,15 +226,22 @@ void describe("tssae instance identity", () => {
             storeAccess.ref,
             otherAccess.ref,
           ]);
-          ownStore = r1?.instance ?? undefined;
-          ownOther = r2?.instance ?? undefined;
+          assert.equal(r1?.status, "proved");
+          assert.equal(r2?.status, "proved");
+          if (r1?.status === "proved" && r2?.status === "proved") {
+            ownStoreKeys = r1.instances.map((inst) => inst.instanceKey);
+            ownOtherKey = r2.instanceKey ?? r2.instances[0].instanceKey;
+          }
         } finally {
           await session.close();
         }
 
-        const getInst = (name: string) => {
+        const getInst = (name: string): InstanceRef => {
           const row = resultsByName.get(name);
-          assert.ok(row?.instance, `Expected instance for ${name}`);
+          assert.ok(
+            row?.status === "proved" && row.instance !== null,
+            `Expected proved single instance for ${name}, got ${JSON.stringify(row)}`,
+          );
           return row.instance;
         };
 
@@ -267,13 +290,13 @@ void describe("tssae instance identity", () => {
         const sing2 = getInst("sing2");
         assert.equal(isSameInstance(sing1, sing2), true);
 
-        assert.ok(ownStore && ownOther);
-        assert.equal(isSameInstance(ownStore, ownOther), false);
+        assert.ok(ownStoreKeys.length > 0 && ownOtherKey !== "");
+        assert.equal(ownStoreKeys.includes(ownOtherKey), false);
       },
     );
   });
 
-  void it("applies Model behaviors for external .d.ts factories/forwarders, reports gaps when unmodeled, invalidates on update, and rejects stale InstanceRef", async () => {
+  void it("applies behavior summaries for external .d.ts factories/forwarders, reports inconclusive gaps when unmodeled, invalidates on update, and rejects stale InstanceRef", async () => {
     await withTempHost(
       {
         host: "sdk-queries/instance-identity-model",
@@ -287,39 +310,62 @@ void describe("tssae instance identity", () => {
       async (host) => {
         await host.typecheck();
 
-        const baseModel = defineModel({
-          id: "acme-ui-model",
+        const baseSummaries = defineSummaries({
+          id: "acme-ui-summaries",
           version: "1.0.0",
-          facts: { compatible: true },
-          instanceBehaviors: [
+          entries: [
             {
-              kind: "allocates-fresh-instance",
-              match: { module: "@acme/ui", symbol: "Event.once" },
-            },
-            {
-              kind: "allocates-fresh-instance",
-              match: {
-                module: "@acme/ui",
-                container: "IMenuService",
-                member: "createMenu",
+              match: { package: "@acme/ui", memberPath: ["Event", "once"] },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
               },
             },
             {
-              kind: "allocates-fresh-instance",
               match: {
-                container: "IInstantiationService",
-                member: "createInstance",
+                package: "@acme/ui",
+                memberPath: ["IMenuService", "createMenu"],
+              },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
               },
             },
             {
-              kind: "forwards-argument",
-              match: { container: "Disposable", member: "_register" },
-              argumentIndex: 0,
+              match: {
+                package: "@acme/ui",
+                memberPath: ["IInstantiationService", "createInstance"],
+              },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
+              },
             },
             {
-              kind: "forwards-argument",
-              match: { container: "DisposableStore", member: "add" },
-              argumentIndex: 0,
+              match: {
+                package: "@acme/ui",
+                memberPath: ["Disposable", "prototype", "_register"],
+              },
+              instances: {
+                completeness: "complete",
+                outcome: {
+                  kind: "forwards-instance",
+                  from: { argIndex: 0 },
+                },
+              },
+            },
+            {
+              match: {
+                package: "@acme/ui",
+                memberPath: ["DisposableStore", "prototype", "add"],
+              },
+              instances: {
+                completeness: "complete",
+                outcome: {
+                  kind: "forwards-instance",
+                  from: { argIndex: 0 },
+                },
+              },
             },
           ],
         });
@@ -366,7 +412,7 @@ void describe("tssae instance identity", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [baseModel],
+          summaries: { packs: [baseSummaries] },
         });
 
         try {
@@ -375,47 +421,58 @@ void describe("tssae instance identity", () => {
           const w1 = resolvedMap.get("w1")!;
           const registered = resolvedMap.get("registered")!;
           const added = resolvedMap.get("added")!;
-          assert.ok(w1.instance);
+          assert.equal(w1.status, "proved");
+          assert.equal(registered.status, "proved");
+          assert.equal(added.status, "proved");
+          assert.ok(w1.instance && registered.instance && added.instance);
           assert.equal(isSameInstance(w1.instance, registered.instance), true);
           assert.equal(isSameInstance(w1.instance, added.instance), true);
           assert.ok(registered.evidence.some((e) => e.kind === "source"));
           assert.ok(
             registered.evidence.some(
               (e) =>
-                e.kind === "model" &&
-                e.modelId === "acme-ui-model" &&
+                e.kind === "summary" &&
+                e.summaryId === "acme-ui-summaries" &&
+                e.summarySource === "local" &&
                 e.declaration?.includes("_register"),
             ),
-            `Expected model evidence for _register, got ${JSON.stringify(registered.evidence)}`,
+            `Expected summary evidence for _register, got ${JSON.stringify(registered.evidence)}`,
           );
           assert.ok(
             added.evidence.some(
               (e) =>
-                e.kind === "model" &&
-                e.modelId === "acme-ui-model" &&
+                e.kind === "summary" &&
+                e.summaryId === "acme-ui-summaries" &&
                 e.declaration?.includes("add"),
             ),
           );
 
           const evOnce1 = resolvedMap.get("evOnce1")!;
           const evOnce2 = resolvedMap.get("evOnce2")!;
+          assert.equal(evOnce1.status, "proved");
+          assert.equal(evOnce2.status, "proved");
           assert.ok(evOnce1.instance && evOnce2.instance);
-          assert.equal(evOnce1.originKind, "model-allocation");
+          assert.equal(evOnce1.originKind, "summary-allocation");
+          assert.equal(evOnce1.instances[0].summaryId, "acme-ui-summaries");
           assert.equal(
             isSameInstance(evOnce1.instance, evOnce2.instance),
             false,
           );
           assert.ok(
             evOnce1.evidence.some(
-              (e) => e.kind === "model" && e.modelId === "acme-ui-model",
+              (e) =>
+                e.kind === "summary" && e.summaryId === "acme-ui-summaries",
             ),
           );
 
           const menu1 = resolvedMap.get("menu1")!;
           const menu2 = resolvedMap.get("menu2")!;
           const menu1Alias = resolvedMap.get("menu1Alias")!;
+          assert.equal(menu1.status, "proved");
+          assert.equal(menu2.status, "proved");
+          assert.equal(menu1Alias.status, "proved");
           assert.ok(menu1.instance && menu2.instance && menu1Alias.instance);
-          assert.equal(menu1.originKind, "model-allocation");
+          assert.equal(menu1.originKind, "summary-allocation");
           assert.equal(isSameInstance(menu1.instance, menu2.instance), false);
           assert.equal(
             isSameInstance(menu1.instance, menu1Alias.instance),
@@ -424,46 +481,69 @@ void describe("tssae instance identity", () => {
 
           const inst1 = resolvedMap.get("inst1")!;
           const inst2 = resolvedMap.get("inst2")!;
+          assert.equal(inst1.status, "proved");
+          assert.equal(inst2.status, "proved");
           assert.ok(inst1.instance && inst2.instance);
           assert.equal(isSameInstance(inst1.instance, inst2.instance), false);
 
-          // Unmodeled .d.ts call -> null instance + missing-instance-model gap
+          // Unmodeled external factory without summary -> inconclusive + missing-behavior-summary gap + summary lookup note
           const unknownExt = resolvedMap.get("unknownExt")!;
-          assert.equal(unknownExt.instance, null);
+          assert.equal(unknownExt.status, "inconclusive");
           assert.equal(unknownExt.instances.length, 0);
           assert.ok(
-            unknownExt.gaps.some((g) => g.kind === "missing-instance-model"),
+            unknownExt.gaps.some((g) => g.kind === "missing-behavior-summary"),
+            `Expected missing-behavior-summary gap, got ${JSON.stringify(unknownExt.gaps)}`,
+          );
+          assert.ok(
+            unknownExt.evidence.some((e) =>
+              e.message.toLowerCase().includes("summary"),
+            ),
+            `Expected summary lookup evidence, got ${JSON.stringify(unknownExt.evidence)}`,
           );
 
           // Partial resolution: keeps known branch `menu1` while reporting gap for `unmodeledExternal()`
           const partial = resolvedMap.get("partial")!;
+          assert.equal(partial.status, "inconclusive");
           assert.equal(partial.instances.length, 1);
-          assert.equal(isSameInstance(partial.instance, menu1.instance), true);
+          assert.equal(
+            isSameInstance(partial.instances[0]!.ref, menu1.instance),
+            true,
+          );
           assert.ok(
-            partial.gaps.some((g) => g.kind === "missing-instance-model"),
+            partial.gaps.some((g) => g.kind === "missing-behavior-summary"),
           );
 
-          // Dynamic callee -> null instance + dynamic-callee gap
+          // Dynamic callee -> inconclusive + dynamic-callee gap
           const dyn = resolvedMap.get("dyn")!;
-          assert.equal(dyn.instance, null);
+          assert.equal(dyn.status, "inconclusive");
           assert.ok(dyn.gaps.some((g) => g.kind === "dynamic-callee"));
 
-          // Capture snapshot-1 InstanceRef, then update models to cover `unmodeledExternal`
+          // Capture snapshot-1 InstanceRef, then update summaries to cover `unmodeledExternal`
           const staleInstRef = menu1.instance;
-          const extendedModel = defineModel({
-            ...baseModel,
+          const extendedSummaries = defineSummaries({
+            ...baseSummaries,
             version: "1.1.0",
-            instanceBehaviors: [
-              ...(baseModel.instanceBehaviors ?? []),
+            entries: [
+              ...baseSummaries.entries,
               {
-                kind: "allocates-fresh-instance",
-                match: { module: "@acme/ui", symbol: "unmodeledExternal" },
+                match: {
+                  package: "@acme/ui",
+                  memberPath: ["unmodeledExternal"],
+                },
+                instances: {
+                  completeness: "complete",
+                  outcome: { kind: "allocates-fresh-instance" },
+                },
               },
             ],
           });
 
-          const updateRes = await session.update({ models: [extendedModel] });
-          assert.ok(updateRes.recomputation.invalidatedBy.includes("models"));
+          const updateRes = await session.update({
+            summaries: { packs: [extendedSummaries] },
+          });
+          assert.ok(
+            updateRes.recomputation.invalidatedBy.includes("summaries"),
+          );
 
           const ctx2 = session.project();
           await assert.rejects(
@@ -478,21 +558,24 @@ void describe("tssae instance identity", () => {
           const resolvedMap2 = await resolveAppInstances(ctx2);
 
           const nowModeled = resolvedMap2.get("unknownExt")!;
-          assert.ok(
-            nowModeled.instance,
-            "Expected unmodeledExternal to resolve after model update",
+          assert.equal(
+            nowModeled.status,
+            "proved",
+            "Expected unmodeledExternal to resolve after summary update",
           );
-          assert.equal(nowModeled.originKind, "model-allocation");
-          assert.deepEqual(nowModeled.gaps, []);
+          assert.ok(nowModeled.instance);
+          assert.equal(nowModeled.originKind, "summary-allocation");
           assert.ok(
             nowModeled.evidence.some(
-              (e) => e.kind === "model" && e.modelId === "acme-ui-model",
+              (e) =>
+                e.kind === "summary" && e.summaryId === "acme-ui-summaries",
             ),
           );
 
           const partialAfter = resolvedMap2.get("partial")!;
+          assert.equal(partialAfter.status, "proved");
+          assert.equal(partialAfter.instance, null);
           assert.equal(partialAfter.instances.length, 2);
-          assert.deepEqual(partialAfter.gaps, []);
 
           // Edit source file to alias `menu2` instead of `menu1` and verify cache invalidation
           host.replaceText(
@@ -511,6 +594,9 @@ void describe("tssae instance identity", () => {
           const menu1AfterEdit = resolvedMap3.get("menu1")!;
           const menu2AfterEdit = resolvedMap3.get("menu2")!;
           const menu1AliasAfterEdit = resolvedMap3.get("menu1Alias")!;
+          assert.equal(menu1AfterEdit.status, "proved");
+          assert.equal(menu2AfterEdit.status, "proved");
+          assert.equal(menu1AliasAfterEdit.status, "proved");
           assert.equal(
             isSameInstance(
               menu1AliasAfterEdit.instance,
@@ -524,6 +610,231 @@ void describe("tssae instance identity", () => {
               menu1AfterEdit.instance,
             ),
             false,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("tracks #private fields, constructor parameter properties, getters, closures, disproved values, and project-local summary files", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-instance-private-and-local-summary",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "node_modules/ext-factory/package.json": JSON.stringify({
+            name: "ext-factory",
+            version: "1.0.0",
+            types: "./index.d.ts",
+          }),
+          "node_modules/ext-factory/index.d.ts": [
+            "export interface ExtHandle { dispose(): void }",
+            "export declare function createHandle(): ExtHandle;",
+            "export declare function wrapHandle(h: ExtHandle): ExtHandle;",
+            "export declare function missingSummary(): ExtHandle;",
+            "export declare function checkFlag(v: unknown): boolean;",
+          ].join("\n"),
+          "tssae.summaries.json": JSON.stringify({
+            id: "local-instance-summaries",
+            entries: [
+              {
+                match: {
+                  package: "ext-factory",
+                  memberPath: ["createHandle"],
+                },
+                instances: {
+                  completeness: "complete",
+                  outcome: { kind: "allocates-fresh-instance" },
+                },
+              },
+              {
+                match: {
+                  package: "ext-factory",
+                  memberPath: ["wrapHandle"],
+                },
+                instances: {
+                  completeness: "complete",
+                  outcome: {
+                    kind: "forwards-instance",
+                    from: { argIndex: 0 },
+                  },
+                },
+              },
+              {
+                match: {
+                  package: "ext-factory",
+                  memberPath: ["checkFlag"],
+                },
+                instances: {
+                  completeness: "complete",
+                  outcome: { kind: "none" },
+                },
+              },
+            ],
+          }),
+          "src/app.ts": [
+            'import { checkFlag, createHandle, missingSummary, wrapHandle, type ExtHandle } from "ext-factory";',
+            "",
+            "class Vault {",
+            "  #secret: ExtHandle;",
+            "  constructor(public readonly paramHandle: ExtHandle) {",
+            "    this.#secret = createHandle();",
+            "  }",
+            "  get secret(): ExtHandle {",
+            "    return this.#secret;",
+            "  }",
+            "  setSecret(next: ExtHandle): void {",
+            "    this.#secret = next;",
+            "  }",
+            "}",
+            "",
+            "export function run(flag: boolean): void {",
+            "  const ext1 = createHandle();",
+            "  const ext2 = createHandle();",
+            "  const wrapped = wrapHandle(ext1);",
+            "  const vault = new Vault(ext1);",
+            "  const paramOut = vault.paramHandle;",
+            "  const secretBefore = vault.secret;",
+            "  let capturedRead: ExtHandle | undefined;",
+            "  const runCb = () => {",
+            "    capturedRead = vault.secret;",
+            "    return capturedRead;",
+            "  };",
+            "  const fromClosure = runCb();",
+            "  vault.setSecret(ext2);",
+            "  const secretAfter = vault.secret;",
+            "  const numLit = 42;",
+            "  const nullVal = null;",
+            "  const nonInstCall = checkFlag(ext1);",
+            "  const unmodeled = missingSummary();",
+            "  const branchJoin = flag ? ext1 : ext2;",
+            "  void [wrapped, paramOut, secretBefore, fromClosure, secretAfter, numLit, nullVal, nonInstCall, unmodeled, branchJoin];",
+            "}",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const varDecls = await ctx.findSyntax({
+            files: ["src/app.ts"],
+            kinds: ["VariableDeclaration"],
+          });
+          const names = [
+            "ext1",
+            "ext2",
+            "wrapped",
+            "paramOut",
+            "secretBefore",
+            "fromClosure",
+            "secretAfter",
+            "numLit",
+            "nullVal",
+            "nonInstCall",
+            "unmodeled",
+            "branchJoin",
+          ];
+          const targets = names.map((name) => {
+            const node = varDecls.find((d) => d.text.startsWith(`${name} =`));
+            assert.ok(node?.initializer, `Missing variable ${name}`);
+            return node.initializer;
+          });
+
+          const resolved = await ctx.resolveInstances(targets);
+          const byName = new Map<string, InstanceResolutionResult>();
+          for (const [idx, row] of resolved.entries()) {
+            byName.set(names[idx]!, row);
+          }
+
+          const ext1 = byName.get("ext1")!;
+          const ext2 = byName.get("ext2")!;
+          const wrapped = byName.get("wrapped")!;
+          const paramOut = byName.get("paramOut")!;
+          const secretBefore = byName.get("secretBefore")!;
+          const fromClosure = byName.get("fromClosure")!;
+          const secretAfter = byName.get("secretAfter")!;
+          const numLit = byName.get("numLit")!;
+          const nullVal = byName.get("nullVal")!;
+          const nonInstCall = byName.get("nonInstCall")!;
+          const unmodeled = byName.get("unmodeled")!;
+          const branchJoin = byName.get("branchJoin")!;
+
+          assert.equal(ext1.status, "proved");
+          assert.equal(ext2.status, "proved");
+          assert.equal(wrapped.status, "proved");
+          assert.equal(paramOut.status, "proved");
+          assert.equal(secretBefore.status, "proved");
+          assert.equal(fromClosure.status, "proved");
+          assert.equal(secretAfter.status, "proved");
+
+          assert.ok(ext1.instance && ext2.instance && wrapped.instance);
+          assert.equal(isSameInstance(ext1.instance, ext2.instance), false);
+          assert.equal(isSameInstance(ext1.instance, wrapped.instance), true);
+          assert.equal(isSameInstance(ext1.instance, paramOut.instance), true);
+          assert.ok(secretBefore.instance && fromClosure.instance);
+          assert.equal(
+            isSameInstance(secretBefore.instance, fromClosure.instance),
+            true,
+          );
+          assert.equal(
+            isSameInstance(secretBefore.instance, ext1.instance),
+            false,
+          );
+          assert.equal(
+            isSameInstance(secretAfter.instance, ext2.instance),
+            true,
+          );
+
+          assert.equal(numLit.status, "disproved");
+          assert.ok(numLit.evidence.length > 0);
+          assert.equal(nullVal.status, "disproved");
+          assert.equal(nonInstCall.status, "disproved");
+          assert.ok(
+            nonInstCall.evidence.some(
+              (e) =>
+                e.kind === "summary" &&
+                e.summaryId === "local-instance-summaries",
+            ),
+          );
+
+          assert.equal(unmodeled.status, "inconclusive");
+          assert.ok(
+            unmodeled.gaps.some((g) => g.kind === "missing-behavior-summary"),
+          );
+
+          assert.equal(branchJoin.status, "proved");
+          assert.equal(branchJoin.instance, null);
+          assert.equal(branchJoin.instances.length, 2);
+          assert.ok(
+            branchJoin.instances.some((i) =>
+              isSameInstance(i.ref, ext1.instance),
+            ),
+          );
+          assert.ok(
+            branchJoin.instances.some((i) =>
+              isSameInstance(i.ref, ext2.instance),
+            ),
           );
         } finally {
           await session.close();
@@ -601,19 +912,32 @@ void describe("tssae instance identity", () => {
             lookupFiles: ["src/app.ts"],
           });
           const [full] = await ctx.resolveInstances([valueParam.ref]);
-          scopedLocations = scoped!.instances
-            .map((instance) => instance.allocationLocation?.file ?? "")
-            .toSorted();
-          fullLocations = full!.instances
-            .map((instance) => instance.allocationLocation?.file ?? "")
-            .toSorted();
+          assert.equal(scoped?.status, "proved");
+          assert.equal(full?.status, "proved");
+          scopedLocations =
+            scoped?.status === "proved"
+              ? scoped.instances
+                  .map((instance) => instance.allocationLocation?.file ?? "")
+                  .toSorted()
+              : [];
+          fullLocations =
+            full?.status === "proved"
+              ? full.instances
+                  .map((instance) => instance.allocationLocation?.file ?? "")
+                  .toSorted()
+              : [];
 
           const [scopedFactory] = await ctx.resolveInstances(
             [factoryCall.ref],
             { lookupFiles: ["src/app.ts"] },
           );
           const [fullFactory] = await ctx.resolveInstances([factoryCall.ref]);
-          assert.ok(scopedFactory?.instance && fullFactory?.instance);
+          assert.ok(
+            scopedFactory?.status === "proved" &&
+              fullFactory?.status === "proved" &&
+              scopedFactory.instance !== null &&
+              fullFactory.instance !== null,
+          );
           assert.equal(
             isSameInstance(scopedFactory.instance, fullFactory.instance),
             true,

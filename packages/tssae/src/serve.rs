@@ -33,7 +33,8 @@ use tssae_tsrs_boundary::{
 use crate::calls_values::ProjectCallGraph;
 use crate::cfg::{EvidenceItem, FunctionCfg, GapItem};
 use crate::comments::{ScannedComment, scan_snapshot_comments};
-use crate::instance_identity::{FieldWriteIndex, InstanceHandleData};
+use crate::instance_identity::FieldWriteIndex;
+use crate::ir_instances::InstanceHandleData;
 use crate::native_adapter::{
     NativeAdapterObservation, NativeAdapterPackageInput, NativeAdapterRegistry, NativeAdapterStatus,
 };

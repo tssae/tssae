@@ -13,10 +13,12 @@ use tsrs_checker::{Signature, TypeFlags};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
 
+use tssae_tsrs_boundary::{FacadeImplementationOutcome, is_first_party_source_file};
+
 use crate::cfg::{EvidenceItem, GapItem, resolve_enclosing_function};
 use crate::package_impl::{
-    PackageImplCache, PackageImplLookup, ResolvedImplTargetPayload, check_call_missing_package_gap,
-    resolve_impl_for_call_target,
+    ResolvedImplTargetPayload, check_call_missing_package_gap, resolve_first_party_for_call_target,
+    to_resolved_impl_payload,
 };
 use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{SourceLocation, node_location, slice_source_text};
@@ -971,7 +973,8 @@ pub fn run_callees_of(
         call_nodes.push((handle_id.clone(), node));
     }
 
-    let cache = snapshot.package_impl_cache.clone();
+    let workspace_programs = snapshot.workspace_programs();
+    let sourcemap_cache = snapshot.sourcemap_cache.clone();
     let cwd = snapshot.cwd.clone();
     let mut rows = Vec::with_capacity(call_nodes.len());
     for (call_id, call_node) in call_nodes {
@@ -984,75 +987,58 @@ pub fn run_callees_of(
 
         for target in outcome.targets {
             let decl_ref = snapshot.alloc_declaration(project_id, target.decl_node, target.symbol);
-            let is_decl_only_node = target.fn_node.is_none_or(|f| f.body().is_none())
-                || get_source_file_of_node(target.decl_node)
-                    .is_some_and(|sf| sf.is_declaration_file());
+            let is_first_party_body = target.fn_node.is_some_and(|f| f.body().is_some())
+                && get_source_file_of_node(target.decl_node).is_some_and(|sf| {
+                    !sf.is_declaration_file() && is_first_party_source_file(&cwd, program, sf)
+                });
 
-            let (effective_fn, implementation) = if is_decl_only_node {
-                match resolve_impl_for_call_target(
-                    &cache,
-                    &cwd,
-                    program,
-                    checker,
-                    call_node,
-                    Some(target.decl_node),
-                    target.fn_node,
-                ) {
-                    PackageImplLookup::ResolvedExternal { fn_node, info, .. }
-                    | PackageImplLookup::SourceBody { fn_node, info } => {
+            let impl_outcome = resolve_first_party_for_call_target(
+                &cwd,
+                program,
+                checker,
+                &workspace_programs,
+                &sourcemap_cache,
+                Some(target.decl_node),
+                call_node,
+            );
+
+            let (effective_fn, implementation) = match impl_outcome {
+                FacadeImplementationOutcome::Resolved(impl_target) => {
+                    let resolved_fn = impl_target.fn_node.or({
+                        if is_first_party_body {
+                            target.fn_node
+                        } else {
+                            None
+                        }
+                    });
+                    if !is_first_party_body {
                         evidence.push(EvidenceItem::simple(
                             "source",
                             format!(
-                                "Resolved {} implementation '{}' for '{}'",
-                                info.resolution_mode,
-                                info.file,
+                                "Resolved first-party implementation '{}' for '{}'",
+                                impl_target.file,
                                 target.name.as_deref().unwrap_or("<anonymous>")
                             ),
-                            info.location.clone(),
+                            Some(impl_target.location.clone()),
                         ));
-                        (Some(fn_node), Some(info))
                     }
-                    PackageImplLookup::DeclarationOnly { message, .. } => {
-                        outcome.gaps.push(GapItem {
-                            kind: "missing-package-implementation",
-                            message,
-                            at: node_location_rel(&cwd, call_node),
-                        });
-                        (target.fn_node, None)
-                    }
-                    PackageImplLookup::MissingPackage { message, .. } => {
-                        outcome.gaps.push(GapItem {
-                            kind: "missing-package",
-                            message,
-                            at: node_location_rel(&cwd, call_node),
-                        });
-                        (target.fn_node, None)
-                    }
-                    PackageImplLookup::Ambiguous { message, .. } => {
-                        outcome.gaps.push(GapItem {
-                            kind: "ambiguous-package-implementation",
-                            message,
-                            at: node_location_rel(&cwd, call_node),
-                        });
-                        (target.fn_node, None)
-                    }
-                    PackageImplLookup::Unimplemented { .. } => (target.fn_node, None),
+                    let info = to_resolved_impl_payload(snapshot, project_id, impl_target);
+                    (resolved_fn, Some(info))
                 }
-            } else {
-                let impl_info = match resolve_impl_for_call_target(
-                    &cache,
-                    &cwd,
-                    program,
-                    checker,
-                    call_node,
-                    Some(target.decl_node),
-                    target.fn_node,
-                ) {
-                    PackageImplLookup::SourceBody { info, .. }
-                    | PackageImplLookup::ResolvedExternal { info, .. } => Some(info),
-                    _ => None,
-                };
-                (target.fn_node, impl_info)
+                FacadeImplementationOutcome::External { .. } => (None, None),
+                FacadeImplementationOutcome::Inconclusive { mut gaps, .. } => {
+                    if !is_first_party_body {
+                        outcome.gaps.append(&mut gaps);
+                    }
+                    (
+                        if is_first_party_body {
+                            target.fn_node
+                        } else {
+                            None
+                        },
+                        None,
+                    )
+                }
             };
 
             let parameter_bindings =
@@ -1497,7 +1483,6 @@ struct PropagationRunner<'a> {
     lookup_files: Option<Vec<String>>,
     include_member_access: bool,
     call_graph: Option<Arc<ProjectCallGraph>>,
-    package_impl_cache: PackageImplCache,
     all_gaps: Vec<GapItem>,
     target_endpoints: Vec<(String, EndpointSpec)>,
     found_paths: Vec<Vec<ValuePropagationPathPayload>>,
@@ -1505,10 +1490,6 @@ struct PropagationRunner<'a> {
 }
 
 impl<'a> PropagationRunner<'a> {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Initializes propagation runner state for a batch of endpoints."
-    )]
     fn new(
         snapshot: &'a mut crate::serve::SnapshotState,
         project_id: &'a str,
@@ -1516,7 +1497,6 @@ impl<'a> PropagationRunner<'a> {
         checker: &'a mut CheckerHandle,
         lookup_files: Option<&[String]>,
         include_member_access: bool,
-        package_impl_cache: PackageImplCache,
         target_endpoints: Vec<(String, EndpointSpec)>,
     ) -> Self {
         let n = target_endpoints.len();
@@ -1530,7 +1510,6 @@ impl<'a> PropagationRunner<'a> {
             lookup_files: lookup_files.map(<[String]>::to_vec),
             include_member_access,
             call_graph: None,
-            package_impl_cache,
             all_gaps: Vec::new(),
             target_endpoints,
             found_paths: (0..n).map(|_| Vec::new()).collect(),
@@ -2585,42 +2564,61 @@ impl<'a> PropagationRunner<'a> {
         }
 
         for target in resolution.targets {
-            let resolved_impl_fn = if let Some(fn_node) = target.fn_node
-                && fn_node.body().is_some()
-                && !get_source_file_of_node(fn_node).is_some_and(|sf| sf.is_declaration_file())
-            {
-                Ok(fn_node)
+            let is_first_party_body = target.fn_node.is_some_and(|fn_node| {
+                fn_node.body().is_some()
+                    && get_source_file_of_node(fn_node).is_some_and(|sf| {
+                        !sf.is_declaration_file()
+                            && is_first_party_source_file(&self.cwd, self.program, sf)
+                    })
+            });
+            let resolved_impl_fn = if is_first_party_body {
+                Ok(target.fn_node.expect("checked has first-party body"))
             } else if target.is_default_library && !return_used {
                 continue;
             } else {
-                match resolve_impl_for_call_target(
-                    &self.package_impl_cache,
+                let workspace_programs = self.snapshot.workspace_programs();
+                let sourcemap_cache = self.snapshot.sourcemap_cache.clone();
+                match resolve_first_party_for_call_target(
                     &self.cwd,
                     self.program,
                     self.checker,
-                    call_node,
+                    &workspace_programs,
+                    &sourcemap_cache,
                     Some(target.decl_node),
-                    target.fn_node,
+                    call_node,
                 ) {
-                    PackageImplLookup::ResolvedExternal { fn_node, .. }
-                    | PackageImplLookup::SourceBody { fn_node, .. } => Ok(fn_node),
-                    PackageImplLookup::MissingPackage { message, .. } => {
-                        Err(("missing-package", message))
+                    FacadeImplementationOutcome::Resolved(impl_target) => {
+                        impl_target.fn_node.ok_or_else(|| {
+                            let name = target.name.as_deref().unwrap_or("<callee>");
+                            (
+                                "missing-function-body",
+                                format!(
+                                    "Callee '{name}' has no implementation body; value propagation across this call cannot be verified."
+                                ),
+                            )
+                        })
                     }
-                    PackageImplLookup::Ambiguous { message, .. } => {
-                        Err(("ambiguous-package-implementation", message))
-                    }
-                    PackageImplLookup::DeclarationOnly { message, .. } => {
-                        Err(("missing-function-body", message))
-                    }
-                    PackageImplLookup::Unimplemented { .. } => {
+                    FacadeImplementationOutcome::External { .. } => {
                         let name = target.name.as_deref().unwrap_or("<callee>");
                         Err((
                             "missing-function-body",
                             format!(
-                                "Callee '{name}' has no implementation body; value propagation across this call cannot be verified."
+                                "External callee '{name}' has no local implementation source; value propagation across this call cannot be verified."
                             ),
                         ))
+                    }
+                    FacadeImplementationOutcome::Inconclusive { gaps, .. } => {
+                        if let Some(gap) = gaps.into_iter().next() {
+                            Err((gap.kind, gap.message))
+                        } else {
+                            let name = target.name.as_deref().unwrap_or("<callee>");
+                            Err((
+                                "missing-function-body",
+                                format!(
+                                    "Callee '{name}' has no implementation body; value propagation across this call cannot be verified."
+                                ),
+                            ))
+                        }
                     }
                 }
             };
@@ -2811,7 +2809,6 @@ pub fn run_value_propagation(
         to_specs.push((handle_id.clone(), spec));
     }
 
-    let package_impl_cache = snapshot.package_impl_cache.clone();
     let mut runner = PropagationRunner::new(
         snapshot,
         project_id,
@@ -2819,7 +2816,6 @@ pub fn run_value_propagation(
         checker,
         lookup_files,
         include_member_access,
-        package_impl_cache,
         to_specs,
     );
 

@@ -30,6 +30,8 @@ export {
   locationsOverlap,
   type CleanupCoverageEvent,
   type EngineCallIoMetrics,
+  type EngineIrCacheMetrics,
+  type EngineLoweringMetrics,
   type EngineRpcMetrics,
   type EngineStepMetrics,
   type FactExplainEvent,

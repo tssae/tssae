@@ -8,7 +8,7 @@ use tsrs_core::P;
 use tsrs_scanner::{
     get_ecma_line_and_utf16_character_of_position, get_ecma_line_starts, get_token_pos_of_node,
 };
-use tssae_analysis::ir::IrScopeKind;
+use tssae_analysis::ir::{IrScopeKind, ScopeCatalogEntry, scope_ir_id};
 use tssae_common::{DiagnosticLocation, FileId, LocalSyntaxId, SyntaxCatalog, SyntaxId};
 
 /// Error raised when a syntax view query receives invalid range or kind parameters.
@@ -397,6 +397,145 @@ impl<'a> SyntaxView<'a> {
         rel_file: &str,
     ) -> Vec<ScannedComment> {
         scan_source_file_comments(sf, rel_file)
+    }
+}
+
+/// Session-wide registry assigning monotonically increasing [`FileId`] handles to normalized paths.
+#[derive(Default, Debug)]
+pub struct FileIdRegistry {
+    paths: Vec<String>,
+    path_to_id: FxHashMap<String, FileId>,
+}
+
+impl FileIdRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, rel_file: &str) -> FileId {
+        if let Some(&id) = self.path_to_id.get(rel_file) {
+            return id;
+        }
+        let id = FileId(u32::try_from(self.paths.len()).unwrap_or(u32::MAX));
+        self.paths.push(rel_file.to_string());
+        self.path_to_id.insert(rel_file.to_string(), id);
+        id
+    }
+
+    #[must_use]
+    pub fn path(&self, file_id: FileId) -> Option<&str> {
+        self.paths
+            .get(usize::try_from(file_id.0).ok()?)
+            .map(String::as_str)
+    }
+}
+
+/// Snapshot-scoped deterministic pre-order AST index for a single `SourceFile`.
+///
+/// Rebuilding this index for an unchanged `SourceFile` yields identical [`LocalSyntaxId`]s and
+/// scope slots without storing any `P<Node>` pointers inside the persistent `SnapshotIrCache`.
+#[derive(Debug)]
+pub struct FileSyntaxIndex {
+    pub file_id: FileId,
+    pub rel_file: String,
+    pub source_file_addr: usize,
+    pub node_to_local: FxHashMap<P<Node>, LocalSyntaxId>,
+    pub local_to_node: Vec<P<Node>>,
+    pub scope_catalog: Vec<ScopeCatalogEntry>,
+}
+
+impl FileSyntaxIndex {
+    #[must_use]
+    pub fn build(file_id: FileId, rel_file: String, sf: P<SourceFile>) -> Self {
+        fn visit(
+            file_id: FileId,
+            node: P<Node>,
+            node_to_local: &mut FxHashMap<P<Node>, LocalSyntaxId>,
+            local_to_node: &mut Vec<P<Node>>,
+            scope_catalog: &mut Vec<ScopeCatalogEntry>,
+        ) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = node_to_local.entry(node) {
+                let local = LocalSyntaxId(u32::try_from(local_to_node.len()).unwrap_or(u32::MAX));
+                slot.insert(local);
+                local_to_node.push(node);
+
+                if let Some(kind) = classify_catalog_scope_kind(node.kind()) {
+                    let local_scope = u32::try_from(scope_catalog.len()).unwrap_or(u32::MAX);
+                    let root_syntax = SyntaxId::from_parts(file_id, local);
+                    scope_catalog.push(ScopeCatalogEntry {
+                        id: scope_ir_id(file_id, local_scope),
+                        local_syntax: local,
+                        root_syntax,
+                        kind,
+                    });
+                }
+            }
+            node.for_each_child(&mut |child| {
+                visit(file_id, child, node_to_local, local_to_node, scope_catalog);
+                false
+            });
+        }
+
+        let mut node_to_local = FxHashMap::default();
+        let mut local_to_node = Vec::new();
+        let mut scope_catalog = Vec::new();
+        let source_file_addr = std::ptr::from_ref(&*sf) as usize;
+
+        visit(
+            file_id,
+            sf.as_node(),
+            &mut node_to_local,
+            &mut local_to_node,
+            &mut scope_catalog,
+        );
+
+        Self {
+            file_id,
+            rel_file,
+            source_file_addr,
+            node_to_local,
+            local_to_node,
+            scope_catalog,
+        }
+    }
+
+    #[must_use]
+    pub fn syntax_id_for_node(&self, node: P<Node>) -> Option<SyntaxId> {
+        self.node_to_local
+            .get(&node)
+            .copied()
+            .map(|local| SyntaxId::from_parts(self.file_id, local))
+    }
+
+    #[must_use]
+    pub fn local_id_for_node(&self, node: P<Node>) -> Option<LocalSyntaxId> {
+        self.node_to_local.get(&node).copied()
+    }
+
+    #[must_use]
+    pub fn node_for_syntax_id(&self, syntax: SyntaxId) -> Option<P<Node>> {
+        if syntax.file_id() != self.file_id {
+            return None;
+        }
+        self.local_to_node
+            .get(usize::try_from(syntax.local_id().0).ok()?)
+            .copied()
+    }
+}
+
+const fn classify_catalog_scope_kind(kind: Kind) -> Option<IrScopeKind> {
+    match kind {
+        Kind::FunctionDeclaration | Kind::FunctionExpression | Kind::ArrowFunction => {
+            Some(IrScopeKind::Function)
+        }
+        Kind::MethodDeclaration => Some(IrScopeKind::Method),
+        Kind::Constructor => Some(IrScopeKind::Constructor),
+        Kind::GetAccessor => Some(IrScopeKind::Getter),
+        Kind::SetAccessor => Some(IrScopeKind::Setter),
+        Kind::ClassStaticBlockDeclaration => Some(IrScopeKind::ClassStaticInit),
+        Kind::SourceFile => Some(IrScopeKind::ModuleTopLevel),
+        _ => None,
     }
 }
 

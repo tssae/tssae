@@ -59,6 +59,25 @@ pub struct EngineProviderExtractionStats {
     pub candidates: usize,
 }
 
+/// Engine-side IR lowering summary counters for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineLoweringMetrics {
+    pub functions_lowered: usize,
+    pub vertices_created: usize,
+    pub duration_ms: f64,
+}
+
+/// Engine-side IR cache hit/miss and cross-snapshot file reuse/invalidation counters.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineIrCacheMetrics {
+    pub function_hits: usize,
+    pub function_misses: usize,
+    pub files_reused: usize,
+    pub files_invalidated: usize,
+}
+
 /// Engine-side metrics attached to an RPC response only when observation is enabled.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +88,8 @@ pub struct EngineRpcMetrics {
     pub dropped_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<EngineStepMetrics>,
+    pub lowering: EngineLoweringMetrics,
+    pub ir_cache: EngineIrCacheMetrics,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
@@ -85,6 +106,8 @@ pub struct ObserveCollector {
     truncated: bool,
     dropped_count: usize,
     steps: Vec<EngineStepMetrics>,
+    lowering: EngineLoweringMetrics,
+    ir_cache: EngineIrCacheMetrics,
     provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
 }
 
@@ -108,6 +131,8 @@ impl ObserveCollector {
             truncated: false,
             dropped_count: 0,
             steps: Vec::new(),
+            lowering: EngineLoweringMetrics::default(),
+            ir_cache: EngineIrCacheMetrics::default(),
             provider_extractions: BTreeMap::new(),
         }
     }
@@ -134,6 +159,36 @@ impl ObserveCollector {
     pub fn add_encode_ms(&mut self, duration_ms: f64) {
         if self.is_active() {
             self.encode_ms += duration_ms;
+        }
+    }
+
+    pub const fn record_ir_cache_hit(&mut self) {
+        if self.is_active() {
+            self.ir_cache.function_hits += 1;
+        }
+    }
+
+    pub fn record_ir_lowering(
+        &mut self,
+        vertices_created: usize,
+        duration_ms: f64,
+        succeeded: bool,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        self.ir_cache.function_misses += 1;
+        if succeeded {
+            self.lowering.functions_lowered += 1;
+            self.lowering.vertices_created += vertices_created;
+        }
+        self.lowering.duration_ms += duration_ms;
+    }
+
+    pub const fn record_ir_file_reuse(&mut self, files_reused: usize, files_invalidated: usize) {
+        if self.is_active() {
+            self.ir_cache.files_reused += files_reused;
+            self.ir_cache.files_invalidated += files_invalidated;
         }
     }
 
@@ -258,6 +313,8 @@ impl ObserveCollector {
             truncated: self.truncated,
             dropped_count: self.dropped_count,
             steps: self.steps,
+            lowering: self.lowering,
+            ir_cache: self.ir_cache,
             provider_extractions: self.provider_extractions,
         })
     }

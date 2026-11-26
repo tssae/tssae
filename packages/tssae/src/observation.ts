@@ -28,12 +28,27 @@ export type EngineStepMetrics = {
   }[];
 };
 
+export type EngineLoweringMetrics = {
+  readonly functionsLowered: number;
+  readonly verticesCreated: number;
+  readonly durationMs: number;
+};
+
+export type EngineIrCacheMetrics = {
+  readonly functionHits: number;
+  readonly functionMisses: number;
+  readonly filesReused: number;
+  readonly filesInvalidated: number;
+};
+
 export type EngineRpcMetrics = {
   readonly durationMs: number;
   readonly encodeMs: number;
   readonly truncated: boolean;
   readonly droppedCount: number;
   readonly steps?: readonly EngineStepMetrics[];
+  readonly lowering?: EngineLoweringMetrics;
+  readonly irCache?: EngineIrCacheMetrics;
   readonly providerExtractions?: Readonly<
     Record<string, EngineProviderExtractionStats>
   >;

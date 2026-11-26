@@ -63,6 +63,8 @@ export type DeclarationProjectionSelection = {
   readonly location?: true;
   readonly syntax?: true;
   readonly isExternal?: true;
+  readonly packageName?: true;
+  readonly exportName?: true;
   readonly declarations?: true;
 };
 
@@ -73,6 +75,8 @@ export type FullDeclarationProjectionFields = {
   readonly location: DiagnosticLocation | null;
   readonly syntax: SyntaxRef | null;
   readonly isExternal: boolean;
+  readonly packageName: string | null;
+  readonly exportName: string | null;
   readonly declarations: readonly DeclarationRef[];
 };
 
@@ -268,6 +272,8 @@ type RawDeclarationRow = {
   readonly location?: DiagnosticLocation | null;
   readonly syntax?: string | null;
   readonly isExternal?: boolean;
+  readonly packageName?: string | null;
+  readonly exportName?: string | null;
   readonly declarations?: readonly string[];
 };
 
@@ -588,6 +594,12 @@ export function createProjectionQueries(deps: {
         }
         if (select?.isExternal === true) {
           row.isExternal = raw.isExternal ?? false;
+        }
+        if (select?.packageName === true) {
+          row.packageName = raw.packageName ?? null;
+        }
+        if (select?.exportName === true) {
+          row.exportName = raw.exportName ?? null;
         }
         if (select?.declarations === true) {
           row.declarations = (raw.declarations ?? []).map((id) =>

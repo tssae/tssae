@@ -32,9 +32,6 @@ use tssae_tsrs_boundary::{
 
 use crate::comments::{ScannedComment, scan_snapshot_comments};
 use crate::ir_instances::InstanceHandleData;
-use crate::native_adapter::{
-    NativeAdapterObservation, NativeAdapterPackageInput, NativeAdapterRegistry, NativeAdapterStatus,
-};
 use crate::observe::{EngineRpcMetrics, ObserveCollector, ObserveRequestConfig, elapsed_ms};
 use crate::projection::{QueryStep, execute_query_batch};
 pub use crate::projection::{SourceLocation, node_location};
@@ -106,8 +103,6 @@ impl RpcErr {
 struct SnapshotOpenParams {
     cwd: String,
     entries: Vec<String>,
-    #[serde(default, rename = "nativeAdapters")]
-    native_adapters: Vec<NativeAdapterPackageInput>,
 }
 
 #[derive(Deserialize)]
@@ -122,8 +117,6 @@ struct SnapshotUpdateParams {
     created: Vec<String>,
     #[serde(default)]
     deleted: Vec<String>,
-    #[serde(default, rename = "nativeAdapters")]
-    native_adapters: Option<Vec<NativeAdapterPackageInput>>,
 }
 
 #[derive(Deserialize)]
@@ -184,7 +177,6 @@ struct SnapshotOpenResult {
     snapshot_digest: String,
     projects: Vec<ProjectSummary>,
     workspace_source_files: Vec<String>,
-    native_adapters: Vec<NativeAdapterObservation>,
     resolved_packages: Vec<ResolvedPackagePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     engine_rss_bytes: Option<u64>,
@@ -197,7 +189,6 @@ struct SnapshotUpdateResult {
     snapshot_digest: String,
     projects: Vec<ProjectSummary>,
     workspace_source_files: Vec<String>,
-    native_adapters: Vec<NativeAdapterObservation>,
     resolved_packages: Vec<ResolvedPackagePayload>,
     recomputed_projects: Vec<String>,
     reused_projects: Vec<String>,
@@ -356,8 +347,6 @@ pub struct SnapshotState {
     pub symbol_registry: tssae_tsrs_boundary::SymbolRegistry,
     pub ir_call_graph_cache: FxHashMap<String, Arc<tssae_analysis::call_resolution::IrCallGraph>>,
     pub sourcemap_cache: SourceMapCache,
-    pub native_adapters: NativeAdapterRegistry,
-    pub native_fact_cache: crate::native_adapter::NativeFactCache,
     pub resolved_package_versions: FxHashMap<String, Option<String>>,
     pub summary_config: SummaryConfigPayload,
     pub summary_index: Arc<BehaviorSummaryIndex>,
@@ -825,10 +814,6 @@ impl EngineServer {
     }
 
     fn open_snapshot(&mut self, params: &SnapshotOpenParams) -> Result<SnapshotOpenResult, RpcErr> {
-        let native_adapters =
-            crate::native_adapter::load_configured_adapters(&params.native_adapters)?;
-        let native_adapter_observations =
-            crate::native_adapter::observe_registry(&native_adapters, NativeAdapterStatus::Loaded);
         let cwd = normalize_path(&params.cwd);
         let session = self.ensure_session(&cwd);
         let opened = open_projects_snapshot(&session, &cwd, &params.entries)
@@ -863,8 +848,6 @@ impl EngineServer {
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
-                native_adapters,
-                native_fact_cache: crate::native_adapter::NativeFactCache::default(),
                 resolved_package_versions,
                 summary_config,
                 summary_index,
@@ -877,7 +860,6 @@ impl EngineServer {
             snapshot_digest: opened.snapshot_digest,
             projects: opened.summaries,
             workspace_source_files: opened.workspace_source_files,
-            native_adapters: native_adapter_observations,
             resolved_packages,
             engine_rss_bytes: read_process_rss_bytes(),
         })
@@ -926,7 +908,6 @@ impl EngineServer {
             old_opened_configs,
             old_snapshot_data,
             old_project_ids,
-            old_native_adapters,
             old_summary_config,
         ) = {
             let Some(old_state) = self.snapshots.get(&params.snapshot_id) else {
@@ -942,20 +923,9 @@ impl EngineServer {
                 old_state.opened_configs.clone(),
                 Arc::clone(&old_state.snapshot_data),
                 old_state.project_ids.clone(),
-                old_state.native_adapters.clone(),
                 old_state.summary_config.clone(),
             )
         };
-
-        let (native_adapters, native_adapter_status) = match params.native_adapters.as_deref() {
-            Some(inputs) => (
-                crate::native_adapter::load_configured_adapters(inputs)?,
-                NativeAdapterStatus::Loaded,
-            ),
-            None => (old_native_adapters, NativeAdapterStatus::Reused),
-        };
-        let native_adapter_observations =
-            crate::native_adapter::observe_registry(&native_adapters, native_adapter_status);
 
         let updated = update_projects_snapshot(
             &session,
@@ -1019,8 +989,6 @@ impl EngineServer {
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
-                native_adapters,
-                native_fact_cache: crate::native_adapter::NativeFactCache::default(),
                 resolved_package_versions,
                 summary_config: old_summary_config,
                 summary_index,
@@ -1033,7 +1001,6 @@ impl EngineServer {
             snapshot_digest: opened.snapshot_digest,
             projects: opened.summaries,
             workspace_source_files: opened.workspace_source_files,
-            native_adapters: native_adapter_observations,
             resolved_packages,
             recomputed_projects: updated.recomputed_projects,
             reused_projects: updated.reused_projects,

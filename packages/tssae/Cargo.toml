@@ -8,7 +8,6 @@ publish = false
 tssae-common = { path = "crates/tssae-common" }
 tssae-analysis = { path = "crates/tssae-analysis" }
 tssae-tsrs-boundary = { path = "crates/tssae-tsrs-boundary" }
-tssae-adapter-api = { path = "../adapter-api" }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

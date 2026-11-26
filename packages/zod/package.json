@@ -1,0 +1,54 @@
+{
+  "name": "@tssae/zod",
+  "version": "0.1.0",
+  "description": "Pure TypeScript Zod domain extraction and shared validator contracts built on tssae.",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./package.json": "./package.json"
+    },
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false",
+    "format:check": "oxfmt --list-different .",
+    "format:write": "oxfmt --write .",
+    "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules .",
+    "lint:fix": "oxlint --format=unix --ignore-pattern node_modules . --fix",
+    "test": "node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
+  },
+  "dependencies": {
+    "tssae": "workspace:*"
+  },
+  "devDependencies": {
+    "@tssae/test-hosts": "workspace:*",
+    "@tssae/tooling-config": "workspace:*",
+    "@types/node": "catalog:",
+    "drizzle-orm": "catalog:",
+    "drizzle-zod": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "typescript-7": "catalog:",
+    "zod": "catalog:"
+  },
+  "engines": {
+    "node": "^26.13.1"
+  }
+}

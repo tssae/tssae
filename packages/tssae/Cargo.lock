@@ -30,12 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "cfg-if"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -209,16 +203,6 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
 
 [[package]]
 name = "linux-raw-sys"
@@ -959,15 +943,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tssae-adapter-api"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "tssae-analysis"
 version = "0.1.0"
 dependencies = [
@@ -1004,7 +979,6 @@ dependencies = [
  "tsrs_project",
  "tsrs_scanner",
  "tsrs_vfs",
- "tssae-adapter-api",
  "tssae-analysis",
  "tssae-common",
  "tssae-tsrs-boundary",

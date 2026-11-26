@@ -1,16 +1,4 @@
 export {
-  buildExternalRustAdapter,
-  packAdapterApiCrate,
-  packExternalAdapterPackage,
-  type BuildExternalRustAdapterOptions,
-  type BuiltExternalRustAdapter,
-  type ExternalRustAdapterVariant,
-  type PackAdapterApiCrateOptions,
-  type PackExternalAdapterPackageOptions,
-  type PackedAdapterApiCrate,
-  type PackedExternalAdapterPackage,
-} from "./external-rust-adapter.ts";
-export {
   CORE_TSSAE_PACKAGES,
   packWorkspaceArtifacts,
   type PackedArtifact,
@@ -48,11 +36,8 @@ export {
 export type { PackageManager } from "./types.ts";
 export {
   verifyHostArtifactResolution,
-  verifyInstalledNativeLibrary,
   type HostResolutionAudit,
-  type VerifiedNativeLibrary,
   type VerifyHostResolutionOptions,
-  type VerifyInstalledNativeLibraryOptions,
 } from "./verify.ts";
 export {
   prepareBaselineArtifact,

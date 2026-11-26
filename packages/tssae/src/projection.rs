@@ -9,13 +9,13 @@ use tsrs_core::{
 };
 pub use tssae_common::SourceLocation;
 use tssae_common::{GapItem, UnknownReason};
+pub use tssae_tsrs_boundary::node_location;
 use tssae_tsrs_boundary::{
     FacadeCallProjection, FacadeCallSelect, FacadeDeclarationSelect, FacadeDeclarationTarget,
     FacadeInstantiatedParameter, FacadeParameterIndexSelection, FacadeSignatureSelect,
     FacadeTypeSelect, FacadeTypeSummary, FindSyntaxFilter, SemanticFacade, SourceRangeSpec,
     SyntaxLookupOptions, SyntaxView,
 };
-pub use tssae_tsrs_boundary::{node_location, safe_expression, safe_initializer};
 
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
 use crate::ir_effects::{
@@ -27,7 +27,6 @@ use crate::ir_instances::{
     run_resolve_instances,
 };
 use crate::ir_values::{ValuePropagationResultPayload, run_value_propagation};
-use crate::native_adapter;
 use crate::observe::{EngineStepDetail, ObserveCollector};
 use crate::serve::{
     BranchCoverageItem, BranchCoverageRequest, FunctionBranchesItem, HandlePayload, RpcErr,
@@ -193,20 +192,6 @@ pub enum QueryStep {
         #[serde(default, rename = "lookupFiles")]
         lookup_files: Option<Vec<String>>,
     },
-    ExtractFacts {
-        #[serde(rename = "factTypeId")]
-        fact_type_id: String,
-        #[serde(rename = "providerId")]
-        provider_id: String,
-        #[serde(default, rename = "reportProviderId")]
-        report_provider_id: Option<String>,
-        #[serde(default)]
-        targets: Option<Vec<String>>,
-        #[serde(default)]
-        condition: Option<Value>,
-        #[serde(default)]
-        explain: bool,
-    },
 }
 
 #[derive(Deserialize)]
@@ -248,6 +233,10 @@ pub struct DeclarationSelect {
     syntax: bool,
     #[serde(default)]
     is_external: bool,
+    #[serde(default)]
+    package_name: bool,
+    #[serde(default)]
+    export_name: bool,
     #[serde(default)]
     declarations: bool,
 }
@@ -453,14 +442,6 @@ enum StepResult {
     InstanceCleanup {
         items: Vec<InstanceCleanupScopeRow>,
     },
-    NativeFacts {
-        items: Vec<tssae_adapter_api::NativeContribution>,
-        additional_inputs: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        adapter_inputs: Vec<tssae_adapter_api::NativeAdapterInputAttribution>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        sub_queries: Vec<native_adapter::NativeSubQueryTrace>,
-    },
 }
 
 #[derive(Serialize)]
@@ -561,6 +542,10 @@ struct DeclarationRow {
     syntax: ProjectedField<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     is_external: Option<bool>,
+    #[serde(skip_serializing_if = "ProjectedField::is_omitted")]
+    package_name: ProjectedField<String>,
+    #[serde(skip_serializing_if = "ProjectedField::is_omitted")]
+    export_name: ProjectedField<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     declarations: Option<Vec<String>>,
 }
@@ -828,8 +813,7 @@ fn execute_step(
         | QueryStep::ProjectInstances { .. }
         | QueryStep::ResolveImplementations { .. }
         | QueryStep::CallEffects { .. }
-        | QueryStep::InstanceCleanup { .. }
-        | QueryStep::ExtractFacts { .. }) => execute_extended_step(
+        | QueryStep::InstanceCleanup { .. }) => execute_extended_step(
             snapshot, project_id, program, checker, other, step_start, observer,
         ),
     }
@@ -877,37 +861,6 @@ fn execute_extended_step(
                 Vec::new(),
             );
             Ok(StepResult::ResolveImplementations { items })
-        }
-        QueryStep::ExtractFacts {
-            fact_type_id,
-            provider_id,
-            report_provider_id,
-            targets,
-            condition,
-            explain,
-        } => {
-            let target_list = targets.as_deref().unwrap_or(&[]);
-            let outcome = native_adapter::extract(
-                snapshot,
-                project_id,
-                program,
-                checker,
-                &provider_id,
-                report_provider_id.as_deref(),
-                &fact_type_id,
-                target_list,
-                targets.is_some(),
-                condition.as_ref(),
-                explain,
-                step_start,
-                observer,
-            )?;
-            Ok(StepResult::NativeFacts {
-                items: outcome.output.contributions,
-                additional_inputs: outcome.output.additional_inputs,
-                adapter_inputs: outcome.output.adapter_inputs,
-                sub_queries: outcome.sub_queries,
-            })
         }
         other => execute_effects_step(
             snapshot, project_id, program, checker, other, step_start, observer,
@@ -1485,6 +1438,8 @@ fn run_resolve_declarations(
         kind: select.kind,
         location: select.location,
         is_external: select.is_external,
+        package_name: select.package_name,
+        export_name: select.export_name,
         declarations: select.declarations,
     };
 
@@ -1541,6 +1496,8 @@ fn run_resolve_declarations(
             location: ProjectedField::from_option(select.location, resolved.location),
             syntax,
             is_external: resolved.is_external,
+            package_name: ProjectedField::from_option(select.package_name, resolved.package_name),
+            export_name: ProjectedField::from_option(select.export_name, resolved.export_name),
             declarations,
         });
     }

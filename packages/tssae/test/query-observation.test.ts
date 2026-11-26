@@ -3,144 +3,26 @@ import { describe, it } from "node:test";
 
 import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
   defineSummaries,
   openProject,
   syntaxLocationOf,
   type CleanupCoverageEvent,
   type EngineCallIoMetrics,
-  type ExplainProviderEvaluation,
-  type FactExplainEvent,
   type Gap,
   type QueryCompletedEvent,
 } from "tssae";
 
-void describe("tssae query observation, local gaps, and explain hooks", () => {
-  void it("emits RPC metrics, query cache statuses, gaps, fact explain localGaps, cleanup paths, and syntaxLocationOf", async () => {
+void describe("tssae query observation, gaps, and explain hooks", () => {
+  void it("emits RPC metrics, query cache statuses, recordGaps(), and syntaxLocationOf", async () => {
     await withTempHost(
       { host: "sdk-queries/fact-providers-explain-gaps" },
       async (host) => {
         await host.typecheck();
 
-        const SourceSpecFact = defineFactType<
-          "syntax",
-          undefined,
-          { readonly sourceName: string }
-        >({
-          id: "ts.obs.source-spec",
-          subjectKind: "syntax",
-        });
-
-        const DerivedFact = defineFactType<
-          "syntax",
-          undefined,
-          { readonly consumerName: string }
-        >({
-          id: "ts.obs.derived",
-          subjectKind: "syntax",
-        });
-
-        const adapterA = defineAdapter({
-          id: "obs-adapter-a",
-          provides: [
-            defineFactProvider(SourceSpecFact, async (ctx, request) => {
-              const calls = await ctx.findSyntax({
-                files: ["src/source.ts"],
-                kinds: ["CallExpression"],
-              });
-              const specCall = calls.find((c) =>
-                c.text.startsWith("defineSpec("),
-              );
-              const dynamicCall = calls.find((c) =>
-                c.text.startsWith("dynamicSpec("),
-              );
-              if (!specCall || !dynamicCall) return [];
-              const gap: Gap = {
-                kind: "unresolved-field",
-                message: 'Field "couponCode" is dynamic.',
-                at: dynamicCall.location,
-              };
-              return [
-                {
-                  subject: specCall.ref,
-                  value: { sourceName: "order" },
-                  gaps: [gap],
-                  ...(request.explain
-                    ? {
-                        explainTrace: {
-                          localGaps: [
-                            {
-                              status: "unresolved" as const,
-                              factTypeId: SourceSpecFact.id,
-                              providerId: "obs-adapter-a",
-                              field: "couponCode",
-                              gap,
-                              subjectLocation: specCall.location,
-                            },
-                          ],
-                        },
-                      }
-                    : {}),
-                },
-              ];
-            }),
-          ],
-        });
-
-        const adapterB = defineAdapter({
-          id: "obs-adapter-b",
-          provides: [
-            defineFactProvider(DerivedFact, async (ctx, request) => {
-              const consumerCalls = await ctx.findSyntax({
-                files: ["src/consumer.ts"],
-                kinds: ["CallExpression"],
-              });
-              const target = consumerCalls.find((c) =>
-                c.text.startsWith("useSpec("),
-              );
-              if (!target) return [];
-              const upstream = await ctx.facts(SourceSpecFact);
-              const firstUpstream = upstream[0];
-              if (!firstUpstream) return [];
-              return [
-                {
-                  subject: target.ref,
-                  value: { consumerName: "derivedOrder" },
-                  basis: [firstUpstream],
-                  ...(request.explain
-                    ? {
-                        explainTrace: {
-                          localGaps: [
-                            {
-                              status: "resolved_by_override" as const,
-                              factTypeId: SourceSpecFact.id,
-                              providerId: "obs-adapter-a",
-                              field: "couponCode",
-                              gap: firstUpstream.gaps[0]!,
-                              resolvedBy: {
-                                providerId: "obs-adapter-b",
-                                operation: "extend",
-                                conclusion: "required",
-                                at: target.location,
-                              },
-                            },
-                          ],
-                        },
-                      }
-                    : {}),
-                },
-              ];
-            }),
-          ],
-        });
-
         const openMetrics: EngineCallIoMetrics[] = [];
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          adapters: [adapterA, adapterB],
           observe: { mode: "summary" },
           onRpcMetrics: (m) => {
             openMetrics.push(m);
@@ -159,8 +41,6 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
           const rpcMetrics: EngineCallIoMetrics[] = [];
           const queryEvents: QueryCompletedEvent[] = [];
           const recordedGaps: Gap[] = [];
-          const factExplains: FactExplainEvent[] = [];
-          const providerEvals: ExplainProviderEvaluation[] = [];
 
           const ctx = session.project(undefined, {
             observer: {
@@ -169,8 +49,6 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
               onRpcMetrics: (m) => rpcMetrics.push(m),
               onQueryCompleted: (ev) => queryEvents.push(ev),
               onGaps: (gaps) => recordedGaps.push(...gaps),
-              onFactExplain: (ev) => factExplains.push(ev),
-              onProviderEvaluation: (ev) => providerEvals.push(ev),
             },
           });
 
@@ -190,12 +68,15 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
           });
           assert.equal(calls2.length, calls1.length);
 
-          const derived = await ctx.facts(DerivedFact);
-          assert.equal(derived.length, 1);
-
-          const sourceFacts = await ctx.facts(SourceSpecFact);
-          assert.equal(sourceFacts.length, 1);
-          assert.ok(recordedGaps.length > 0);
+          ctx.recordGaps([
+            {
+              kind: "dynamic-schema-field",
+              message: "Domain library gap forwarded via recordGaps()",
+              at: calls1[0]!.location,
+            },
+          ]);
+          assert.equal(recordedGaps.length, 1);
+          assert.equal(recordedGaps[0]?.kind, "dynamic-schema-field");
 
           assert.ok(
             rpcMetrics.some(
@@ -212,19 +93,8 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
               (e) => e.op === "findSyntax" && e.cacheStatus === "reused",
             ),
           );
-          assert.ok(
-            providerEvals.some(
-              (p) =>
-                p.providerId === "obs-adapter-b" && p.status === "evaluated",
-            ),
-          );
-          assert.ok(
-            factExplains.some((fe) =>
-              fe.localGaps.some((lg) => lg.status === "resolved_by_override"),
-            ),
-          );
 
-          // Test typeAt gap propagation (unknown identifier or any) & scanComments metrics
+          // Test scanComments metrics
           const commentMetrics: EngineCallIoMetrics[] = [];
           const comments = await session.scanComments({
             observe: "summary",

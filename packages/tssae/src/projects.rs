@@ -710,7 +710,7 @@ fn collect_workspace_files_with_text(
         .unwrap_or_else(|_| Path::new(cwd).to_path_buf());
     let workspace_root = workspace_root.to_string_lossy();
 
-    // These files affect adapter facts and snapshot identity but stay outside public source coverage.
+    // These files affect cross-package references and snapshot identity but stay outside public source coverage.
     let mut files = Vec::new();
     for &source_file in program.get_source_files() {
         if program.is_source_file_default_library(source_file.path())

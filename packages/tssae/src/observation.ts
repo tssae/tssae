@@ -2,10 +2,7 @@ import type { RpcRequestOptions } from "./engine-client.ts";
 import {
   TssaeError,
   type DiagnosticLocation,
-  type EngineProviderExtractionStats,
   type ExplainCleanupPath,
-  type ExplainLocalGap,
-  type ExplainProviderEvaluation,
   type Gap,
   type ObserveLimit,
   type ObserveMode,
@@ -62,9 +59,6 @@ export type EngineRpcMetrics = {
   readonly lowering?: EngineLoweringMetrics;
   readonly irCache?: EngineIrCacheMetrics;
   readonly summaryLookup?: EngineSummaryLookupMetrics;
-  readonly providerExtractions?: Readonly<
-    Record<string, EngineProviderExtractionStats>
-  >;
 };
 
 export type EngineCallIoMetrics = {
@@ -89,12 +83,6 @@ export type QueryCompletedEvent = {
   readonly detail?: unknown;
 };
 
-export type FactExplainEvent = {
-  readonly subjectLocation?: DiagnosticLocation;
-  readonly gaps: readonly Gap[];
-  readonly localGaps: readonly ExplainLocalGap[];
-};
-
 export type CleanupCoverageEvent = {
   readonly targetLocations: readonly DiagnosticLocation[];
   readonly paths: readonly ExplainCleanupPath[];
@@ -107,10 +95,6 @@ export type QueryObserver = {
   readonly onRpcMetrics?: (metrics: EngineCallIoMetrics) => void;
   readonly onQueryCompleted?: (event: QueryCompletedEvent) => void;
   readonly onGaps?: (gaps: readonly Gap[]) => void;
-  readonly onFactExplain?: (event: FactExplainEvent) => void;
-  readonly onProviderEvaluation?: (
-    evaluation: ExplainProviderEvaluation,
-  ) => void;
   readonly onCleanupCovered?: (event: CleanupCoverageEvent) => void;
 };
 
@@ -237,17 +221,13 @@ export function locationsOverlap(
   return a.start <= b.end && b.start <= a.end;
 }
 
-/** Lightweight query trace collector used during adapter and engine fact execution. */
+/** Lightweight query trace collector used during engine query execution. */
 export class ObservationCollector {
   readonly mode: ObserveMode;
   readonly limit: ObserveLimit | undefined;
   readonly explainTarget: SourceTarget | undefined;
   readonly #onQueryCompleted:
     | ((event: QueryCompletedEvent) => void)
-    | undefined;
-  readonly #onFactExplain: ((event: FactExplainEvent) => void) | undefined;
-  readonly #onProviderEvaluation:
-    | ((evaluation: ExplainProviderEvaluation) => void)
     | undefined;
 
   constructor(
@@ -256,18 +236,12 @@ export class ObservationCollector {
       readonly limit?: ObserveLimit;
       readonly explainTarget?: SourceTarget;
       readonly onQueryCompleted?: (event: QueryCompletedEvent) => void;
-      readonly onFactExplain?: (event: FactExplainEvent) => void;
-      readonly onProviderEvaluation?: (
-        evaluation: ExplainProviderEvaluation,
-      ) => void;
     } = {},
   ) {
     this.mode = options.mode ?? "off";
     this.limit = options.limit;
     this.explainTarget = options.explainTarget;
     this.#onQueryCompleted = options.onQueryCompleted;
-    this.#onFactExplain = options.onFactExplain;
-    this.#onProviderEvaluation = options.onProviderEvaluation;
   }
 
   isObserveEnabled(): boolean {
@@ -310,23 +284,5 @@ export class ObservationCollector {
         : {}),
       ...(params.detail !== undefined ? { detail: params.detail } : {}),
     });
-  }
-
-  recordFactExplain(params: {
-    readonly subjectLocation?: DiagnosticLocation;
-    readonly gaps: readonly Gap[];
-    readonly localGaps: readonly ExplainLocalGap[];
-  }): void {
-    this.#onFactExplain?.({
-      ...(params.subjectLocation !== undefined
-        ? { subjectLocation: params.subjectLocation }
-        : {}),
-      gaps: params.gaps,
-      localGaps: params.localGaps,
-    });
-  }
-
-  recordProviderEvaluation(evaluation: ExplainProviderEvaluation): void {
-    this.#onProviderEvaluation?.(evaluation);
   }
 }

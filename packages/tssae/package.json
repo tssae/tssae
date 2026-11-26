@@ -35,7 +35,6 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "devDependencies": {
-    "@tssae/adapter-api": "workspace:*",
     "@tssae/test-hosts": "workspace:*",
     "@tssae/tooling-config": "workspace:*",
     "@types/node": "catalog:",

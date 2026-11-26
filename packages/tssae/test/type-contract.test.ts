@@ -417,6 +417,24 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2339/u,
         },
+        {
+          name: "gaps cannot be read on CallTargetsResult before narrowing to incomplete",
+          body: `
+            declare const callRef: CallRef;
+            const [res] = await ctx.calleesOf([callRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on DeclarationCallersResult before narrowing to incomplete",
+          body: `
+            declare const declRef: DeclarationRef;
+            const [res] = await ctx.callersOf([declRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

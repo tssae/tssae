@@ -12,6 +12,7 @@ import type {
 import type {
   CallTargetInfo,
   CallTargetsResult,
+  DeclarationCallersResult,
   DirectCallInfo,
   ValuePropagationPath,
   ValuePropagationTargetResult,
@@ -50,6 +51,7 @@ export type SelectableQueryResult =
   | BranchEdgeInfo
   | CallTargetsResult
   | CallTargetInfo
+  | DeclarationCallersResult
   | DirectCallInfo
   | FieldEffect
   | CallbackInvocationInfo

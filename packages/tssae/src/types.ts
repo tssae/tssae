@@ -130,6 +130,7 @@ export type SyntaxKind =
   | "Identifier"
   | "CallExpression"
   | "NewExpression"
+  | "TaggedTemplateExpression"
   | "ReturnStatement"
   | "VariableDeclaration"
   | "BinaryExpression"

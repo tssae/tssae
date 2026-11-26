@@ -6,6 +6,7 @@ import {
   defineFactType,
   defineModel,
   isSameInstance,
+  extractBasisEvidence,
   openProject,
   type AdditionalInputEntry,
   type AdditionalInputRegistrar,
@@ -219,8 +220,20 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
                 from: syn,
                 to: [decl, ...callRefs],
               });
-              void callers;
-              void callees;
+              const firstCaller = callers[0];
+              if (firstCaller !== undefined) {
+                void extractBasisEvidence([firstCaller]);
+                if (firstCaller.completeness === "incomplete") {
+                  void firstCaller.gaps.length;
+                }
+              }
+              const firstCallee = callees[0];
+              if (
+                firstCallee !== undefined &&
+                firstCallee.completeness === "incomplete"
+              ) {
+                void firstCallee.gaps.length;
+              }
               void prop.results[0]?.reachable;
             }
           }

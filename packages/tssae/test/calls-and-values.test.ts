@@ -96,7 +96,7 @@ void describe("tssae call graph and value propagation", () => {
 
           const aliasedResult = callees[0]!;
           assert.equal(aliasedResult.targets.length, 1);
-          assert.deepEqual(aliasedResult.gaps, []);
+          assert.equal(aliasedResult.completeness, "complete");
           aliasedTargetFile = aliasedResult.resolvedTargets[0]?.location?.file;
           aliasedTargetName = aliasedResult.resolvedTargets[0]?.name;
           aliasedBindingParamName =
@@ -107,9 +107,11 @@ void describe("tssae call graph and value propagation", () => {
 
           const mixedResult = callees[1]!;
           mixedTargetNames = mixedResult.resolvedTargets.map((t) => t.name);
+          assert.equal(mixedResult.completeness, "incomplete");
           mixedGapKinds = mixedResult.gaps.map((g) => g.kind);
 
           const ifaceResult = callees[2]!;
+          assert.equal(ifaceResult.completeness, "incomplete");
           ifaceGapKinds = ifaceResult.gaps.map((g) => g.kind);
         } finally {
           await session.close();
@@ -134,7 +136,7 @@ void describe("tssae call graph and value propagation", () => {
 
         assert.deepEqual(mixedTargetNames, ["processItem"]);
         assert.ok(mixedGapKinds.includes("dynamic-callee"));
-        assert.ok(ifaceGapKinds.includes("dynamic-callee"));
+        assert.ok(ifaceGapKinds.includes("open-external-hierarchy"));
       },
     );
   });
@@ -588,7 +590,9 @@ void describe("tssae call graph and value propagation", () => {
             const callees = await ctx.calleesOf(
               resolved.map((r) => r.call!).filter(Boolean),
             );
-            const gaps = callees.flatMap((row) => row.gaps);
+            const gaps = callees.flatMap((row) =>
+              row.completeness === "incomplete" ? row.gaps : [],
+            );
 
             let reachable = false;
             if (options.checkDirectFlow) {
@@ -737,7 +741,10 @@ void describe("tssae call graph and value propagation", () => {
             (site) => `${site.location.file}:${site.location.line}`,
           );
           callerLocations.sort();
-          gapKinds = callers[0]!.gaps.map((gap) => gap.kind);
+          gapKinds =
+            callers[0]!.completeness === "incomplete"
+              ? callers[0]!.gaps.map((gap) => gap.kind)
+              : [];
         } finally {
           await session.close();
         }
@@ -784,7 +791,10 @@ void describe("tssae call graph and value propagation", () => {
             (site) => `${site.location.file}:${site.location.line}`,
           );
           callerLocations.sort();
-          gapKinds = callers!.gaps.map((gap) => gap.kind);
+          gapKinds =
+            callers!.completeness === "incomplete"
+              ? callers!.gaps.map((gap) => gap.kind)
+              : [];
         } finally {
           await session.close();
         }
@@ -879,10 +889,14 @@ void describe("tssae call graph and value propagation", () => {
           observed.factoryNormalized = factoryNormalized[0]!.callSites.map(
             (site) => `${site.location.file}:${site.location.line}`,
           );
-          gaps.factoryFull = factoryFull[0]!.gaps.map((gap) => gap.kind);
-          gaps.factoryEntryOnly = factoryEntryOnly[0]!.gaps.map(
-            (gap) => gap.kind,
-          );
+          gaps.factoryFull =
+            factoryFull[0]!.completeness === "incomplete"
+              ? factoryFull[0]!.gaps.map((gap) => gap.kind)
+              : [];
+          gaps.factoryEntryOnly =
+            factoryEntryOnly[0]!.completeness === "incomplete"
+              ? factoryEntryOnly[0]!.gaps.map((gap) => gap.kind)
+              : [];
 
           const genericEntryOnly = await ctx.callersOf([genericTarget], {
             lookupFiles: ["src/entry.ts"],
@@ -894,10 +908,14 @@ void describe("tssae call graph and value propagation", () => {
           observed.genericFull = genericFull[0]!.callSites.map(
             (site) => `${site.location.file}:${site.location.line}`,
           );
-          gaps.genericEntryOnly = genericEntryOnly[0]!.gaps.map(
-            (gap) => gap.kind,
-          );
-          gaps.genericFull = genericFull[0]!.gaps.map((gap) => gap.kind);
+          gaps.genericEntryOnly =
+            genericEntryOnly[0]!.completeness === "incomplete"
+              ? genericEntryOnly[0]!.gaps.map((gap) => gap.kind)
+              : [];
+          gaps.genericFull =
+            genericFull[0]!.completeness === "incomplete"
+              ? genericFull[0]!.gaps.map((gap) => gap.kind)
+              : [];
 
           await assert.rejects(
             () =>
@@ -985,6 +1003,369 @@ void describe("tssae call graph and value propagation", () => {
         assert.deepEqual(propagationGaps.scoped, []);
         assert.deepEqual(propagationGaps.full, []);
         assert.deepEqual(propagationGaps.empty, []);
+      },
+    );
+  });
+
+  void it("resolves polymorphic overrides with closed/open completeness and tracks closure, ||=, destructuring, for-of, and callback gaps without signature fallback", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-resolution-regressions",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/index.ts": [
+            "function fnA(): number {",
+            "  return 1;",
+            "}",
+            "function fnB(): number {",
+            "  return 2;",
+            "}",
+            "",
+            "class ClosedBase {",
+            "  run(): number {",
+            "    return 10;",
+            "  }",
+            "}",
+            "class ClosedSub extends ClosedBase {",
+            "  override run(): number {",
+            "    return 20;",
+            "  }",
+            "}",
+            "export class OpenBase {",
+            "  run(): number {",
+            "    return 30;",
+            "  }",
+            "}",
+            "export class OpenSub extends OpenBase {",
+            "  override run(): number {",
+            "    return 40;",
+            "  }",
+            "}",
+            "",
+            "export function callPoly(closed: ClosedBase, open: OpenBase): number {",
+            "  const exact = new OpenSub();",
+            "  return closed.run() + open.run() + exact.run();",
+            "}",
+            "",
+            "export function closureMutation(): number {",
+            "  let fn = fnA;",
+            "  function mutate() {",
+            "    fn = fnB;",
+            "  }",
+            "  mutate();",
+            "  return fn();",
+            "}",
+            "",
+            "export function logicalOrAssign(flag: boolean): number {",
+            "  let fn: (() => number) | undefined = flag ? fnA : undefined;",
+            "  fn ||= fnB;",
+            "  return fn();",
+            "}",
+            "",
+            "export function destructureAndForOf(): number {",
+            "  const { run: objFn } = { run: fnA };",
+            "  const [, secondFn] = [fnA, fnB];",
+            "  let sum = objFn() + secondFn();",
+            "  for (const itemFn of [fnA, fnB]) {",
+            "    sum += itemFn();",
+            "  }",
+            "  return sum;",
+            "}",
+            "",
+            "export function mapCallbackNoFallback(): number[] {",
+            "  return [fnA, fnB].map((f) => f());",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const calls = await ctx.findSyntax({
+            files: ["src/index.ts"],
+            kinds: ["CallExpression"],
+          });
+          const resolveByPrefix = async (prefix: string): Promise<CallRef> => {
+            const syn = calls.find(
+              (c) => c.text === prefix || c.text.startsWith(prefix),
+            );
+            assert.ok(syn, `Missing call matching ${prefix}`);
+            const [res] = await ctx.resolveCalls([syn.ref]);
+            assert.ok(res?.call, `resolveCalls returned null for ${prefix}`);
+            return res.call;
+          };
+
+          const closedCall = await resolveByPrefix("closed.run()");
+          const openCall = await resolveByPrefix("open.run()");
+          const exactCall = await resolveByPrefix("exact.run()");
+          const objDestructCall = await resolveByPrefix("objFn()");
+          const arrDestructCall = await resolveByPrefix("secondFn()");
+          const forOfCall = await resolveByPrefix("itemFn()");
+          const mapCbCall = await resolveByPrefix("f()");
+
+          // Verify both `fn()` call sites explicitly by line number
+          const allCallsResolved = await ctx.resolveCalls(
+            calls.map((c) => c.ref),
+            { select: { location: true } },
+          );
+          const callByLineAndText = (text: string, line: number): CallRef => {
+            const idx = calls.findIndex(
+              (c) => c.text === text && c.location.line === line,
+            );
+            assert.notEqual(idx, -1, `Missing call '${text}' at line ${line}`);
+            const call = allCallsResolved[idx]?.call;
+            assert.ok(call);
+            return call;
+          };
+
+          const closureFnCall = callByLineAndText("fn()", 40);
+          const logicalOrFnCall = callByLineAndText("fn()", 46);
+
+          const [
+            closedRes,
+            openRes,
+            exactRes,
+            closureRes,
+            orRes,
+            objRes,
+            arrRes,
+            forOfRes,
+            mapCbRes,
+          ] = await ctx.calleesOf([
+            closedCall,
+            openCall,
+            exactCall,
+            closureFnCall,
+            logicalOrFnCall,
+            objDestructCall,
+            arrDestructCall,
+            forOfCall,
+            mapCbCall,
+          ]);
+
+          // 1. Polymorphic overrides: unexported ClosedBase -> complete with [10, 20]; exported OpenBase -> incomplete with [30, 40] + gap
+          assert.equal(closedRes!.completeness, "complete");
+          assert.deepEqual(
+            closedRes!.resolvedTargets.map((t) => t.location?.line),
+            [9, 14],
+          );
+
+          assert.equal(openRes!.completeness, "incomplete");
+          assert.deepEqual(
+            openRes!.resolvedTargets.map((t) => t.location?.line),
+            [19, 24],
+          );
+          assert.ok(
+            openRes!.completeness === "incomplete" &&
+              openRes!.gaps.some((g) => g.kind === "open-external-hierarchy"),
+          );
+
+          assert.equal(exactRes!.completeness, "complete");
+          assert.deepEqual(
+            exactRes!.resolvedTargets.map((t) => t.location?.line),
+            [24],
+          );
+
+          // 2. Closure mutation
+          assert.equal(closureRes!.completeness, "complete");
+          assert.deepEqual(
+            closureRes!.resolvedTargets.map((t) => t.name),
+            ["fnA", "fnB"],
+          );
+
+          // 3. ||= logical assignment
+          assert.equal(orRes!.completeness, "complete");
+          assert.deepEqual(
+            orRes!.resolvedTargets.map((t) => t.name),
+            ["fnA", "fnB"],
+          );
+
+          // 4. Destructuring & for-of
+          assert.equal(objRes!.completeness, "complete");
+          assert.deepEqual(
+            objRes!.resolvedTargets.map((t) => t.name),
+            ["fnA"],
+          );
+
+          assert.equal(arrRes!.completeness, "complete");
+          assert.deepEqual(
+            arrRes!.resolvedTargets.map((t) => t.name),
+            ["fnB"],
+          );
+
+          assert.equal(forOfRes!.completeness, "complete");
+          assert.deepEqual(
+            forOfRes!.resolvedTargets.map((t) => t.name),
+            ["fnA", "fnB"],
+          );
+
+          // 5. [fnA, fnB].map(f => f()) must NOT report fnA or parameter signature
+          assert.equal(mapCbRes!.completeness, "incomplete");
+          assert.deepEqual(mapCbRes!.targets, []);
+          assert.ok(
+            mapCbRes!.completeness === "incomplete" &&
+              mapCbRes!.gaps.some((g) => g.kind === "dynamic-callee"),
+          );
+
+          // Verify callersOf on OpenSub.run includes open.run() & exact.run() and is incomplete due to open hierarchy
+          const openSubRunDecl = openRes!.targets[1]!;
+          const [openSubCallers] = await ctx.callersOf([openSubRunDecl]);
+          assert.equal(openSubCallers!.completeness, "incomplete");
+          assert.equal(openSubCallers!.callSites.length, 2);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("includes implicit getter, setter, using dispose, tagged template, and super calls in calleesOf and callersOf", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-implicit-calls",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              lib: ["ES2022", "ESNext.Disposable"],
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/index.ts": [
+            "function html(strings: TemplateStringsArray): string {",
+            '  return strings.join("");',
+            "}",
+            "class Parent {",
+            "  constructor(public v: number) {}",
+            "}",
+            "class Child extends Parent {",
+            "  private _val: number;",
+            "  constructor(v: number) {",
+            "    super(v);",
+            "    this._val = v;",
+            "  }",
+            "  get val(): number {",
+            "    return this._val;",
+            "  }",
+            "  set val(next: number) {",
+            "    this._val = next;",
+            "  }",
+            "  [Symbol.dispose](): void {}",
+            "}",
+            "export function useAll(): number {",
+            "  using c = new Child(1);",
+            "  c.val = 2;",
+            "  void html`ok`;",
+            "  return c.val;",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const candidates = await ctx.findSyntax({
+            files: ["src/index.ts"],
+            kinds: [
+              "CallExpression",
+              "TaggedTemplateExpression",
+              "PropertyAccessExpression",
+              "BinaryExpression",
+              "VariableDeclaration",
+            ],
+          });
+
+          const taggedSyn = candidates.find((s) => s.text === "html`ok`");
+          const superSyn = candidates.find((s) => s.text === "super(v)");
+          const getterSyn = candidates.find(
+            (s) => s.text === "c.val" && s.location.line === 25,
+          );
+          const setterSyn = candidates.find((s) => s.text === "c.val = 2");
+          const usingSyn = candidates.find(
+            (s) =>
+              s.text.startsWith("c = new Child(1)") && s.location.line === 22,
+          );
+          const nonGetterProp = candidates.find(
+            (s) => s.text === "this._val" && s.location.line === 14,
+          );
+          assert.ok(
+            taggedSyn &&
+              superSyn &&
+              getterSyn &&
+              setterSyn &&
+              usingSyn &&
+              nonGetterProp,
+          );
+
+          const resolved = await ctx.resolveCalls([
+            taggedSyn.ref,
+            superSyn.ref,
+            getterSyn.ref,
+            setterSyn.ref,
+            usingSyn.ref,
+            nonGetterProp.ref,
+          ]);
+          assert.ok(resolved[0]?.call);
+          assert.ok(resolved[1]?.call);
+          assert.ok(resolved[2]?.call);
+          assert.ok(resolved[3]?.call);
+          assert.ok(resolved[4]?.call);
+          assert.equal(resolved[5]?.call, null);
+
+          const callees = await ctx.calleesOf([
+            resolved[0].call,
+            resolved[1].call,
+            resolved[2].call,
+            resolved[3].call,
+            resolved[4].call,
+          ]);
+          assert.equal(callees[0]?.resolvedTargets[0]?.name, "html");
+          assert.equal(callees[1]?.resolvedTargets[0]?.name, "constructor");
+          assert.equal(callees[2]?.resolvedTargets[0]?.location?.line, 13);
+          assert.equal(callees[3]?.resolvedTargets[0]?.location?.line, 16);
+          assert.equal(callees[4]?.resolvedTargets[0]?.location?.line, 19);
+
+          const [htmlCallers] = await ctx.callersOf([callees[0]!.targets[0]!]);
+          assert.equal(htmlCallers?.callSites.length, 1);
+          assert.equal(htmlCallers?.callSites[0]?.location.line, 24);
+        } finally {
+          await session.close();
+        }
       },
     );
   });

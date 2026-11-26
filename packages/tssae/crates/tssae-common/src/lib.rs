@@ -14,7 +14,8 @@ pub use handles::{
 pub use model::{
     ClassMemberFact, ClassOrInterfaceKind, DeclarationSummaryData, ImplementationFact,
     ImplementationSourceKind, MemberTargetHierarchy, ResolvedImplementationFact, SemanticModel,
-    SignatureSummaryData, SyntaxCatalog, SyntaxNodeSummary, TypeHierarchyNode, TypeSummaryData,
+    SignatureSummaryData, SyntaxCatalog, SyntaxNodeSummary, SyntaxScopeInfo, TypeHierarchyNode,
+    TypeSummaryData, WriteSyntaxInfo,
 };
 pub use summaries::{
     BehaviorSummaryEntry, BehaviorSummaryPack, CallAspectSummary, CallbackCardinality,

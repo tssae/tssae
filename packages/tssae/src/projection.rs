@@ -19,11 +19,10 @@ pub use tssae_tsrs_boundary::{
     node_location, safe_expression, safe_initializer, slice_source_text,
 };
 
-use crate::call_effects::{
-    CallEffectsRow, EffectsModelInput, InstanceCleanupScopeRow, run_call_effects,
-    run_instance_cleanup,
-};
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
+use crate::ir_effects::{
+    CallEffectsRow, InstanceCleanupScopeRow, run_call_effects, run_instance_cleanup,
+};
 use crate::ir_instances::{
     InstanceProjectionRow, InstanceResolutionRow, InstanceSelect, run_project_instances,
     run_resolve_instances,
@@ -188,15 +187,11 @@ pub enum QueryStep {
         include_writes: bool,
         #[serde(default, rename = "maxDepth")]
         max_depth: Option<usize>,
-        #[serde(default)]
-        models: Vec<EffectsModelInput>,
     },
     InstanceCleanup {
         scopes: Vec<String>,
         #[serde(default)]
         targets: Vec<String>,
-        #[serde(default)]
-        models: Vec<EffectsModelInput>,
         #[serde(default, rename = "lookupFiles")]
         lookup_files: Option<Vec<String>>,
     },
@@ -938,7 +933,6 @@ fn execute_effects_step(
             include_reads,
             include_writes,
             max_depth,
-            models,
         } => {
             let items = run_call_effects(
                 snapshot,
@@ -950,7 +944,7 @@ fn execute_effects_step(
                 include_reads,
                 include_writes,
                 max_depth,
-                &models,
+                observer,
             )?;
             observer.record_step("callEffects", step_start, items.len(), Vec::new());
             Ok(StepResult::CallEffects { items })
@@ -958,7 +952,6 @@ fn execute_effects_step(
         QueryStep::InstanceCleanup {
             scopes,
             targets,
-            models,
             lookup_files,
         } => {
             let items = run_instance_cleanup(
@@ -968,8 +961,8 @@ fn execute_effects_step(
                 checker,
                 &scopes,
                 &targets,
-                &models,
                 lookup_files.as_deref(),
+                observer,
             )?;
             observer.record_step("instanceCleanup", step_start, items.len(), Vec::new());
             Ok(StepResult::InstanceCleanup { items })

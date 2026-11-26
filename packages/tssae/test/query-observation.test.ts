@@ -6,7 +6,6 @@ import {
   defineAdapter,
   defineFactProvider,
   defineFactType,
-  defineModel,
   defineSummaries,
   openProject,
   syntaxLocationOf,
@@ -255,30 +254,6 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
       async (host) => {
         await host.typecheck();
 
-        const model = defineModel({
-          id: "cleanup-obs-model",
-          instanceBehaviors: [
-            {
-              kind: "allocates-fresh-instance",
-              match: { symbol: "createExternalResource" },
-            },
-          ],
-          cleanupOperations: [
-            {
-              kind: "disposes-target",
-              match: { member: "dispose" },
-              target: "receiver",
-            },
-          ],
-          lifecycleEvents: [
-            {
-              kind: "lifecycle-end-callback",
-              match: { symbol: "onDidDisconnect" },
-              callbackArgumentIndex: 0,
-            },
-          ],
-        });
-
         const summaries = defineSummaries({
           id: "cleanup-obs-summaries",
           entries: [
@@ -292,13 +267,38 @@ void describe("tssae query observation, local gaps, and explain hooks", () => {
                 outcome: { kind: "allocates-fresh-instance" },
               },
             },
+            {
+              match: {
+                package: "@acme/lifecycle",
+                memberPath: ["IDisposable", "prototype", "dispose"],
+              },
+              effects: {
+                completeness: "complete",
+                resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+              },
+            },
+            {
+              match: {
+                package: "@acme/lifecycle",
+                memberPath: ["onDidDisconnect"],
+              },
+              calls: {
+                completeness: "complete",
+                invokesCallbacks: [
+                  {
+                    callbackArgIndex: 0,
+                    timing: "lifecycle-end",
+                    eventName: "disconnect",
+                  },
+                ],
+              },
+            },
           ],
         });
 
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [model],
           summaries: { packs: [summaries] },
         });
         try {

@@ -18,7 +18,8 @@ use tssae_analysis::ir::{ImplicitAccessorKind, TypeGuardSemantics};
 use tssae_common::{
     DeclarationSummaryData, DiagnosticLocation, FileId, GapItem, ImplementationFact,
     ImplementationSourceKind, MemberTargetHierarchy, ResolvedImplementationFact, SemanticModel,
-    SignatureId, SymbolId, SyntaxCatalog, SyntaxId, TypeId, TypeSummaryData, UnknownReason,
+    SignatureId, SymbolId, SyntaxCatalog, SyntaxId, SyntaxScopeInfo, TypeId, TypeSummaryData,
+    UnknownReason, WriteSyntaxInfo,
 };
 
 use crate::{
@@ -1715,6 +1716,123 @@ impl SemanticModel for SemanticModelBridge<'_> {
         let mut checker = self.checker.borrow_mut();
         let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
         facade.extract_declaration_identity(node)
+    }
+
+    fn syntax_scope_info(&self, syntax: SyntaxId) -> Option<SyntaxScopeInfo> {
+        let node = self.node_for_syntax(syntax)?;
+        let enclosing_fn = crate::ir_lower::resolve_enclosing_function(node)?;
+        let enclosing_function = self.intern_syntax(enclosing_fn);
+
+        let mut enclosing_block = None;
+        let mut cur = node;
+        while let Some(parent) = cur.parent() {
+            if parent.kind() == Kind::Block {
+                enclosing_block = self.intern_syntax(parent);
+                break;
+            }
+            if parent == enclosing_fn {
+                break;
+            }
+            cur = parent;
+        }
+
+        let mut cfg_scope_node = enclosing_fn;
+        let mut highest_clean_block = None;
+        let mut walk = node;
+        while let Some(parent) = walk.parent() {
+            if matches!(
+                parent.kind(),
+                Kind::ForStatement
+                    | Kind::ForInStatement
+                    | Kind::ForOfStatement
+                    | Kind::WhileStatement
+                    | Kind::DoStatement
+                    | Kind::TryStatement
+                    | Kind::LabeledStatement
+            ) {
+                cfg_scope_node = highest_clean_block.unwrap_or(enclosing_fn);
+                break;
+            }
+            if parent == enclosing_fn {
+                cfg_scope_node = enclosing_fn;
+                break;
+            }
+            if parent.kind() == Kind::Block {
+                highest_clean_block = Some(parent);
+            }
+            walk = parent;
+        }
+
+        Some(SyntaxScopeInfo {
+            enclosing_function,
+            enclosing_block,
+            cfg_scope: self.intern_syntax(cfg_scope_node),
+        })
+    }
+
+    fn branch_statement_syntax(&self, condition_syntax: SyntaxId) -> Option<SyntaxId> {
+        let node = self.node_for_syntax(condition_syntax)?;
+        let mut cur = node;
+        while let Some(parent) = cur.parent() {
+            if parent.kind() == Kind::IfStatement && parent.as_if_statement().expression() == cur {
+                return self.intern_syntax(parent);
+            }
+            if matches!(
+                parent.kind(),
+                Kind::ParenthesizedExpression
+                    | Kind::AsExpression
+                    | Kind::TypeAssertionExpression
+                    | Kind::SatisfiesExpression
+                    | Kind::NonNullExpression
+            ) {
+                cur = parent;
+                continue;
+            }
+            break;
+        }
+        None
+    }
+
+    fn write_syntax_info(&self, write_syntax: SyntaxId) -> Option<WriteSyntaxInfo> {
+        let node = self.node_for_syntax(write_syntax)?;
+        match node.kind() {
+            Kind::BinaryExpression => {
+                let bin = node.as_binary_expression();
+                let target_node = unwrap_expr_wrappers(bin.left());
+                let target_syntax = self.intern_syntax(target_node)?;
+                let logical_assign_op = match bin.operator_token().kind() {
+                    Kind::AmpersandAmpersandEqualsToken => Some("&&="),
+                    Kind::BarBarEqualsToken => Some("||="),
+                    Kind::QuestionQuestionEqualsToken => Some("??="),
+                    _ => None,
+                };
+                Some(WriteSyntaxInfo {
+                    target_syntax,
+                    logical_assign_op,
+                })
+            }
+            Kind::PrefixUnaryExpression => {
+                let p = node.as_prefix_unary_expression();
+                let target_node = unwrap_expr_wrappers(p.operand());
+                Some(WriteSyntaxInfo {
+                    target_syntax: self.intern_syntax(target_node)?,
+                    logical_assign_op: None,
+                })
+            }
+            Kind::PostfixUnaryExpression => {
+                let p = node.as_postfix_unary_expression();
+                let target_node = unwrap_expr_wrappers(p.operand());
+                Some(WriteSyntaxInfo {
+                    target_syntax: self.intern_syntax(target_node)?,
+                    logical_assign_op: None,
+                })
+            }
+            Kind::PropertyDeclaration => Some(WriteSyntaxInfo {
+                target_syntax: write_syntax,
+                logical_assign_op: None,
+            }),
+            _ => None,
+        }
     }
 }
 

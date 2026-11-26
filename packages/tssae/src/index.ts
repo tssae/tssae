@@ -104,6 +104,7 @@ export type {
   FieldEffectKind,
   FieldWriteOperator,
   GuardConditionInfo,
+  ImplicitExceptionCleanupOutcome,
   InstanceCleanupOptions,
   InstanceCleanupScopeResult,
   LifecycleEventBehavior,

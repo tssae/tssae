@@ -171,6 +171,21 @@ pub trait SyntaxCatalog {
     fn file_path(&self, file: FileId) -> Option<&str>;
 }
 
+/// Enclosing function, block, and loop/try-free CFG scope for a syntax node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntaxScopeInfo {
+    pub enclosing_function: Option<SyntaxId>,
+    pub enclosing_block: Option<SyntaxId>,
+    pub cfg_scope: Option<SyntaxId>,
+}
+
+/// Extracted member target and logical-assignment operator metadata for a write syntax node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteSyntaxInfo {
+    pub target_syntax: SyntaxId,
+    pub logical_assign_op: Option<&'static str>,
+}
+
 /// Read-only semantic facade trait implemented by the `tsrs` boundary layer for analysis crates.
 pub trait SemanticModel {
     fn symbol_at_syntax(&self, syntax: SyntaxId) -> Option<SymbolId>;
@@ -197,6 +212,15 @@ pub trait SemanticModel {
     ) -> ImplementationFact;
     fn check_call_missing_package_gap(&self, call_syntax: SyntaxId) -> Option<GapItem>;
     fn declaration_identity(&self, _syntax: SyntaxId) -> Option<DeclarationIdentity> {
+        None
+    }
+    fn syntax_scope_info(&self, _syntax: SyntaxId) -> Option<SyntaxScopeInfo> {
+        None
+    }
+    fn branch_statement_syntax(&self, _condition_syntax: SyntaxId) -> Option<SyntaxId> {
+        None
+    }
+    fn write_syntax_info(&self, _write_syntax: SyntaxId) -> Option<WriteSyntaxInfo> {
         None
     }
     fn record_summary_lookup(&self, _source: Option<SummarySource>) {}

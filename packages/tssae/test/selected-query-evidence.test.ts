@@ -7,6 +7,7 @@ import {
   defineFactProvider,
   defineFactType,
   defineModel,
+  defineSummaries,
   extractBasisEvidence,
   openProject,
   type DiagnosticBasis,
@@ -259,13 +260,20 @@ void describe("tssae selected query evidence", () => {
       async (host) => {
         await host.typecheck();
 
-        const cleanupModel = defineModel({
-          id: "resource-cleanup-model",
-          cleanupOperations: [
+        const cleanupSummaries = defineSummaries({
+          id: "resource-cleanup-summary",
+          entries: [
             {
-              kind: "disposes-target",
-              match: { container: "Resource", member: "dispose" },
-              target: "receiver",
+              match: { memberPath: ["Resource", "prototype", "dispose"] },
+              effects: {
+                completeness: "complete",
+                resourceOps: [
+                  {
+                    kind: "disposes-target",
+                    target: "receiver",
+                  },
+                ],
+              },
             },
           ],
         });
@@ -273,7 +281,7 @@ void describe("tssae selected query evidence", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [cleanupModel],
+          summaries: { packs: [cleanupSummaries] },
         });
         try {
           const ctx = session.project();

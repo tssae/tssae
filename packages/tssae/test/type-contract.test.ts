@@ -497,6 +497,33 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2353|TS2322/u,
         },
+        {
+          name: "gaps cannot be read on CallEffectsResult before narrowing to incomplete",
+          body: `
+            declare const callRef: CallRef;
+            const [res] = await ctx.callEffects({ targets: [callRef] });
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "uncleanedPath cannot be read on TargetInstanceCleanupResult before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [scope] = await ctx.instanceCleanup({ scopes: [synRef] });
+            void scope?.targetResults[0]?.uncleanedPath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "mayThrowSites cannot be read on TargetInstanceCleanupResult implicitExceptions before narrowing",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [scope] = await ctx.instanceCleanup({ scopes: [synRef] });
+            void scope?.targetResults[0]?.implicitExceptions.mayThrowSites;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {

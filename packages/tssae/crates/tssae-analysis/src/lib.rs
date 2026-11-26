@@ -4,8 +4,10 @@
 //! and abstract boundary traits, with zero dependency on any `tsrs_*` crate.
 
 pub mod branch_coverage;
+pub mod call_effects;
 pub mod call_resolution;
 pub mod class_overrides;
+pub mod instance_cleanup;
 pub mod instance_identity;
 pub mod ir;
 pub mod summaries;

@@ -267,18 +267,18 @@ fn vertex_location(ir: &FunctionIr, vid: VertexId) -> Option<DiagnosticLocation>
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct StackId(usize);
+pub(crate) struct StackId(pub(crate) usize);
 
-type CompletionStack = Vec<(FinallyId, VertexId)>;
+pub(crate) type CompletionStack = Vec<(FinallyId, VertexId)>;
 
 #[derive(Default)]
-struct StackArena {
+pub(crate) struct StackArena {
     stacks: Vec<CompletionStack>,
     intern: FxHashMap<CompletionStack, StackId>,
 }
 
 impl StackArena {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut arena = Self::default();
         arena.intern(Vec::new());
         arena
@@ -294,7 +294,7 @@ impl StackArena {
         id
     }
 
-    fn transition_explicit(
+    pub(crate) fn transition_explicit(
         &mut self,
         ir: &FunctionIr,
         stack_id: StackId,
@@ -330,7 +330,7 @@ impl StackArena {
         Some(self.intern(next_stack))
     }
 
-    fn transition_may_throw(
+    pub(crate) fn transition_may_throw(
         &mut self,
         ir: &FunctionIr,
         stack_id: StackId,

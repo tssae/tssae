@@ -261,7 +261,14 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     const effectsResults: readonly CallEffectsResult[] = await ctx.callEffects({
       targets: callRefs,
     });
-    const firstEffect = effectsResults[0]?.fieldWrites[0];
+    const firstEffResult = effectsResults[0];
+    if (
+      firstEffResult !== undefined &&
+      firstEffResult.completeness === "incomplete"
+    ) {
+      void firstEffResult.gaps.length;
+    }
+    const firstEffect = firstEffResult?.fieldWrites[0];
     if (firstEffect !== undefined) {
       const writeSyn: SyntaxRef = firstEffect.syntax;
       const recvSyn: SyntaxRef = firstEffect.receiverSyntax;
@@ -294,6 +301,26 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
       const disposedInst: InstanceRef | undefined =
         firstCleanup.disposedInstances[0]?.instance;
       void disposedInst;
+      const firstTarget = firstCleanup.targetResults[0];
+      if (firstTarget !== undefined) {
+        if (firstTarget.status === "proved") {
+          void firstTarget.cleanupSites[0].location;
+        } else if (firstTarget.status === "disproved") {
+          void firstTarget.cleanedOnAnyPath;
+          void firstTarget.uncleanedPath.length;
+        } else {
+          void firstTarget.gaps.length;
+        }
+        if (firstTarget.implicitExceptions.status === "disproved") {
+          void firstTarget.implicitExceptions.mayThrowSites.length;
+          void firstTarget.implicitExceptions.counterexamplePath.length;
+        } else if (firstTarget.implicitExceptions.status === "inconclusive") {
+          void firstTarget.implicitExceptions.mayThrowSites.length;
+          void firstTarget.implicitExceptions.gaps.length;
+        } else {
+          void firstTarget.implicitExceptions.cleanupSites.length;
+        }
+      }
     }
   } finally {
     await session.close();

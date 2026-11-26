@@ -157,6 +157,7 @@ const consumerSource = `import assert from "node:assert/strict";
 import {
   TssaeError,
   defineModel,
+  defineSummaries,
   evidenceOf,
   extractBasisEvidence,
   isSameInstance,
@@ -178,17 +179,24 @@ import {
 const resourceModel = defineModel({
   id: "acceptance-connection-model",
   description: "Local connections must be closed on all paths.",
-  instanceBehaviors: [
+});
+
+const resourceSummaries = defineSummaries({
+  id: "acceptance-connection-summaries",
+  entries: [
     {
-      kind: "allocates-fresh-instance",
-      match: { symbol: "createConnection" },
+      match: { memberPath: ["createConnection"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
     },
-  ],
-  cleanupOperations: [
     {
-      kind: "disposes-target",
-      match: { container: "LocalConnection", member: "close" },
-      target: "receiver",
+      match: { memberPath: ["LocalConnection", "prototype", "close"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
     },
   ],
 });
@@ -198,6 +206,7 @@ const session = await openProject({
   cwd: process.cwd(),
   tsconfig: "tsconfig.json",
   models: [resourceModel],
+  summaries: { packs: [resourceSummaries] },
   observe: "summary",
   onRpcMetrics: (m) => openMetrics.push(m),
 });
@@ -406,8 +415,9 @@ try {
       evidence: true,
     },
   });
-  assert.equal(projectedInstA?.originKind, "allocation");
-  assert.equal(projectedInstA?.allocationLocation?.file, "src/sources.ts");
+  assert.equal(projectedInstA?.originKind, "summary-allocation");
+  assert.equal(projectedInstA?.summaryId, "acceptance-connection-summaries");
+  assert.equal(projectedInstA?.allocationLocation?.file, "src/app.ts");
 
   const [cleanupScope] = await ctx.instanceCleanup({
     scopes: [processOrderFn.ref],
@@ -420,8 +430,8 @@ try {
   const cleanupB = cleanupScope.targetResults.find((tr) =>
     isSameInstance(tr.instance, instB.instance),
   );
-  assert.equal(cleanupA?.cleanedOnAllPaths, true);
-  assert.equal(cleanupB?.cleanedOnAllPaths, false);
+  assert.equal(cleanupA?.status, "proved");
+  assert.equal(cleanupB?.status, "disproved");
 
   // 5. Evidence traceability & external declaration-only gap handling
   const basis: readonly DiagnosticBasis[] = [

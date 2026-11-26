@@ -95,36 +95,36 @@ pub struct ResolveInstancesBatchOutcome {
 }
 
 #[derive(Clone)]
-struct IrCallFrame {
-    call_syntax: SyntaxId,
-    call_location: Option<DiagnosticLocation>,
-    caller_ir: Arc<FunctionIr>,
-    callee_ir: Arc<FunctionIr>,
-    receiver: Option<ReceiverBinding>,
-    args: Vec<IrCallArg>,
-    is_construct: bool,
-    closure_env: Vec<Self>,
+pub(crate) struct IrCallFrame {
+    pub(crate) call_syntax: SyntaxId,
+    pub(crate) call_location: Option<DiagnosticLocation>,
+    pub(crate) caller_ir: Arc<FunctionIr>,
+    pub(crate) callee_ir: Arc<FunctionIr>,
+    pub(crate) receiver: Option<ReceiverBinding>,
+    pub(crate) args: Vec<IrCallArg>,
+    pub(crate) is_construct: bool,
+    pub(crate) closure_env: Vec<Self>,
 }
 
 #[derive(Clone)]
-enum ReceiverBinding {
+pub(crate) enum ReceiverBinding {
     Value(ValueId),
     PreResolved(Vec<HostOrigin>),
 }
 
 #[derive(Clone)]
-struct HostOrigin {
-    origin: ResolvedInstanceOrigin,
-    captured_stack: Vec<IrCallFrame>,
-    class_syntax: Option<SyntaxId>,
-    closure_fn: Option<SyntaxId>,
-    host_scope_ir: Option<Arc<FunctionIr>>,
-    object_alloc_props: Option<Vec<IrObjectProp>>,
-    array_alloc_elems: Option<Vec<IrArrayElem>>,
+pub(crate) struct HostOrigin {
+    pub(crate) origin: ResolvedInstanceOrigin,
+    pub(crate) captured_stack: Vec<IrCallFrame>,
+    pub(crate) class_syntax: Option<SyntaxId>,
+    pub(crate) closure_fn: Option<SyntaxId>,
+    pub(crate) host_scope_ir: Option<Arc<FunctionIr>>,
+    pub(crate) object_alloc_props: Option<Vec<IrObjectProp>>,
+    pub(crate) array_alloc_elems: Option<Vec<IrArrayElem>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum NonInstanceKind {
+pub(crate) enum NonInstanceKind {
     Nullish,
     FalsyNonNullish,
     TruthyOrUnknownPrimitive,
@@ -132,12 +132,12 @@ enum NonInstanceKind {
 }
 
 #[derive(Clone, Default)]
-struct TraceResult {
-    hosts: Vec<HostOrigin>,
-    non_instances: Vec<(NonInstanceKind, EvidenceItem)>,
-    gaps: Vec<GapItem>,
-    evidence: Vec<EvidenceItem>,
-    hit_cycle: bool,
+pub(crate) struct TraceResult {
+    pub(crate) hosts: Vec<HostOrigin>,
+    pub(crate) non_instances: Vec<(NonInstanceKind, EvidenceItem)>,
+    pub(crate) gaps: Vec<GapItem>,
+    pub(crate) evidence: Vec<EvidenceItem>,
+    pub(crate) hit_cycle: bool,
 }
 
 impl TraceResult {
@@ -202,7 +202,7 @@ impl TraceResult {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum VisitKey {
+pub(crate) enum VisitKey {
     Value {
         ir_id: FunctionIrId,
         value: ValueId,
@@ -335,20 +335,47 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
     )
 }
 
-struct IrInstanceResolver<'a> {
-    project_files: &'a [FileId],
-    allowed_files: Option<&'a FxHashSet<FileId>>,
-    semantic: &'a dyn SemanticModel,
-    syntax: &'a dyn SyntaxCatalog,
-    ir_provider: &'a dyn IrProvider,
-    summary_index: &'a BehaviorSummaryIndex,
-    cached_call_graph: Option<&'a IrCallGraph>,
-    owned_graph: &'a mut Option<IrCallGraph>,
+pub(crate) struct IrInstanceResolver<'a> {
+    pub(crate) project_files: &'a [FileId],
+    pub(crate) allowed_files: Option<&'a FxHashSet<FileId>>,
+    pub(crate) semantic: &'a dyn SemanticModel,
+    pub(crate) syntax: &'a dyn SyntaxCatalog,
+    pub(crate) ir_provider: &'a dyn IrProvider,
+    pub(crate) summary_index: &'a BehaviorSummaryIndex,
+    pub(crate) cached_call_graph: Option<&'a IrCallGraph>,
+    pub(crate) owned_graph: &'a mut Option<IrCallGraph>,
     field_index: Option<IrFieldWriteIndex>,
-    conflict: Option<SummaryConflictError>,
+    pub(crate) conflict: Option<SummaryConflictError>,
 }
 
-impl IrInstanceResolver<'_> {
+impl<'a> IrInstanceResolver<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Constructs internal IR instance resolver from snapshot IR environment and optional call graph cache."
+    )]
+    pub(crate) fn new(
+        project_files: &'a [FileId],
+        allowed_files: Option<&'a FxHashSet<FileId>>,
+        semantic: &'a dyn SemanticModel,
+        syntax: &'a dyn SyntaxCatalog,
+        ir_provider: &'a dyn IrProvider,
+        summary_index: &'a BehaviorSummaryIndex,
+        cached_call_graph: Option<&'a IrCallGraph>,
+        owned_graph: &'a mut Option<IrCallGraph>,
+    ) -> Self {
+        Self {
+            project_files,
+            allowed_files,
+            semantic,
+            syntax,
+            ir_provider,
+            summary_index,
+            cached_call_graph,
+            owned_graph,
+            field_index: None,
+            conflict: None,
+        }
+    }
     fn call_graph(&mut self) -> Option<&IrCallGraph> {
         if let Some(g) = self.cached_call_graph {
             return Some(g);
@@ -539,7 +566,7 @@ impl IrInstanceResolver<'_> {
         out
     }
 
-    fn resolve_syntax_in_any_scope(
+    pub(crate) fn resolve_syntax_in_any_scope(
         &mut self,
         syn: SyntaxId,
         call_stack: &[IrCallFrame],
@@ -570,7 +597,7 @@ impl IrInstanceResolver<'_> {
         out
     }
 
-    fn trace_value(
+    pub(crate) fn trace_value(
         &mut self,
         ir: &Arc<FunctionIr>,
         value: ValueId,
@@ -3498,7 +3525,7 @@ fn find_stack_for_scope(
     None
 }
 
-const fn static_prop_key(key: &IrPropKey) -> Option<(&str, bool)> {
+pub(crate) const fn static_prop_key(key: &IrPropKey) -> Option<(&str, bool)> {
     match key {
         IrPropKey::Named(name)
         | IrPropKey::Computed {
@@ -3529,7 +3556,7 @@ fn classify_literal_non_instance(kind: &LiteralKind) -> NonInstanceKind {
     }
 }
 
-fn find_value_producer_vertex(
+pub(crate) fn find_value_producer_vertex(
     ir: &FunctionIr,
     value: ValueId,
     hint: Option<VertexId>,
@@ -3553,7 +3580,10 @@ fn find_value_producer_vertex(
     })
 }
 
-fn find_call_vertex_by_syntax(ir: &FunctionIr, call_syntax: SyntaxId) -> Option<&CfgVertex> {
+pub(crate) fn find_call_vertex_by_syntax(
+    ir: &FunctionIr,
+    call_syntax: SyntaxId,
+) -> Option<&CfgVertex> {
     ir.vertices.iter().find(|v| {
         v.syntax == Some(call_syntax) && matches!(v.op, IrOp::Call { .. } | IrOp::Construct { .. })
     })

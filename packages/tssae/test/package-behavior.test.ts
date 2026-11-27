@@ -953,4 +953,166 @@ void describe("tssae first-party implementation resolution", () => {
       },
     );
   });
+
+  void it("completes without stack overflow on outer mutable cyclic property reassignment", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/tree.ts": [
+            "interface TreeNode {",
+            "  children: TreeNode[];",
+            "  parent?: TreeNode;",
+            "}",
+            "",
+            "let currentParent: TreeNode = { children: [], parent: undefined };",
+            "",
+            "export function stepUp(): void {",
+            "  if (currentParent.parent) {",
+            "    currentParent = currentParent.parent!;",
+            "  }",
+            "}",
+            "",
+            "export function addChild(n: TreeNode): void {",
+            "  currentParent.children.push(n);",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const calls = await ctx.findSyntax({
+            files: ["src/tree.ts"],
+            kinds: ["CallExpression"],
+          });
+          const fns = await ctx.findSyntax({
+            files: ["src/tree.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const idents = await ctx.findSyntax({
+            files: ["src/tree.ts"],
+            kinds: ["Identifier"],
+          });
+
+          const pushCallSyn = calls.find((c) =>
+            c.text.includes("currentParent.children.push("),
+          );
+          assert.ok(pushCallSyn);
+          const [resolvedPush] = await ctx.resolveCalls([pushCallSyn.ref]);
+          assert.ok(resolvedPush?.call);
+
+          const [pushCallees] = await ctx.calleesOf([resolvedPush.call]);
+          assert.ok(pushCallees);
+          assert.equal(pushCallees.completeness, "incomplete");
+          assert.ok(pushCallees.gaps.length > 0);
+
+          const addChildFn = fns.find((f) =>
+            f.text.includes("function addChild("),
+          );
+          const stepUpFn = fns.find((f) => f.text.includes("function stepUp("));
+          assert.ok(addChildFn);
+          assert.ok(stepUpFn);
+          const declRows = await ctx.resolveDeclarations([
+            addChildFn.ref,
+            stepUpFn.ref,
+          ]);
+          const declRefs = declRows.map((r) => {
+            assert.ok(r.declaration);
+            return r.declaration;
+          });
+          const callers = await ctx.callersOf(declRefs);
+          assert.equal(callers.length, 2);
+
+          const parentIdentInAddChild = idents.find(
+            (id) => id.text === "currentParent" && id.location.line === 15,
+          );
+          assert.ok(parentIdentInAddChild);
+          const [parentInst] = await ctx.resolveInstances([
+            parentIdentInAddChild.ref,
+          ]);
+          assert.ok(parentInst);
+
+          const effects = await ctx.callEffects({
+            targets: [resolvedPush.call, ...declRefs],
+          });
+          assert.equal(effects.length, 3);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("terminates cleanly via depth and visited bounds on const self-referential call and property cycles", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/cycle.ts": [
+            "function helper(): any {",
+            "  return box.next();",
+            "}",
+            "const box: any = { next: helper().next };",
+            "export function trigger() {",
+            "  return box.next();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const calls = await ctx.findSyntax({
+            files: ["src/cycle.ts"],
+            kinds: ["CallExpression"],
+          });
+          const triggerCallSyn = calls.find(
+            (c) => c.text === "box.next()" && c.location.line === 6,
+          );
+          assert.ok(triggerCallSyn);
+
+          const [resolvedTrigger] = await ctx.resolveCalls([
+            triggerCallSyn.ref,
+          ]);
+          assert.ok(resolvedTrigger?.call);
+
+          const [callees] = await ctx.calleesOf([resolvedTrigger.call]);
+          assert.ok(callees);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

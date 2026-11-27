@@ -4,13 +4,26 @@
 //! comment scanning, and [`semantic_facade::SemanticFacade`] for symbols, types,
 //! signatures, assignability, and module/project-reference mapping.
 
+pub mod boundary;
 pub mod hierarchy;
 pub mod impl_resolution;
 #[deny(clippy::wildcard_enum_match_arm)]
 pub mod ir_lower;
+pub mod projects;
 pub mod semantic_facade;
 pub mod syntax_view;
 
+pub use boundary::{
+    BoundaryCallProjection, BoundaryChecker, BoundaryDeclarationResolution,
+    BoundaryDeclarationTarget, BoundaryImplementationInput, BoundaryImplementationOutcome,
+    BoundaryImplementationTarget, BoundaryInstantiatedParameter, BoundaryNode, BoundaryProgram,
+    BoundaryProjectFileCatalog, BoundaryProjectId, BoundarySemanticBridge, BoundarySemanticFacade,
+    BoundarySession, BoundarySignature, BoundarySignatureParameter, BoundarySignatureProjection,
+    BoundarySnapshotData, BoundarySourceFile, BoundarySymbol, BoundarySyntaxChildren,
+    BoundarySyntaxLookupMatch, BoundarySyntaxMatch, BoundaryType, BoundaryTypeProjection,
+    BoundaryTypeProperty, BoundaryTypeSummary, build_boundary_project_file_catalog,
+    lower_scope_to_ir_boundary,
+};
 pub use hierarchy::ProgramHierarchyIndex;
 pub use impl_resolution::{
     DeclarationProvenance, FacadeImplementationInput, FacadeImplementationOutcome,
@@ -24,7 +37,11 @@ pub use ir_lower::{
     lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
     resolve_enclosing_cfg_owner, resolve_enclosing_function,
 };
-
+pub use projects::{
+    CompilerOptionsSummary, OpenedProjectsSnapshot, ProjectOpenError, ProjectSummary,
+    UpdateSnapshotInput, UpdatedProjectsSnapshot, open_projects_snapshot,
+    release_compiler_snapshot, update_projects_snapshot,
+};
 pub use semantic_facade::{
     FacadeAssignability, FacadeCallProjection, FacadeCallSelect, FacadeDeclarationResolution,
     FacadeDeclarationSelect, FacadeDeclarationTarget, FacadeInstantiatedParameter,

@@ -872,6 +872,267 @@ fn pick_bodied_declaration(
     })
 }
 
+fn is_bodied_declaration(node: P<Node>) -> bool {
+    extract_callable_from_decl(node).is_some_and(|f| f.body().is_some()) || node.body().is_some()
+}
+
+fn find_named_declaration_in_statements(
+    statements: &[P<Node>],
+    candidate_names: &[String],
+) -> Option<P<Node>> {
+    let mut fallback = None;
+    for &stmt in statements {
+        match stmt.kind() {
+            Kind::FunctionDeclaration
+            | Kind::ClassDeclaration
+            | Kind::InterfaceDeclaration
+            | Kind::TypeAliasDeclaration
+            | Kind::EnumDeclaration
+            | Kind::ModuleDeclaration => {
+                if let Some(name) = stmt.name().and_then(node_text)
+                    && candidate_names.iter().any(|c| c == &name)
+                {
+                    if is_bodied_declaration(stmt) {
+                        return Some(stmt);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(stmt);
+                    }
+                }
+            }
+            Kind::VariableStatement => {
+                let decls = stmt
+                    .as_variable_statement()
+                    .declaration_list()
+                    .as_variable_declaration_list()
+                    .declarations()
+                    .nodes();
+                for &decl in decls {
+                    if let Some(name) = decl.name().and_then(node_text)
+                        && candidate_names.iter().any(|c| c == &name)
+                    {
+                        if is_bodied_declaration(decl) || decl.initializer().is_some() {
+                            return Some(decl);
+                        }
+                        if fallback.is_none() {
+                            fallback = Some(decl);
+                        }
+                    }
+                }
+            }
+            Kind::ExportDeclaration => {
+                let mut matched_spec: Option<(Option<String>, P<Node>)> = None;
+                stmt.for_each_child(&mut |child| {
+                    if child.kind() == Kind::NamedExports {
+                        child.for_each_child(&mut |elem| {
+                            if elem.kind() == Kind::ExportSpecifier {
+                                let spec = elem.as_export_specifier();
+                                if let Some(exported) = node_text(spec.name())
+                                    && candidate_names.iter().any(|c| c == &exported)
+                                {
+                                    let local =
+                                        spec.property_name().and_then(node_text).or(Some(exported));
+                                    matched_spec = Some((local, elem));
+                                    return true;
+                                }
+                            }
+                            false
+                        });
+                    }
+                    matched_spec.is_some()
+                });
+                if let Some((local_name, spec_node)) = matched_spec {
+                    if let Some(local) = local_name
+                        && let Some(resolved_local) =
+                            find_named_declaration_in_statements(statements, &[local])
+                    {
+                        return Some(resolved_local);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(spec_node);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fallback
+}
+
+fn find_default_declaration_in_statements(statements: &[P<Node>]) -> Option<P<Node>> {
+    let mut fallback = None;
+    for &stmt in statements {
+        if get_combined_modifier_flags(stmt).intersects(ModifierFlags::Default) {
+            if is_bodied_declaration(stmt) {
+                return Some(stmt);
+            }
+            if fallback.is_none() {
+                fallback = Some(stmt);
+            }
+        }
+        if stmt.kind() == Kind::ExportAssignment {
+            let expr = unwrap_expr_wrappers(stmt.as_export_assignment().expression());
+            if expr.kind() == Kind::Identifier
+                && let Some(target_name) = node_text(expr)
+                && let Some(local_decl) =
+                    find_named_declaration_in_statements(statements, &[target_name])
+            {
+                return Some(local_decl);
+            }
+            if fallback.is_none() {
+                fallback = Some(stmt);
+            }
+        }
+    }
+    fallback
+}
+
+fn collect_module_block_statements(module_decl: P<Node>) -> Vec<P<Node>> {
+    let mut out = Vec::new();
+    module_decl.for_each_child(&mut |child| {
+        if child.kind() == Kind::ModuleBlock {
+            child.for_each_child(&mut |stmt| {
+                out.push(stmt);
+                false
+            });
+        }
+        false
+    });
+    out
+}
+
+fn find_container_in_statements(statements: &[P<Node>], path: &[String]) -> Option<P<Node>> {
+    let target_name = path.first()?;
+    for &stmt in statements {
+        let matched = match stmt.kind() {
+            Kind::ClassDeclaration
+            | Kind::ClassExpression
+            | Kind::InterfaceDeclaration
+            | Kind::ModuleDeclaration
+            | Kind::EnumDeclaration => stmt
+                .name()
+                .and_then(node_text)
+                .is_some_and(|n| n == *target_name)
+                .then_some(stmt),
+            _ => None,
+        };
+        let Some(container) = matched else {
+            continue;
+        };
+        if path.len() == 1 {
+            return Some(container);
+        }
+        if container.kind() == Kind::ModuleDeclaration {
+            let inner = collect_module_block_statements(container);
+            if let Some(found) = find_container_in_statements(&inner, &path[1..]) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_member_in_container(container: P<Node>, decl_node: P<Node>) -> Option<P<Node>> {
+    if container.kind() == Kind::ModuleDeclaration {
+        let stmts = collect_module_block_statements(container);
+        let name = decl_node.name().and_then(node_text)?;
+        return find_named_declaration_in_statements(&stmts, &[name]);
+    }
+    let members = match container.kind() {
+        Kind::ClassDeclaration => container.as_class_declaration().members().nodes(),
+        Kind::ClassExpression => container.as_class_expression().members().nodes(),
+        Kind::InterfaceDeclaration => container.as_interface_declaration().members().nodes(),
+        _ => return None,
+    };
+    if decl_node.kind() == Kind::Constructor {
+        let mut fallback = None;
+        for &member in members {
+            if member.kind() == Kind::Constructor {
+                if member.body().is_some() {
+                    return Some(member);
+                }
+                if fallback.is_none() {
+                    fallback = Some(member);
+                }
+            }
+        }
+        return fallback;
+    }
+    let member_name = extract_member_name_for_summary(decl_node)
+        .or_else(|| decl_node.name().and_then(node_text))?;
+    let mut fallback = None;
+    for &member in members {
+        let name_matches = extract_member_name_for_summary(member)
+            .or_else(|| member.name().and_then(node_text))
+            .is_some_and(|n| n == member_name);
+        if !name_matches {
+            continue;
+        }
+        if is_bodied_declaration(member) {
+            return Some(member);
+        }
+        if fallback.is_none() {
+            fallback = Some(member);
+        }
+    }
+    fallback
+}
+
+fn resolve_redirected_declaration(
+    target_sf: P<SourceFile>,
+    decl_node: P<Node>,
+    export_name: Option<&str>,
+    sym_opt: Option<P<Symbol>>,
+) -> Option<P<Node>> {
+    if decl_node.kind() == Kind::SourceFile {
+        return Some(target_sf.as_node());
+    }
+
+    let (containers, _) = collect_container_chain(decl_node);
+    if !containers.is_empty()
+        && let Some(container) =
+            find_container_in_statements(target_sf.statements.nodes(), &containers)
+        && let Some(member) = resolve_member_in_container(container, decl_node)
+    {
+        return Some(member);
+    }
+
+    let is_default = export_name == Some("default")
+        || get_combined_modifier_flags(decl_node).intersects(ModifierFlags::Default);
+    let mut candidate_names = Vec::new();
+    let mut push_candidate = |name: String| {
+        if !name.is_empty()
+            && !matches!(
+                name.as_str(),
+                "default" | "__function" | "__class" | "unknown"
+            )
+            && !candidate_names.contains(&name)
+        {
+            candidate_names.push(name);
+        }
+    };
+    if let Some(exp) = export_name {
+        push_candidate(exp.to_string());
+    }
+    if let Some(name) = decl_node.name().and_then(node_text) {
+        push_candidate(name);
+    }
+    if let Some(sym) = sym_opt {
+        push_candidate(sym.name().to_string());
+    }
+
+    let stmts = target_sf.statements.nodes();
+    if !candidate_names.is_empty()
+        && let Some(matched) = find_named_declaration_in_statements(stmts, &candidate_names)
+    {
+        return Some(matched);
+    }
+    if is_default && let Some(matched) = find_default_declaration_in_statements(stmts) {
+        return Some(matched);
+    }
+    None
+}
+
 fn resolve_sibling_bodied_declaration(sf: P<SourceFile>, decl: P<Node>) -> Option<P<Node>> {
     if extract_callable_from_decl(decl).is_some_and(|f| f.body().is_some()) {
         return Some(decl);
@@ -1401,12 +1662,35 @@ impl SemanticFacade<'_> {
         let redirect = program.get_parse_file_redirect(decl_sf.file_name());
         if !redirect.is_empty()
             && is_first_party_workspace_path(&cwd, &redirect)
-            && let Some((_, target_sf)) =
+            && let Some((target_program, target_sf)) =
                 find_source_file_in_programs(program, workspace_programs, &redirect)
             && !target_sf.is_declaration_file()
         {
-            let target_decl = target_sf.as_node();
-            let target_rel = relative_to_cwd(&cwd, target_sf.file_name());
+            let matched_decl = resolve_redirected_declaration(
+                target_sf,
+                decl_node,
+                export_name.as_deref(),
+                sym_opt,
+            )
+            .map(|raw_decl| {
+                if std::ptr::eq(target_program, program) {
+                    let resolved = resolve_symbol_for_node(self.checker_mut(), raw_decl);
+                    pick_bodied_declaration(resolved.symbol, resolved.primary_decl)
+                        .unwrap_or(raw_decl)
+                } else {
+                    resolve_sibling_bodied_declaration(target_sf, raw_decl).unwrap_or(raw_decl)
+                }
+            });
+            let (target_decl, fn_node) = matched_decl.map_or_else(
+                || (target_sf.as_node(), None),
+                |matched| {
+                    let callable =
+                        extract_callable_from_decl(matched).filter(|f| f.body().is_some());
+                    (matched, callable)
+                },
+            );
+            let matched_sf = get_source_file_of_node(target_decl).unwrap_or(target_sf);
+            let target_rel = relative_to_cwd(&cwd, matched_sf.file_name());
             let location =
                 node_location_relative(&cwd, target_decl).unwrap_or_else(|| DiagnosticLocation {
                     file: target_rel.clone(),
@@ -1418,13 +1702,13 @@ impl SemanticFacade<'_> {
                     end: 0,
                 });
             let pkg_name =
-                package_name_for_file(program, target_sf.file_name(), provenance.as_ref());
+                package_name_for_file(program, matched_sf.file_name(), provenance.as_ref());
             return FacadeImplementationOutcome::Resolved(FacadeImplementationTarget {
                 file: target_rel,
                 location,
                 declaration_node: target_decl,
                 declaration_symbol: target_decl.symbol(),
-                fn_node: None,
+                fn_node,
                 export_name,
                 package_name: pkg_name,
                 resolution_source: FirstPartyResolutionSource::ProjectReference,
@@ -1953,6 +2237,100 @@ mod tests {
         // Second lookup hits CANONICAL_PATH_CACHE cleanly.
         assert!(is_first_party_workspace_path(&ws_str, &local_via_nm));
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_redirected_declaration_finds_concrete_ts_declaration_and_fn_node() {
+        use tsrs_api::{Handler, Session, SessionOptions};
+        use tsrs_vfs::{FS, bundled, osvfs};
+
+        let base =
+            std::env::temp_dir().join(format!("tssae-redirect-decl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src_dir = base.join("src");
+        let dist_dir = base.join("dist");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dist_dir).unwrap();
+
+        let tsconfig_path = base.join("tsconfig.json");
+        let ts_path = src_dir.join("mod.ts");
+        let dts_path = dist_dir.join("mod.d.ts");
+
+        std::fs::write(
+            &tsconfig_path,
+            r#"{"compilerOptions":{"strict":true,"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext"},"include":["src/**/*.ts","dist/**/*.d.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &ts_path,
+            "export function greet(name: string): string {\n  return `hi ${name}`;\n}\nexport class Greeter {\n  say(who: string): string {\n    return who;\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &dts_path,
+            "export declare function greet(name: string): string;\nexport declare class Greeter {\n  say(who: string): string;\n}\n",
+        )
+        .unwrap();
+
+        let cwd = normalize_path(&base.to_string_lossy());
+        let fs: Arc<dyn FS> = Arc::new(bundled::wrap_fs(osvfs::fs()));
+        let session = Session::new(SessionOptions::new(
+            cwd,
+            bundled::default_lib_path(),
+            fs,
+            false,
+        ));
+        let open_payload = serde_json::to_vec(&serde_json::json!({
+            "openProjects": [tsconfig_path.to_string_lossy()],
+        }))
+        .unwrap();
+        let resp = session
+            .handle_request("createSnapshot", &open_payload)
+            .unwrap();
+        let tsrs_api::Response::Json(json) = resp else {
+            panic!("expected json snapshot response");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let snap_id = parsed["snapshot"].as_u64().unwrap();
+        let snap_data = session.snapshot_data(snap_id).unwrap();
+        let program = snap_data
+            .snapshot
+            .project_collection
+            .projects()
+            .iter()
+            .find_map(|p| p.get_program())
+            .unwrap();
+
+        let dts_sf = program
+            .get_source_file(&normalize_path(&dts_path.to_string_lossy()))
+            .unwrap();
+        let ts_sf = program
+            .get_source_file(&normalize_path(&ts_path.to_string_lossy()))
+            .unwrap();
+
+        let dts_greet = dts_sf.statements.nodes()[0];
+        let matched_greet =
+            resolve_redirected_declaration(ts_sf, dts_greet, Some("greet"), dts_greet.symbol())
+                .expect("expected greet function declaration");
+        assert_eq!(matched_greet.kind(), Kind::FunctionDeclaration);
+        assert_ne!(matched_greet, ts_sf.as_node());
+        let fn_node = extract_callable_from_decl(matched_greet).filter(|f| f.body().is_some());
+        assert!(fn_node.is_some(), "expected bodied fn_node for greet");
+
+        let dts_greeter = dts_sf.statements.nodes()[1];
+        let dts_say = dts_greeter.as_class_declaration().members().nodes()[0];
+        let matched_say =
+            resolve_redirected_declaration(ts_sf, dts_say, Some("say"), dts_say.symbol())
+                .expect("expected Greeter.say method declaration");
+        assert_eq!(matched_say.kind(), Kind::MethodDeclaration);
+        assert!(
+            extract_callable_from_decl(matched_say).is_some_and(|f| f.body().is_some()),
+            "expected bodied fn_node for Greeter.say"
+        );
+
+        drop(snap_data);
+        session.close();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

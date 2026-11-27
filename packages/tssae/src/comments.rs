@@ -31,7 +31,7 @@ pub fn scan_snapshot_comments(
         let Ok(program) = snapshot.snapshot_data.get_program(project_id) else {
             continue;
         };
-        syntax_view.scan_program_comments(
+        syntax_view.scan_boundary_program_comments(
             program,
             filter_set.as_ref(),
             &mut seen_files,

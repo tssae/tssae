@@ -2,9 +2,6 @@ use std::{cell::Cell, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use tsrs_ast::{Node, SourceFile, Symbol};
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
 use tssae_analysis::{
     IrProvider,
     call_resolution::{
@@ -25,12 +22,13 @@ use tssae_common::{
     SyntaxScopeInfo, TypeId, TypeSummaryData, UnknownReason, WriteSyntaxInfo,
 };
 use tssae_tsrs_boundary::{
-    FirstPartyResolutionSource, SemanticModelBridge, normalize_path, resolve_enclosing_cfg_owner,
+    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundaryProjectFileCatalog,
+    BoundarySemanticBridge, BoundarySymbol, FirstPartyResolutionSource,
+    build_boundary_project_file_catalog, normalize_path,
 };
 
 use crate::ir_impls::ResolvedImplTargetPayload;
 use crate::observe::ObserveCollector;
-use crate::projects::{is_project_source_file, relative_to_cwd};
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
 
 #[derive(Serialize)]
@@ -109,69 +107,10 @@ pub enum CallTargetsRow {
     },
 }
 
-pub struct SnapshotProjectFileCatalog {
-    pub sf_by_file_id: FxHashMap<FileId, P<SourceFile>>,
-    pub rel_paths_by_file_id: FxHashMap<FileId, String>,
-    pub project_files: Vec<FileId>,
-}
-
-fn build_project_file_catalog(
-    cwd: &str,
-    program: &'static Program,
-    workspace_programs: &[&'static Program],
-    file_ids: &Arc<std::sync::RwLock<tssae_tsrs_boundary::FileIdRegistry>>,
-) -> SnapshotProjectFileCatalog {
-    let mut sf_by_file_id = FxHashMap::default();
-    let mut rel_paths_by_file_id = FxHashMap::default();
-    let mut project_files = Vec::new();
-    let mut seen_rel = FxHashSet::default();
-
-    let mut reg = file_ids.write().ok();
-    let mut register_sf = |sf: P<SourceFile>, is_proj: bool| {
-        let rel = normalize_path(&relative_to_cwd(cwd, sf.file_name()));
-        let Some(ref mut reg) = reg else {
-            return;
-        };
-        let fid = reg.intern(&rel);
-        sf_by_file_id.entry(fid).or_insert(sf);
-        rel_paths_by_file_id
-            .entry(fid)
-            .or_insert_with(|| rel.clone());
-        if is_proj && seen_rel.insert(rel) {
-            project_files.push(fid);
-        }
-    };
-
-    for &sf in program.get_source_files() {
-        if !program.is_source_file_default_library(sf.path()) {
-            register_sf(sf, is_project_source_file(program, sf));
-        }
-    }
-    for &wp in workspace_programs {
-        for &sf in wp.get_source_files() {
-            if !wp.is_source_file_default_library(sf.path()) {
-                register_sf(sf, false);
-            }
-        }
-    }
-    drop(reg);
-    project_files.sort_by(|a, b| {
-        rel_paths_by_file_id
-            .get(a)
-            .cmp(&rel_paths_by_file_id.get(b))
-    });
-
-    SnapshotProjectFileCatalog {
-        sf_by_file_id,
-        rel_paths_by_file_id,
-        project_files,
-    }
-}
-
 pub struct SnapshotIrEnv<'a> {
-    pub semantic: SemanticModelBridge<'a>,
+    pub semantic: BoundarySemanticBridge<'a>,
     ir_cache: &'a tssae_analysis::ir::SnapshotIrCache,
-    catalog: Arc<SnapshotProjectFileCatalog>,
+    catalog: Arc<BoundaryProjectFileCatalog>,
     project_id: String,
     hierarchy_cache: &'a mut FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
     ir_call_graph_cache: &'a mut FxHashMap<String, Arc<IrCallGraph>>,
@@ -195,15 +134,15 @@ impl<'a> SnapshotIrEnv<'a> {
     pub fn from_snapshot(
         snapshot: &'a mut SnapshotState,
         project_id: &str,
-        program: &'static Program,
-        workspace_programs: &'a [&'static Program],
-        checker: &'a mut CheckerHandle,
+        program: BoundaryProgram,
+        workspace_programs: &'a [BoundaryProgram],
+        checker: &'a mut BoundaryChecker<'_>,
     ) -> Self {
         let file_ids = Arc::clone(&snapshot.file_ids);
         let catalog = if let Some(cached) = snapshot.project_file_catalog_cache.get(project_id) {
             Arc::clone(cached)
         } else {
-            let built = Arc::new(build_project_file_catalog(
+            let built = Arc::new(build_boundary_project_file_catalog(
                 &snapshot.cwd,
                 program,
                 workspace_programs,
@@ -216,7 +155,7 @@ impl<'a> SnapshotIrEnv<'a> {
         };
         let cached_hierarchy = snapshot.hierarchy_cache.get(project_id).cloned();
 
-        let semantic = SemanticModelBridge::with_snapshot_store(
+        let semantic = BoundarySemanticBridge::with_snapshot_store(
             &snapshot.cwd,
             program,
             workspace_programs,
@@ -362,7 +301,7 @@ impl<'a> SnapshotIrEnv<'a> {
             .get(&fid)
             .cloned()
             .unwrap_or_else(|| file_index.rel_file.clone());
-        let sf_addr = std::ptr::from_ref(&*sf) as usize;
+        let sf_addr = sf.addr();
         Some(self.ir_cache.get_or_insert_file(fid, || {
             tssae_analysis::ir::FileIrEntry::new(
                 fid,
@@ -518,7 +457,7 @@ impl IrProvider for SnapshotIrEnv<'_> {
                 None,
             )
         })?;
-        let scope_node = resolve_enclosing_cfg_owner(node).ok_or_else(|| {
+        let scope_node = node.resolve_enclosing_cfg_owner().ok_or_else(|| {
             GapItem::from_reason(
                 UnknownReason::NoEnclosingFunction,
                 "Node has no enclosing function or module scope.".to_string(),
@@ -553,17 +492,17 @@ impl IrProvider for SnapshotIrEnv<'_> {
 
 struct MaterializedBinding {
     argument_index: usize,
-    argument_node: P<Node>,
+    argument_node: BoundaryNode,
     parameter_name: Option<String>,
-    parameter_decl_node: Option<(P<Node>, Option<P<Symbol>>)>,
+    parameter_decl_node: Option<(BoundaryNode, Option<BoundarySymbol>)>,
     is_rest: bool,
 }
 
 struct MaterializedImplTarget {
     file: String,
     location: DiagnosticLocation,
-    decl_node: P<Node>,
-    decl_symbol: Option<P<Symbol>>,
+    decl_node: BoundaryNode,
+    decl_symbol: Option<BoundarySymbol>,
     export_name: Option<String>,
     package_name: Option<String>,
     resolution_source: FirstPartyResolutionSource,
@@ -571,19 +510,19 @@ struct MaterializedImplTarget {
 }
 
 struct MaterializedTarget {
-    decl_node: P<Node>,
-    decl_symbol: Option<P<Symbol>>,
+    decl_node: BoundaryNode,
+    decl_symbol: Option<BoundarySymbol>,
     name: Option<String>,
     location: Option<DiagnosticLocation>,
     is_external: bool,
     implementation: Option<MaterializedImplTarget>,
     parameter_bindings: Vec<MaterializedBinding>,
-    return_expr_nodes: Vec<P<Node>>,
+    return_expr_nodes: Vec<BoundaryNode>,
 }
 
 struct MaterializedCalleesRow {
     call_id: String,
-    call_node: P<Node>,
+    call_node: BoundaryNode,
     targets: Vec<MaterializedTarget>,
     evidence: Vec<EvidenceItem>,
     gaps: Vec<GapItem>,
@@ -591,9 +530,9 @@ struct MaterializedCalleesRow {
 }
 
 struct MaterializedCallerSite {
-    call_node: P<Node>,
+    call_node: BoundaryNode,
     location: DiagnosticLocation,
-    caller_decl: Option<(P<Node>, Option<P<Symbol>>)>,
+    caller_decl: Option<(BoundaryNode, Option<BoundarySymbol>)>,
     parameter_bindings: Vec<MaterializedBinding>,
 }
 
@@ -725,8 +664,8 @@ fn alloc_materialized_bindings(
 pub fn run_callees_of(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     observer: &mut ObserveCollector,
 ) -> Result<Vec<CallTargetsRow>, RpcErr> {
@@ -815,11 +754,11 @@ pub fn run_callees_of(
 fn collect_materialized_callees(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    workspace_programs: &[&'static Program],
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    workspace_programs: &[BoundaryProgram],
+    checker: &mut BoundaryChecker<'_>,
     summary_index: &BehaviorSummaryIndex,
-    call_nodes: Vec<(String, P<Node>)>,
+    call_nodes: Vec<(String, BoundaryNode)>,
     observer: &mut ObserveCollector,
 ) -> Result<Vec<MaterializedCalleesRow>, RpcErr> {
     let env =
@@ -887,8 +826,8 @@ fn collect_materialized_callees(
 pub fn run_callers_of(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     lookup_files: Option<&[String]>,
     observer: &mut ObserveCollector,
@@ -983,11 +922,11 @@ pub fn run_callers_of(
 fn collect_materialized_callers(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    workspace_programs: &[&'static Program],
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    workspace_programs: &[BoundaryProgram],
+    checker: &mut BoundaryChecker<'_>,
     summary_index: &BehaviorSummaryIndex,
-    decl_inputs: Vec<(String, P<Node>, Option<P<Symbol>>)>,
+    decl_inputs: Vec<(String, BoundaryNode, Option<BoundarySymbol>)>,
     allowed_files: Option<&FxHashSet<FileId>>,
     observer: &mut ObserveCollector,
 ) -> Result<Vec<MaterializedCallersRow>, RpcErr> {

@@ -16,6 +16,11 @@ use tsrs_core::{
 use tsrs_diagnostics::Category;
 use tsrs_project::ID as ProjectId;
 
+use crate::boundary::{BoundaryProjectId, BoundarySession, BoundarySnapshotData};
+use crate::syntax_view::{
+    is_project_source_file, normalize_path, relative_to_cwd, resolve_against_cwd,
+};
+
 #[derive(Debug)]
 pub struct ProjectOpenError {
     pub code: &'static str,
@@ -65,11 +70,11 @@ pub struct ProjectSummary {
 }
 
 pub struct OpenedProjectsSnapshot {
-    pub tsrs_snapshot_id: u64,
-    pub snapshot_data: Arc<SnapshotData>,
+    pub compiler_snapshot_id: u64,
+    pub snapshot_data: BoundarySnapshotData,
     pub entry_specs: Vec<String>,
     pub opened_configs: Vec<String>,
-    pub project_ids: BTreeMap<String, ProjectId>,
+    pub project_ids: BTreeMap<String, BoundaryProjectId>,
     pub summaries: Vec<ProjectSummary>,
     pub workspace_source_files: Vec<String>,
     pub snapshot_digest: String,
@@ -77,11 +82,11 @@ pub struct OpenedProjectsSnapshot {
 
 pub struct UpdateSnapshotInput<'a> {
     pub cwd: &'a str,
-    pub old_tsrs_snapshot_id: u64,
+    pub old_compiler_snapshot_id: u64,
     pub old_entry_specs: &'a [String],
     pub old_opened_configs: &'a [String],
-    pub old_snapshot_data: &'a SnapshotData,
-    pub old_project_ids: &'a BTreeMap<String, ProjectId>,
+    pub old_snapshot_data: &'a BoundarySnapshotData,
+    pub old_project_ids: &'a BTreeMap<String, BoundaryProjectId>,
     pub entries: Option<&'a [String]>,
     pub changed: &'a [String],
     pub created: &'a [String],
@@ -115,11 +120,11 @@ struct DiscoveryState {
     project_refs_map: BTreeMap<String, Vec<String>>,
 }
 
-pub use tssae_tsrs_boundary::{
-    is_project_source_file, normalize_path, relative_to_cwd, resolve_against_cwd,
-};
+pub fn release_compiler_snapshot(session: &BoundarySession, compiler_snapshot_id: u64) {
+    release_tsrs_snapshot_raw(&session.0, compiler_snapshot_id);
+}
 
-pub fn release_tsrs_snapshot(session: &Session, tsrs_snapshot_id: u64) {
+fn release_tsrs_snapshot_raw(session: &Session, tsrs_snapshot_id: u64) {
     if let Ok(payload) = serde_json::to_vec(&serde_json::json!({ "snapshot": tsrs_snapshot_id })) {
         let _ = session.handle_request("release", &payload);
     }
@@ -127,17 +132,21 @@ pub fn release_tsrs_snapshot(session: &Session, tsrs_snapshot_id: u64) {
 
 fn release_if_intermediate(session: &Session, candidate_id: u64, protected_id: u64) {
     if candidate_id != protected_id {
-        release_tsrs_snapshot(session, candidate_id);
+        release_tsrs_snapshot_raw(session, candidate_id);
     }
 }
 
 /// Opens all entry `tsconfig.json`/`jsconfig.json` files and recursively discovers `references`
 /// via BFS, preventing cycles and releasing intermediate transition snapshots.
+///
+/// # Errors
+/// Returns [`ProjectOpenError`] when config files are missing, invalid, or fail to load.
 pub fn open_projects_snapshot(
-    session: &Arc<Session>,
+    session: &BoundarySession,
     cwd: &str,
     entries: &[String],
 ) -> Result<OpenedProjectsSnapshot, ProjectOpenError> {
+    let session = &session.0;
     let (initial_entries, mut state) = collect_initial_entries(cwd, entries)?;
     let mut tsrs_snapshot_id = create_initial_snapshot(session, &initial_entries)?;
     let mut pending_inspection: VecDeque<String> = initial_entries.into_iter().collect();
@@ -146,7 +155,7 @@ pub fn open_projects_snapshot(
         let snapshot_data = match session.snapshot_data(tsrs_snapshot_id) {
             Ok(data) => data,
             Err(err) => {
-                release_tsrs_snapshot(session, tsrs_snapshot_id);
+                release_tsrs_snapshot_raw(session, tsrs_snapshot_id);
                 return Err(ProjectOpenError::new("PROJECT_LOAD_ERROR", err.to_string()));
             }
         };
@@ -160,7 +169,7 @@ pub fn open_projects_snapshot(
             Ok(next) => next,
             Err(err) => {
                 drop(snapshot_data);
-                release_tsrs_snapshot(session, tsrs_snapshot_id);
+                release_tsrs_snapshot_raw(session, tsrs_snapshot_id);
                 return Err(err);
             }
         };
@@ -174,7 +183,7 @@ pub fn open_projects_snapshot(
                 &state,
             );
             if result.is_err() {
-                release_tsrs_snapshot(session, tsrs_snapshot_id);
+                release_tsrs_snapshot_raw(session, tsrs_snapshot_id);
             }
             return result;
         }
@@ -185,11 +194,11 @@ pub fn open_projects_snapshot(
             match update_snapshot_open_projects(session, prev_snapshot_id, &newly_discovered) {
                 Ok(id) => id,
                 Err(err) => {
-                    release_tsrs_snapshot(session, prev_snapshot_id);
+                    release_tsrs_snapshot_raw(session, prev_snapshot_id);
                     return Err(err);
                 }
             };
-        release_tsrs_snapshot(session, prev_snapshot_id);
+        release_tsrs_snapshot_raw(session, prev_snapshot_id);
         tsrs_snapshot_id = next_snapshot_id;
         pending_inspection.extend(newly_discovered);
     }
@@ -197,10 +206,14 @@ pub fn open_projects_snapshot(
 
 /// Incrementally updates an active snapshot with file notifications and optional entry changes,
 /// preserving `old_tsrs_snapshot_id` untouched on failure so watch sessions can recover cleanly.
+///
+/// # Errors
+/// Returns [`ProjectOpenError`] when updated configs or programs fail to load.
 pub fn update_projects_snapshot(
-    session: &Arc<Session>,
+    session: &BoundarySession,
     input: &UpdateSnapshotInput<'_>,
 ) -> Result<UpdatedProjectsSnapshot, ProjectOpenError> {
+    let session = &session.0;
     let effective_entries: Vec<String> = input
         .entries
         .map_or_else(|| input.old_entry_specs.to_vec(), <[String]>::to_vec);
@@ -211,7 +224,7 @@ pub fn update_projects_snapshot(
     let snapshot_data = discover_updated_references(
         session,
         input.cwd,
-        input.old_tsrs_snapshot_id,
+        input.old_compiler_snapshot_id,
         &mut tsrs_snapshot_id,
         initial_entries,
         &mut state,
@@ -219,7 +232,7 @@ pub fn update_projects_snapshot(
 
     let (tsrs_snapshot_id, snapshot_data) = close_unreachable_projects(
         session,
-        input.old_tsrs_snapshot_id,
+        input.old_compiler_snapshot_id,
         tsrs_snapshot_id,
         snapshot_data,
         input.old_opened_configs,
@@ -235,16 +248,16 @@ pub fn update_projects_snapshot(
     ) {
         Ok(opened) => opened,
         Err(err) => {
-            release_if_intermediate(session, tsrs_snapshot_id, input.old_tsrs_snapshot_id);
+            release_if_intermediate(session, tsrs_snapshot_id, input.old_compiler_snapshot_id);
             return Err(err);
         }
     };
 
     let diff = compute_recomputation_scope(
         input.cwd,
-        input.old_snapshot_data,
+        &input.old_snapshot_data.0,
         input.old_project_ids,
-        &opened.snapshot_data,
+        &opened.snapshot_data.0,
         &opened.project_ids,
     );
 
@@ -287,7 +300,7 @@ fn send_initial_incremental_update(
     };
 
     let payload = serde_json::to_vec(&serde_json::json!({
-        "snapshot": input.old_tsrs_snapshot_id,
+        "snapshot": input.old_compiler_snapshot_id,
         "changes": {
             "openProjects": open_projects,
             "closeProjects": close_projects,
@@ -665,7 +678,7 @@ fn build_opened_snapshot(
             files_with_text,
             workspace_files_with_text,
         });
-        project_ids.insert(project_id, tsrs_pid.clone());
+        project_ids.insert(project_id, BoundaryProjectId(tsrs_pid.clone()));
         summaries.push(summary);
     }
 
@@ -690,8 +703,8 @@ fn build_opened_snapshot(
     let snapshot_digest = compute_snapshot_digest(&mut digest_entries);
 
     Ok(OpenedProjectsSnapshot {
-        tsrs_snapshot_id,
-        snapshot_data,
+        compiler_snapshot_id: tsrs_snapshot_id,
+        snapshot_data: BoundarySnapshotData(snapshot_data),
         entry_specs,
         opened_configs: state.discovery_order.clone(),
         project_ids,
@@ -792,13 +805,13 @@ struct RecomputationDiff {
 fn compute_recomputation_scope(
     cwd: &str,
     old_snapshot: &SnapshotData,
-    old_projects: &BTreeMap<String, ProjectId>,
+    old_projects: &BTreeMap<String, BoundaryProjectId>,
     new_snapshot: &SnapshotData,
-    new_projects: &BTreeMap<String, ProjectId>,
+    new_projects: &BTreeMap<String, BoundaryProjectId>,
 ) -> RecomputationDiff {
     let mut old_all_files = BTreeSet::new();
     for pid in old_projects.values() {
-        if let Ok(prog) = old_snapshot.get_program(pid) {
+        if let Ok(prog) = old_snapshot.get_program(&pid.0) {
             for &sf in prog.get_source_files() {
                 if is_project_source_file(prog, sf) {
                     old_all_files.insert(relative_to_cwd(cwd, sf.file_name()));
@@ -814,12 +827,12 @@ fn compute_recomputation_scope(
     let mut new_all_files = BTreeSet::new();
 
     for (id_str, pid) in new_projects {
-        let Ok(new_prog) = new_snapshot.get_program(pid) else {
+        let Ok(new_prog) = new_snapshot.get_program(&pid.0) else {
             continue;
         };
         let old_prog = old_projects
             .get(id_str)
-            .and_then(|old_pid| old_snapshot.get_program(old_pid).ok());
+            .and_then(|old_pid| old_snapshot.get_program(&old_pid.0).ok());
 
         let project_reused = old_prog.is_some_and(|old| std::ptr::eq(old, new_prog));
         if project_reused {

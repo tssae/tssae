@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use tsrs_ast::Node;
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
 use tssae_analysis::{
     call_resolution::IrCallGraph,
     instance_identity::{
@@ -15,7 +12,9 @@ use tssae_analysis::{
 use tssae_common::{
     EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId,
 };
-use tssae_tsrs_boundary::normalize_path;
+use tssae_tsrs_boundary::{
+    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundarySymbol, normalize_path,
+};
 
 use crate::ir_calls::SnapshotIrEnv;
 use crate::observe::ObserveCollector;
@@ -77,7 +76,7 @@ pub struct InstanceHandleData {
     pub instance_key: String,
     pub origin_kind: &'static str,
     pub allocation_location: Option<SourceLocation>,
-    pub origin_syntax: Option<P<Node>>,
+    pub origin_syntax: Option<BoundaryNode>,
     pub summary_id: Option<String>,
     pub summary_source: Option<SummarySource>,
     pub evidence: Vec<EvidenceItem>,
@@ -148,15 +147,15 @@ pub struct InstanceProjectionRow {
 
 struct TargetHandleInput {
     handle_id: String,
-    node: P<Node>,
-    symbol: Option<P<tsrs_ast::Symbol>>,
+    node: BoundaryNode,
+    symbol: Option<BoundarySymbol>,
 }
 
 struct MaterializedOrigin {
     instance_key: String,
     origin_kind: InstanceOriginKind,
     allocation_location: Option<SourceLocation>,
-    origin_node: Option<P<Node>>,
+    origin_node: Option<BoundaryNode>,
     summary_id: Option<String>,
     summary_source: Option<SummarySource>,
     evidence: Vec<EvidenceItem>,
@@ -280,8 +279,8 @@ type InstanceBatchMaterialized = (
 pub fn run_resolve_instances(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     lookup_files: Option<&[String]>,
     observer: &mut ObserveCollector,

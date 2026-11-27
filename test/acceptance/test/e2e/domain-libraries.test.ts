@@ -680,7 +680,7 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
     // 1. Standalone tssae + @tssae/zod
     await withAcceptanceHost(
       {
-        hostFixture: "acceptance/official-adapters-zod",
+        hostFixture: "acceptance/domain-libraries-zod",
         bundle,
         storeDir: sharedStoreDir,
         directPackages: ["tssae", "@tssae/zod"],
@@ -729,7 +729,7 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
     // 2. Standalone tssae + @tssae/drizzle
     await withAcceptanceHost(
       {
-        hostFixture: "acceptance/official-adapters-drizzle",
+        hostFixture: "acceptance/domain-libraries-drizzle",
         bundle,
         storeDir: sharedStoreDir,
         directPackages: ["tssae", "@tssae/drizzle"],
@@ -778,7 +778,7 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
     // 3. Combined tssae + @tssae/drizzle + @tssae/zod
     await withAcceptanceHost(
       {
-        hostFixture: "acceptance/official-adapters-drizzle-zod",
+        hostFixture: "acceptance/domain-libraries-drizzle-zod",
         bundle,
         storeDir: sharedStoreDir,
         directPackages: ["tssae", "@tssae/drizzle", "@tssae/zod"],

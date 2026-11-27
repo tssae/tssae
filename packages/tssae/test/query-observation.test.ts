@@ -15,7 +15,7 @@ import {
 void describe("tssae query observation, gaps, and explain hooks", () => {
   void it("emits RPC metrics, query cache statuses, recordGaps(), and syntaxLocationOf", async () => {
     await withTempHost(
-      { host: "sdk-queries/fact-providers-explain-gaps" },
+      { host: "sdk-queries/query-observation-gaps" },
       async (host) => {
         await host.typecheck();
 

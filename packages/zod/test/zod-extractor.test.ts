@@ -64,7 +64,7 @@ function withZodHost(
 
 void describe("@tssae/zod", () => {
   void it("extracts basic z.object schemas and .parse/.safeParse/.parseAsync/.safeParseAsync calls while ignoring non-Zod .parse", async () => {
-    await withZodHost("adapters/zod-basic-calls", async (host) => {
+    await withZodHost("domain-libraries/zod-basic-calls", async (host) => {
       await host.typecheck();
 
       let inputResults: readonly ValidatorInputFieldsResult[] = [];
@@ -120,7 +120,7 @@ void describe("@tssae/zod", () => {
   });
 
   void it("distinguishes .nullable(), .optional(), .nullish(), v3 .default(), v4 .prefault()/.catch(), and unwraps outer chains", async () => {
-    await withZodHost("adapters/zod-modifiers", async (host) => {
+    await withZodHost("domain-libraries/zod-modifiers", async (host) => {
       await host.typecheck();
 
       let inputResults: readonly ValidatorInputFieldsResult[] = [];
@@ -193,7 +193,7 @@ void describe("@tssae/zod", () => {
   });
 
   void it("resolves .extend, .merge, .pick, .omit, .partial, .required across files and invalidates cache after session.update()", async () => {
-    await withZodHost("adapters/zod-compositions", async (host) => {
+    await withZodHost("domain-libraries/zod-compositions", async (host) => {
       await host.typecheck();
 
       const session = await openProject({
@@ -266,7 +266,7 @@ void describe("@tssae/zod", () => {
   });
 
   void it("preserves known deterministic fields and emits location-aware Gaps for dynamic constructs", async () => {
-    await withZodHost("adapters/zod-dynamic", async (host) => {
+    await withZodHost("domain-libraries/zod-dynamic", async (host) => {
       await host.typecheck();
 
       const recordedGaps: Gap[] = [];
@@ -325,7 +325,7 @@ void describe("@tssae/zod", () => {
   });
 
   void it("caches snapshot extractions per ProjectSummary with zero RPCs on repeated queries", async () => {
-    await withZodHost("adapters/zod-lazy-cache", async (host) => {
+    await withZodHost("domain-libraries/zod-lazy-cache", async (host) => {
       await host.typecheck();
 
       let rpcCount = 0;
@@ -437,7 +437,7 @@ void describe("@tssae/zod", () => {
     };
 
     await withZodHost(
-      "adapters/zod-real-v4",
+      "domain-libraries/zod-real-v4",
       async (host) => {
         await host.typecheck();
 
@@ -481,7 +481,7 @@ void describe("@tssae/zod", () => {
       { linkZod: true },
     );
 
-    await withZodHost("adapters/zod-provider-stub", async (zodHost) => {
+    await withZodHost("domain-libraries/zod-provider-stub", async (zodHost) => {
       await zodHost.typecheck();
       const session = await openProject({
         cwd: zodHost.rootDir,
@@ -498,35 +498,38 @@ void describe("@tssae/zod", () => {
       }
     });
 
-    await withZodHost("adapters/zod-provider-valibot", async (valibotHost) => {
-      await valibotHost.typecheck();
-      const session = await openProject({
-        cwd: valibotHost.rootDir,
-        tsconfig: "tsconfig.json",
-      });
-      try {
-        const hits = await queryAgeInputs(
-          session.project(),
-          customValibotExtractor,
-        );
-        assert.equal(hits.length, 1);
-        assert.equal(hits[0]!.providerId, "custom-valibot");
-        assert.equal(hits[0]!.at.file, "src/app.ts");
-        assert.equal(hits[0]!.at.line, 9);
-        assert.ok(
-          extractBasisEvidence([hits[0]!]).some((e) =>
-            e.message.includes("Valibot"),
-          ),
-        );
-      } finally {
-        await session.close();
-      }
-    });
+    await withZodHost(
+      "domain-libraries/zod-provider-valibot",
+      async (valibotHost) => {
+        await valibotHost.typecheck();
+        const session = await openProject({
+          cwd: valibotHost.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const hits = await queryAgeInputs(
+            session.project(),
+            customValibotExtractor,
+          );
+          assert.equal(hits.length, 1);
+          assert.equal(hits[0]!.providerId, "custom-valibot");
+          assert.equal(hits[0]!.at.file, "src/app.ts");
+          assert.equal(hits[0]!.at.line, 9);
+          assert.ok(
+            extractBasisEvidence([hits[0]!]).some((e) =>
+              e.message.includes("Valibot"),
+            ),
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
   });
 
   void it("retains explicit .extend/.default/.pick conclusions on standalone drizzle-zod schemas while surfacing unresolved-schema", async () => {
     await withZodHost(
-      "adapters/zod-drizzle-standalone",
+      "domain-libraries/zod-drizzle-standalone",
       async (host) => {
         await host.typecheck();
 
@@ -589,7 +592,7 @@ void describe("@tssae/zod", () => {
 
   void it("tracks runtime field validators, clears superseded gaps on .extend(), and extracts field modifiers", async () => {
     await withZodHost(
-      "adapters/zod-runtime-unknowns",
+      "domain-libraries/zod-runtime-unknowns",
       async (host) => {
         await host.typecheck();
 
@@ -689,7 +692,7 @@ void describe("@tssae/zod", () => {
 
   void it("enforces sound input vs output semantics for .default(21), .and(), z.intersection(), .pipe(), and z.pipe()", async () => {
     await withZodHost(
-      "adapters/zod-combinators",
+      "domain-libraries/zod-combinators",
       async (host) => {
         await host.typecheck();
 
@@ -792,7 +795,7 @@ void describe("@tssae/zod", () => {
 
   void it("replaces known base fields when overridden by unknown field validators and resolves chained overrides", async () => {
     await withZodHost(
-      "adapters/zod-unknown-overrides",
+      "domain-libraries/zod-unknown-overrides",
       async (host) => {
         await host.typecheck();
 
@@ -872,7 +875,7 @@ void describe("@tssae/zod", () => {
 
   void it("replaces output with unresolved-schema for unrecognized .pipe()/z.pipe() targets and preserves unknown in nullable .and()", async () => {
     await withZodHost(
-      "adapters/zod-pipe-and-nullable",
+      "domain-libraries/zod-pipe-and-nullable",
       async (host) => {
         await host.typecheck();
 

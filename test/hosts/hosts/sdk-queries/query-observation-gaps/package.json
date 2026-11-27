@@ -1,5 +1,5 @@
 {
-  "name": "verule-sdk-queries-fact-providers-explain-gaps",
+  "name": "tssae-sdk-queries-query-observation-gaps",
   "version": "0.0.0",
   "private": true,
   "type": "module"

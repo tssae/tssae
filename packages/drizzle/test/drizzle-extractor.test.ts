@@ -62,172 +62,186 @@ function withDrizzleHost(
 
 void describe("@tssae/drizzle", () => {
   void it("extracts column nullability, primary keys, defaults, SQL names, and select projections from drizzle-orm tables", async () => {
-    await withDrizzleHost("adapters/drizzle-table-columns", async (host) => {
-      await host.typecheck();
+    await withDrizzleHost(
+      "domain-libraries/drizzle-table-columns",
+      async (host) => {
+        await host.typecheck();
 
-      let allTables: readonly DrizzleTableColumnsResult[] = [];
-      let filteredTables: readonly DrizzleTableColumnsResult[] = [];
-      let projections: readonly QueryRowProjectionResult[] = [];
+        let allTables: readonly DrizzleTableColumnsResult[] = [];
+        let filteredTables: readonly DrizzleTableColumnsResult[] = [];
+        let projections: readonly QueryRowProjectionResult[] = [];
 
-      const session = await openProject({
-        cwd: host.rootDir,
-        tsconfig: "tsconfig.json",
-      });
-      try {
-        const ctx = session.project();
-        allTables = await extractDrizzleTableColumns(ctx);
-        filteredTables = await extractDrizzleTableColumns(ctx, {
-          tableName: "users",
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
         });
-        const extractor: QueryRowProjectionExtractor = drizzleQueryProjection;
-        projections = await extractor.extractRowProjections(ctx, {
-          library: "drizzle",
-        });
-      } finally {
-        await session.close();
-      }
+        try {
+          const ctx = session.project();
+          allTables = await extractDrizzleTableColumns(ctx);
+          filteredTables = await extractDrizzleTableColumns(ctx, {
+            tableName: "users",
+          });
+          const extractor: QueryRowProjectionExtractor = drizzleQueryProjection;
+          projections = await extractor.extractRowProjections(ctx, {
+            library: "drizzle",
+          });
+        } finally {
+          await session.close();
+        }
 
-      assert.equal(allTables.length, 3);
-      assert.equal(filteredTables.length, 1);
+        assert.equal(allTables.length, 3);
+        assert.equal(filteredTables.length, 1);
 
-      const usersTable = filteredTables[0]!;
-      assert.equal(usersTable.library, "drizzle");
-      assert.equal(usersTable.tableName, "users");
-      assert.equal(usersTable.sqlTableName, "users");
-      assert.equal(usersTable.hasDynamicColumns, false);
-      assert.deepEqual(usersTable.columnNames, [
-        "createdAt",
-        "displayName",
-        "email",
-        "externalId",
-        "id",
-        "role",
-      ]);
+        const usersTable = filteredTables[0]!;
+        assert.equal(usersTable.library, "drizzle");
+        assert.equal(usersTable.tableName, "users");
+        assert.equal(usersTable.sqlTableName, "users");
+        assert.equal(usersTable.hasDynamicColumns, false);
+        assert.deepEqual(usersTable.columnNames, [
+          "createdAt",
+          "displayName",
+          "email",
+          "externalId",
+          "id",
+          "role",
+        ]);
 
-      assert.deepEqual(
-        {
-          sqlName: usersTable.columns.id?.sqlName,
-          nullable: usersTable.columns.id?.nullable,
-          primaryKey: usersTable.columns.id?.primaryKey,
-          hasDefault: usersTable.columns.id?.hasDefault,
-        },
-        { sqlName: "id", nullable: false, primaryKey: true, hasDefault: false },
-      );
-      assert.deepEqual(
-        {
-          sqlName: usersTable.columns.displayName?.sqlName,
-          nullable: usersTable.columns.displayName?.nullable,
-          primaryKey: usersTable.columns.displayName?.primaryKey,
-          hasDefault: usersTable.columns.displayName?.hasDefault,
-        },
-        {
-          sqlName: "display_name",
-          nullable: true,
-          primaryKey: false,
-          hasDefault: false,
-        },
-      );
-      assert.deepEqual(
-        {
-          sqlName: usersTable.columns.role?.sqlName,
-          nullable: usersTable.columns.role?.nullable,
-          primaryKey: usersTable.columns.role?.primaryKey,
-          hasDefault: usersTable.columns.role?.hasDefault,
-        },
-        {
-          sqlName: "role",
-          nullable: false,
-          primaryKey: false,
-          hasDefault: true,
-        },
-      );
-      assert.deepEqual(
-        {
-          sqlName: usersTable.columns.createdAt?.sqlName,
-          nullable: usersTable.columns.createdAt?.nullable,
-          primaryKey: usersTable.columns.createdAt?.primaryKey,
-          hasDefault: usersTable.columns.createdAt?.hasDefault,
-        },
-        {
-          sqlName: "created_at",
-          nullable: false,
-          primaryKey: false,
-          hasDefault: true,
-        },
-      );
-      assert.deepEqual(
-        {
-          sqlName: usersTable.columns.externalId?.sqlName,
-          nullable: usersTable.columns.externalId?.nullable,
-          primaryKey: usersTable.columns.externalId?.primaryKey,
-          hasDefault: usersTable.columns.externalId?.hasDefault,
-        },
-        {
-          sqlName: "external_id",
-          nullable: true,
-          primaryKey: false,
-          hasDefault: true,
-        },
-      );
+        assert.deepEqual(
+          {
+            sqlName: usersTable.columns.id?.sqlName,
+            nullable: usersTable.columns.id?.nullable,
+            primaryKey: usersTable.columns.id?.primaryKey,
+            hasDefault: usersTable.columns.id?.hasDefault,
+          },
+          {
+            sqlName: "id",
+            nullable: false,
+            primaryKey: true,
+            hasDefault: false,
+          },
+        );
+        assert.deepEqual(
+          {
+            sqlName: usersTable.columns.displayName?.sqlName,
+            nullable: usersTable.columns.displayName?.nullable,
+            primaryKey: usersTable.columns.displayName?.primaryKey,
+            hasDefault: usersTable.columns.displayName?.hasDefault,
+          },
+          {
+            sqlName: "display_name",
+            nullable: true,
+            primaryKey: false,
+            hasDefault: false,
+          },
+        );
+        assert.deepEqual(
+          {
+            sqlName: usersTable.columns.role?.sqlName,
+            nullable: usersTable.columns.role?.nullable,
+            primaryKey: usersTable.columns.role?.primaryKey,
+            hasDefault: usersTable.columns.role?.hasDefault,
+          },
+          {
+            sqlName: "role",
+            nullable: false,
+            primaryKey: false,
+            hasDefault: true,
+          },
+        );
+        assert.deepEqual(
+          {
+            sqlName: usersTable.columns.createdAt?.sqlName,
+            nullable: usersTable.columns.createdAt?.nullable,
+            primaryKey: usersTable.columns.createdAt?.primaryKey,
+            hasDefault: usersTable.columns.createdAt?.hasDefault,
+          },
+          {
+            sqlName: "created_at",
+            nullable: false,
+            primaryKey: false,
+            hasDefault: true,
+          },
+        );
+        assert.deepEqual(
+          {
+            sqlName: usersTable.columns.externalId?.sqlName,
+            nullable: usersTable.columns.externalId?.nullable,
+            primaryKey: usersTable.columns.externalId?.primaryKey,
+            hasDefault: usersTable.columns.externalId?.hasDefault,
+          },
+          {
+            sqlName: "external_id",
+            nullable: true,
+            primaryKey: false,
+            hasDefault: true,
+          },
+        );
 
-      assert.ok(
-        usersTable.evidence.some(
-          (item) => item.kind === "source" && item.at?.file === "src/schema.ts",
-        ),
-      );
-      assert.ok(evidenceOf(usersTable).length > 0);
-      assert.ok(extractBasisEvidence([usersTable]).length > 0);
+        assert.ok(
+          usersTable.evidence.some(
+            (item) =>
+              item.kind === "source" && item.at?.file === "src/schema.ts",
+          ),
+        );
+        assert.ok(evidenceOf(usersTable).length > 0);
+        assert.ok(extractBasisEvidence([usersTable]).length > 0);
 
-      const sessionsTable = allTables.find((t) => t.tableName === "sessions")!;
-      assert.equal(sessionsTable.columns.id?.primaryKey, true);
-      assert.equal(sessionsTable.columns.id?.nullable, false);
-      assert.equal(sessionsTable.columns.token?.nullable, false);
+        const sessionsTable = allTables.find(
+          (t) => t.tableName === "sessions",
+        )!;
+        assert.equal(sessionsTable.columns.id?.primaryKey, true);
+        assert.equal(sessionsTable.columns.id?.nullable, false);
+        assert.equal(sessionsTable.columns.token?.nullable, false);
 
-      const auditTable = allTables.find((t) => t.tableName === "auditLogs")!;
-      assert.equal(auditTable.sqlTableName, "audit_logs");
-      assert.equal(auditTable.columns.id?.primaryKey, true);
-      assert.equal(auditTable.columns.note?.nullable, true);
+        const auditTable = allTables.find((t) => t.tableName === "auditLogs")!;
+        assert.equal(auditTable.sqlTableName, "audit_logs");
+        assert.equal(auditTable.columns.id?.primaryKey, true);
+        assert.equal(auditTable.columns.note?.nullable, true);
 
-      assert.equal(projections.length, 1);
-      assert.deepEqual(projections[0]?.projectedColumns, ["email", "id"]);
-    });
+        assert.equal(projections.length, 1);
+        assert.deepEqual(projections[0]?.projectedColumns, ["email", "id"]);
+      },
+    );
   });
 
   void it("preserves static columns, emits dynamic gaps, and extracts returning/getTableColumns/relational projections", async () => {
-    await withDrizzleHost("adapters/drizzle-dynamic-tables", async (host) => {
-      await host.typecheck();
+    await withDrizzleHost(
+      "domain-libraries/drizzle-dynamic-tables",
+      async (host) => {
+        await host.typecheck();
 
-      const session = await openProject({
-        cwd: host.rootDir,
-        tsconfig: "tsconfig.json",
-      });
-      try {
-        const ctx = session.project();
-        const tables = await extractDrizzleTableColumns(ctx);
-        const projs = await extractDrizzleRowProjections(ctx);
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const tables = await extractDrizzleTableColumns(ctx);
+          const projs = await extractDrizzleRowProjections(ctx);
 
-        assert.equal(tables.length, 1);
-        const eventsTable = tables[0]!;
-        assert.equal(eventsTable.tableName, "events");
-        assert.equal(eventsTable.hasDynamicColumns, true);
-        assert.deepEqual(eventsTable.columnNames, ["createdAt", "id"]);
-        assert.equal(eventsTable.columns.createdAt?.nullable, false);
-        assert.equal(eventsTable.columns.createdAt?.hasDefault, true);
-        assert.equal(eventsTable.gaps.length, 2);
-        assert.ok(
-          eventsTable.gaps.every((g) => g.kind === "dynamic-table-columns"),
-        );
+          assert.equal(tables.length, 1);
+          const eventsTable = tables[0]!;
+          assert.equal(eventsTable.tableName, "events");
+          assert.equal(eventsTable.hasDynamicColumns, true);
+          assert.deepEqual(eventsTable.columnNames, ["createdAt", "id"]);
+          assert.equal(eventsTable.columns.createdAt?.nullable, false);
+          assert.equal(eventsTable.columns.createdAt?.hasDefault, true);
+          assert.equal(eventsTable.gaps.length, 2);
+          assert.ok(
+            eventsTable.gaps.every((g) => g.kind === "dynamic-table-columns"),
+          );
 
-        assert.equal(projs.length, 1);
-        assert.equal(projs[0]!.hasDynamicColumns, true);
-        assert.deepEqual(projs[0]!.projectedColumns, ["id"]);
-        assert.ok(
-          projs[0]!.gaps.some((g) => g.kind === "dynamic-query-projection"),
-        );
-      } finally {
-        await session.close();
-      }
-    });
+          assert.equal(projs.length, 1);
+          assert.equal(projs[0]!.hasDynamicColumns, true);
+          assert.deepEqual(projs[0]!.projectedColumns, ["id"]);
+          assert.ok(
+            projs[0]!.gaps.some((g) => g.kind === "dynamic-query-projection"),
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
 
     // Also verify full-table select(), getTableColumns(), and insert/update/delete(...).returning(...)
     await withDrizzleHost(
@@ -328,7 +342,7 @@ export function runQueries() {
 
   void it("resolves cross-package Drizzle table declarations for untargeted scans and targeted DeclarationRef/SyntaxRef queries", async () => {
     await withDrizzleHost(
-      "adapters/drizzle-cross-package",
+      "domain-libraries/drizzle-cross-package",
       async (host) => {
         await host.typecheck("packages/app/tsconfig.json");
 
@@ -420,7 +434,7 @@ export function runQueries() {
 
   void it("recognizes createSelectSchema and createSchemaFactory via real drizzle-zod provenance and rejects fake functions", async () => {
     await withDrizzleHost(
-      "adapters/drizzle-zod-provenance",
+      "domain-libraries/drizzle-zod-provenance",
       async (host) => {
         await host.typecheck();
 
@@ -473,7 +487,7 @@ export function runQueries() {
 
   void it("resolves refinements when enabled, supports refineFields:false, and emits unresolved-drizzle-table gaps", async () => {
     await withDrizzleHost(
-      "adapters/drizzle-zod-gaps",
+      "domain-libraries/drizzle-zod-gaps",
       async (host) => {
         await host.typecheck();
 
@@ -528,7 +542,7 @@ export function runQueries() {
 
   void it("composes drizzle-zod tables, callback refinements, .extend()/.pick(), relational projections, caching, and session.update()", async () => {
     await withDrizzleHost(
-      "acceptance/official-adapters-drizzle-zod",
+      "acceptance/domain-libraries-drizzle-zod",
       async (host) => {
         let rpcCount = 0;
         const session = await openProject({

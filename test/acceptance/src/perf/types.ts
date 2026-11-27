@@ -1,3 +1,5 @@
+import type { CorpusSourceOrigin } from "../corpus.ts";
+
 export type CorpusProfileId = "medium" | "large";
 
 export type CorpusProfileSpec = {
@@ -27,19 +29,7 @@ export type MaterializedCorpus = {
   readonly targetCalleeName: string;
   readonly cacheHit: boolean;
   readonly cacheBypassed: boolean;
-  readonly sourceOrigin: "cache" | "host-mirror" | "remote";
-};
-
-export type BaselineArtifact = {
-  readonly rev: string;
-  readonly commitSha: string;
-  readonly cacheKey: string;
-  readonly cacheDir: string;
-  readonly tarballPath: string;
-  readonly version: string;
-  readonly sha256: string;
-  readonly binarySha256: string;
-  readonly cacheHit: boolean;
+  readonly sourceOrigin: CorpusSourceOrigin;
 };
 
 export type PerfScenarioId =

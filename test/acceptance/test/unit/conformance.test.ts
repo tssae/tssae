@@ -270,8 +270,22 @@ void describe("conformance sweep runner", () => {
           "}",
           "class Box {",
           "  value = seed > 0 ? 10 : 20;",
+          "  extra = 30;",
           "}",
           "void Box;",
+          "",
+        ].join("\n"),
+        "test/export-and-class-expr.js": [
+          "var seed = 1;",
+          "class SingleBranchBox {",
+          "  value = seed > 0 ? 10 : 20;",
+          "  second = 30;",
+          "}",
+          "var ExprBox = class {",
+          "  flag = seed > 0 ? 'a' : 'b';",
+          "  other = 'c';",
+          "};",
+          "export default seed > 1 ? SingleBranchBox : ExprBox;",
           "",
         ].join("\n"),
       });
@@ -283,7 +297,7 @@ void describe("conformance sweep runner", () => {
         commitSha,
         sparsePaths: ["test"],
         fileMatch: { scanPaths: ["test"], extensions: [".js"] },
-        minFileCount: 1,
+        minFileCount: 2,
       };
 
       const report = await runConformanceSweep({
@@ -298,9 +312,57 @@ void describe("conformance sweep runner", () => {
       });
 
       assert.equal(report.passed, true);
-      assert.equal(report.totalFiles, 1);
-      // 6 root top-level statements: "use strict";, var seed = 1;, for-of, try-finally, class Box, void Box;
-      assert.equal(report.totalScopes, 6);
+      assert.equal(report.totalFiles, 2);
+      // strict-script.js: 6 root top-level statements + 1 Box default constructor scope = 7
+      // export-and-class-expr.js: 4 root top-level statements (incl. ExportAssignment)
+      //   + 1 SingleBranchBox default constructor + 1 ExprBox default constructor = 6
+      assert.equal(report.totalScopes, 13);
+
+      // Verify export-and-class-expr.js in isolation produces real branches (3 branchCoverage queries:
+      // SingleBranchBox default ctor, ExprBox default ctor, and ExportAssignment) rather than 0-branch no-ops.
+      const singleFileRepo = createGitCorpusRepo(
+        join(tempDir, "branch-proof"),
+        {
+          "test/only-class-and-export-branches.js": [
+            "var seed = 1;",
+            "class SingleBranchBox {",
+            "  value = seed > 0 ? 10 : 20;",
+            "  second = 30;",
+            "}",
+            "var ExprBox = class {",
+            "  flag = seed > 0 ? 'a' : 'b';",
+            "  other = 'c';",
+            "};",
+            "export default seed > 1 ? SingleBranchBox : ExprBox;",
+            "",
+          ].join("\n"),
+        },
+      );
+      const singleReport = await runConformanceSweep({
+        corpora: [
+          {
+            id: "mini-branch-proof",
+            repoUrl: singleFileRepo.bareOriginDir,
+            repoName: "branch-proof",
+            commitSha: singleFileRepo.commitSha,
+            sparsePaths: ["test"],
+            fileMatch: { scanPaths: ["test"], extensions: [".js"] },
+            minFileCount: 1,
+          },
+        ],
+        corpusCacheDir: join(tempDir, "cache-proof"),
+        hostMirrorPaths: [singleFileRepo.bareOriginDir],
+        batchSize: 1,
+        concurrency: 1,
+        batchTimeoutMs: 10_000,
+        tssaeEntryPath,
+        logProgress: () => {},
+      });
+      assert.equal(singleReport.passed, true);
+      assert.equal(singleReport.totalScopes, 6);
+      // 5 base queries (findSyntax, listBranches, resolveInstances, valuePropagation, instanceCleanup)
+      // + 3 branchCoverage queries (SingleBranchBox, ExprBox, ExportAssignment) = 8 queries total.
+      assert.equal(singleReport.totalQueries, 8);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

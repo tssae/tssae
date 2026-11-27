@@ -438,6 +438,30 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "  yield* yieldMappedArray(item);",
             "}",
             "",
+            "async function* yieldWrappedPromise(item: string): AsyncGenerator<string> {",
+            "  yield Promise.resolve(item);",
+            "}",
+            "",
+            "function* syncGenMappedArray(item: string): Generator<string[]> {",
+            "  yield [item].map((x) => x);",
+            "}",
+            "",
+            "async function* delegateSyncGenMappedArray(item: string): AsyncGenerator<string[]> {",
+            "  yield* syncGenMappedArray(item);",
+            "}",
+            "",
+            "function* delegateSecondTupleElem(item: string): Generator<string> {",
+            "  yield* ['safe', item];",
+            "}",
+            "",
+            "async function asyncWrapArray(item: string): Promise<string[]> {",
+            "  return [item];",
+            "}",
+            "",
+            "async function asyncReturnPromise(item: string): Promise<string> {",
+            "  return Promise.resolve(item);",
+            "}",
+            "",
             "export async function runGeneratorFlows(): Promise<void> {",
             "  const raw = origin();",
             "  for (const elem of yieldSingle(raw)) {",
@@ -457,6 +481,49 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "  for await (const dArr of delegateAsyncMappedArray(raw)) {",
             "    sink('asyncGenDelegateArrContainer', dArr);",
             "    sink('asyncGenDelegateArrElem', dArr[0]);",
+            "  }",
+            "",
+            "  // 2A: async function* yielding a Promise (AsyncGeneratorYield implicitly awaits operand)",
+            "  for await (const pVal of yieldWrappedPromise(raw)) {",
+            "    sink('asyncGenYieldPromiseForAwait', pVal);",
+            "  }",
+            "  sink('asyncGenYieldPromiseNextVal', (await yieldWrappedPromise(raw).next()).value);",
+            "",
+            "  // 2B: async function* yield* delegating to sync generator yielding an array (and direct for-await)",
+            "  for await (const syncDelegatedArr of delegateSyncGenMappedArray(raw)) {",
+            "    sink('asyncDelegateSyncArrContainer', syncDelegatedArr);",
+            "    sink('asyncDelegateSyncArrElem', syncDelegatedArr[0]);",
+            "  }",
+            "  for await (const directSyncArr of syncGenMappedArray(raw)) {",
+            "    sink('forAwaitSyncGenArrContainer', directSyncArr);",
+            "    sink('forAwaitSyncGenArrElem', directSyncArr[0]);",
+            "  }",
+            "",
+            "  // 2C: await on synchronous iterator step before reading .value",
+            "  const syncStep = await yieldSingle(raw).next();",
+            "  sink('awaitSyncGenNextValue', syncStep.value);",
+            "",
+            "  // Additional Promise vs Element separation & flattening checks",
+            "  for (const tupleElem of delegateSecondTupleElem(raw)) {",
+            "    sink('delegateTupleElem', tupleElem);",
+            "  }",
+            "  const awaitedArr = await asyncWrapArray(raw);",
+            "  sink('asyncFnArrContainer', awaitedArr);",
+            "  sink('asyncFnArrElem', awaitedArr[0]);",
+            "  sink('asyncFnFlattenedPromise', await asyncReturnPromise(raw));",
+            "  sink('unawaitedAsyncFnItself', asyncReturnPromise(raw));",
+            "  const nonPromiseArr = await [raw];",
+            "  sink('awaitNonPromiseArrContainer', nonPromiseArr);",
+            "  sink('awaitNonPromiseArrElem', nonPromiseArr[0]);",
+            "  const allArr = await Promise.all([Promise.resolve(raw)]);",
+            "  sink('promiseAllContainer', allArr);",
+            "  sink('promiseAllElem', allArr[0]);",
+            "  const raceVal = await Promise.race([Promise.resolve(raw)]);",
+            "  sink('promiseRaceVal', raceVal);",
+            "  const [settledItem] = await Promise.allSettled([Promise.resolve(raw)]);",
+            "  if (settledItem && settledItem.status === 'fulfilled') {",
+            "    sink('promiseAllSettledItem', settledItem);",
+            "    sink('promiseAllSettledVal', settledItem.value);",
             "  }",
             "}",
             "",
@@ -489,6 +556,25 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "asyncGenArrElem",
             "asyncGenDelegateArrContainer",
             "asyncGenDelegateArrElem",
+            "asyncGenYieldPromiseForAwait",
+            "asyncGenYieldPromiseNextVal",
+            "asyncDelegateSyncArrContainer",
+            "asyncDelegateSyncArrElem",
+            "forAwaitSyncGenArrContainer",
+            "forAwaitSyncGenArrElem",
+            "awaitSyncGenNextValue",
+            "delegateTupleElem",
+            "asyncFnArrContainer",
+            "asyncFnArrElem",
+            "asyncFnFlattenedPromise",
+            "unawaitedAsyncFnItself",
+            "awaitNonPromiseArrContainer",
+            "awaitNonPromiseArrElem",
+            "promiseAllContainer",
+            "promiseAllElem",
+            "promiseRaceVal",
+            "promiseAllSettledItem",
+            "promiseAllSettledVal",
           ] as const;
           const targets = tags.map((tag) => {
             const sinkCall = calls.find((c) =>
@@ -525,6 +611,54 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "disproved",
           );
           assert.equal(byTag.get("asyncGenDelegateArrElem")!.status, "proved");
+
+          // 2A assertions
+          assert.equal(
+            byTag.get("asyncGenYieldPromiseForAwait")!.status,
+            "proved",
+          );
+          assert.notEqual(
+            byTag.get("asyncGenYieldPromiseNextVal")!.status,
+            "disproved",
+          );
+
+          // 2B assertions
+          assert.equal(
+            byTag.get("asyncDelegateSyncArrContainer")!.status,
+            "disproved",
+          );
+          assert.equal(byTag.get("asyncDelegateSyncArrElem")!.status, "proved");
+          assert.equal(
+            byTag.get("forAwaitSyncGenArrContainer")!.status,
+            "disproved",
+          );
+          assert.equal(byTag.get("forAwaitSyncGenArrElem")!.status, "proved");
+
+          // 2C assertion
+          assert.notEqual(
+            byTag.get("awaitSyncGenNextValue")!.status,
+            "disproved",
+          );
+
+          // Additional Promise vs Element separation assertions
+          assert.equal(byTag.get("delegateTupleElem")!.status, "proved");
+          assert.equal(byTag.get("asyncFnArrContainer")!.status, "disproved");
+          assert.equal(byTag.get("asyncFnArrElem")!.status, "proved");
+          assert.equal(byTag.get("asyncFnFlattenedPromise")!.status, "proved");
+          assert.equal(
+            byTag.get("unawaitedAsyncFnItself")!.status,
+            "disproved",
+          );
+          assert.equal(
+            byTag.get("awaitNonPromiseArrContainer")!.status,
+            "disproved",
+          );
+          assert.equal(byTag.get("awaitNonPromiseArrElem")!.status, "proved");
+          assert.equal(byTag.get("promiseAllContainer")!.status, "disproved");
+          assert.equal(byTag.get("promiseAllElem")!.status, "proved");
+          assert.equal(byTag.get("promiseRaceVal")!.status, "proved");
+          assert.equal(byTag.get("promiseAllSettledItem")!.status, "disproved");
+          assert.equal(byTag.get("promiseAllSettledVal")!.status, "proved");
         } finally {
           await session.close();
         }

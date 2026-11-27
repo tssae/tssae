@@ -441,6 +441,11 @@ impl<'a> IrInstanceResolver<'a> {
         self.owned_graph.as_ref()
     }
 
+    fn is_file_allowed_for_fields(&self, file: FileId) -> bool {
+        self.allowed_files
+            .is_none_or(|allowed| allowed.contains(&file) || self.extra_field_files.contains(&file))
+    }
+
     fn ensure_field_index(&mut self) -> &IrFieldWriteIndex {
         if let Some(idx) = self.cached_field_index {
             return idx;
@@ -2112,6 +2117,9 @@ impl<'a> IrInstanceResolver<'a> {
             .unwrap_or_default();
 
         for site in candidates {
+            if !self.is_file_allowed_for_fields(site.scope_ir.id.file) {
+                continue;
+            }
             if site.is_private != is_private {
                 continue;
             }
@@ -2515,6 +2523,7 @@ impl<'a> IrInstanceResolver<'a> {
 
     fn collect_caller_syntaxes(&mut self, fn_syn: SyntaxId) -> Vec<SyntaxId> {
         let target_symbol = self.semantic.symbol_at_syntax(fn_syn);
+        let allowed_files = self.allowed_files;
         let Some(graph) = self.call_graph() else {
             return Vec::new();
         };
@@ -2524,6 +2533,11 @@ impl<'a> IrInstanceResolver<'a> {
             && let Some(indices) = graph.by_symbol.get(&sym)
         {
             for &idx in indices {
+                if let Some(allowed) = allowed_files
+                    && !allowed.contains(&graph.sites[idx].file)
+                {
+                    continue;
+                }
                 let s = graph.sites[idx].call_syntax;
                 if seen.insert(s) {
                     syntaxes.push(s);
@@ -2532,6 +2546,11 @@ impl<'a> IrInstanceResolver<'a> {
         }
         if let Some(indices) = graph.by_decl.get(&fn_syn) {
             for &idx in indices {
+                if let Some(allowed) = allowed_files
+                    && !allowed.contains(&graph.sites[idx].file)
+                {
+                    continue;
+                }
                 let s = graph.sites[idx].call_syntax;
                 if seen.insert(s) {
                     syntaxes.push(s);

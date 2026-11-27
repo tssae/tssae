@@ -1524,4 +1524,131 @@ void describe("tssae call-effects and instanceCleanup", () => {
       },
     );
   });
+
+  void it("completes deep diamond call DAGs in instanceCleanup without exponential blowup", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-instance-cleanup-dag",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/cleanup-dag.ts": [
+            "class Resource {",
+            "  dispose(): void {}",
+            "}",
+            "class CleanupDagRunner {",
+            "  private readonly res: Resource;",
+            "  constructor(res: Resource) {",
+            "    this.res = res;",
+            "  }",
+            "  d0(): void { this.d1a(); this.d1b(); this.d1c(); }",
+            "  d1a(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d1b(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d1c(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d2a(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d2b(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d2c(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d3a(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d3b(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d3c(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d4a(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d4b(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d4c(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d5a(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d5b(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d5c(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d6a(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d6b(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d6c(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d7a(): void { this.leaf(); }",
+            "  d7b(): void { this.leaf(); }",
+            "  d7c(): void { this.leaf(); }",
+            "  leaf(): void { this.res.dispose(); }",
+            "}",
+            "export function runCleanupDag(): void {",
+            "  const res = new Resource();",
+            "  const runner = new CleanupDagRunner(res);",
+            "  runner.d0();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: {
+            packs: [
+              defineSummaries({
+                id: "cleanup-dag-pack",
+                entries: [
+                  {
+                    match: {
+                      module: "src/cleanup-dag.ts",
+                      memberPath: ["Resource", "prototype", "dispose"],
+                    },
+                    effects: {
+                      completeness: "complete",
+                      resourceOps: [
+                        { kind: "disposes-target", target: "receiver" },
+                      ],
+                    },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/cleanup-dag.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runCleanupDag = fns.find((f) =>
+            f.text.includes("function runCleanupDag"),
+          );
+          const news = await ctx.findSyntax({
+            files: ["src/cleanup-dag.ts"],
+            kinds: ["NewExpression"],
+          });
+          const newRes = news.find((n) => n.text.includes("new Resource()"));
+          assert.ok(runCleanupDag && newRes);
+
+          const [inst] = await ctx.resolveInstances([newRes.ref]);
+          assert.ok(inst?.status === "proved" && inst.instance);
+
+          const startMs = Date.now();
+          const [cleanup] = await ctx.instanceCleanup({
+            scopes: [runCleanupDag.ref],
+            targets: [inst.instance],
+          });
+          const elapsedMs = Date.now() - startMs;
+
+          assert.ok(
+            elapsedMs < 5000,
+            `expected fast DAG instanceCleanup, took ${elapsedMs}ms`,
+          );
+          assert.equal(cleanup?.targetResults[0]?.status, "proved");
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

@@ -2,13 +2,17 @@ use std::{cell::RefCell, collections::HashSet, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_analysis::{
-    call_resolution::build_ir_call_graph_with_summaries,
+    call_resolution::{
+        build_ir_call_graph_file_shard, build_ir_call_graph_with_summaries, find_callers_on_ir,
+        merge_ir_call_graph_shards, resolve_call_targets_with_summaries,
+    },
     instance_cleanup::{
         CleanupScopeSpec, CleanupTargetSpec, TargetCleanupStatusData,
         evaluate_instance_cleanup_on_ir,
     },
     instance_identity::{
-        InstanceResolutionOutcome, InstanceTargetSpec, IrFieldWriteIndex, resolve_instances_on_ir,
+        InstanceResolutionOutcome, InstanceTargetSpec, IrFieldWriteIndex,
+        build_ir_field_write_file_shard, merge_ir_field_write_shards, resolve_instances_on_ir,
     },
     ir::{
         AssignOp, BindingMutability, CfgVertex, DeclarationSemantics, ExplicitEdge,
@@ -2629,4 +2633,835 @@ fn pre_populated_global_caches_respect_lookup_files_scoping() {
         "bg_origin from excluded bg_0.ts must NOT be proved via cached indexes, got {:?}",
         cleanup_outcome.results[0].target_results[1].status
     );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Verifies sharded call-graph/field-write merging and lazy parameter binding parity across callersOf, valuePropagation, and resolveInstances."
+)]
+fn sharded_call_graph_and_lazy_parameter_bindings_match_full_build() {
+    let mut env = ScopedTestEnv::default();
+
+    let entry_file = FileId(0);
+    let callee_file = FileId(1);
+    let third_file = FileId(2);
+    let project_files = vec![entry_file, callee_file, third_file];
+
+    env.file_paths
+        .insert(entry_file, "src/entry.ts".to_string());
+    env.file_paths
+        .insert(callee_file, "src/callee.ts".to_string());
+    env.file_paths
+        .insert(third_file, "src/third.ts".to_string());
+
+    // callee_file: function attach(box, val) { box.conn = val; return box; }
+    let callee_fn = syn(1, 1);
+    let callee_box_param = syn(1, 2);
+    let callee_val_param = syn(1, 3);
+    let callee_box_read = syn(1, 4);
+    let callee_val_read = syn(1, 5);
+    let callee_prop_write = syn(1, 6);
+    let callee_ret_read = syn(1, 7);
+    let callee_ret = syn(1, 8);
+    let callee_sym = SymbolId(101);
+
+    env.locations.insert(callee_fn, loc("src/callee.ts", 1));
+    env.locations
+        .insert(callee_box_param, loc("src/callee.ts", 10));
+    env.locations
+        .insert(callee_val_param, loc("src/callee.ts", 15));
+    env.locations
+        .insert(callee_ret_read, loc("src/callee.ts", 30));
+    env.symbols.insert(callee_fn, callee_sym);
+    env.decls.insert(
+        callee_fn,
+        DeclarationSummaryData {
+            symbol: Some(callee_sym),
+            primary_syntax: Some(callee_fn),
+            name: Some("attach".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/callee.ts", 1)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(callee_fn),
+        },
+    );
+
+    // entry_file: function run(arg) { const box = {}; const token = "tok"; attach(box, token); return box.conn; }
+    let entry_fn = syn(0, 1);
+    let entry_arg_param = syn(0, 2);
+    let entry_box_alloc = syn(0, 3);
+    let entry_box_decl = syn(0, 4);
+    let entry_tok_lit = syn(0, 5);
+    let entry_tok_decl = syn(0, 6);
+    let entry_callee_ref = syn(0, 7);
+    let entry_box_arg = syn(0, 8);
+    let entry_tok_arg = syn(0, 9);
+    let entry_attach_call = syn(0, 10);
+    let entry_box_read2 = syn(0, 11);
+    let entry_conn_read = syn(0, 12);
+
+    env.locations.insert(entry_fn, loc("src/entry.ts", 1));
+    env.locations
+        .insert(entry_attach_call, loc("src/entry.ts", 40));
+    env.locations.insert(entry_tok_lit, loc("src/entry.ts", 20));
+    env.locations
+        .insert(entry_box_alloc, loc("src/entry.ts", 10));
+    env.locations
+        .insert(entry_conn_read, loc("src/entry.ts", 50));
+    env.decls.insert(
+        entry_callee_ref,
+        DeclarationSummaryData {
+            symbol: Some(callee_sym),
+            primary_syntax: Some(callee_fn),
+            name: Some("attach".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/callee.ts", 1)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(callee_fn),
+        },
+    );
+    env.enclosing.insert(entry_attach_call, entry_fn);
+    env.enclosing.insert(entry_tok_lit, entry_fn);
+    env.enclosing.insert(entry_conn_read, entry_fn);
+    env.enclosing.insert(callee_val_param, callee_fn);
+    env.enclosing.insert(callee_box_param, callee_fn);
+
+    // third_file: function other() { attach(x, y); }
+    let third_fn = syn(2, 1);
+    let third_box_lit = syn(2, 2);
+    let third_val_lit = syn(2, 3);
+    let third_callee_ref = syn(2, 4);
+    let third_attach_call = syn(2, 5);
+    env.locations.insert(third_fn, loc("src/third.ts", 1));
+    env.locations
+        .insert(third_attach_call, loc("src/third.ts", 30));
+    env.locations.insert(third_box_lit, loc("src/third.ts", 10));
+    env.locations.insert(third_val_lit, loc("src/third.ts", 20));
+    env.decls.insert(
+        third_callee_ref,
+        DeclarationSummaryData {
+            symbol: Some(callee_sym),
+            primary_syntax: Some(callee_fn),
+            name: Some("attach".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/callee.ts", 1)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(callee_fn),
+        },
+    );
+    env.enclosing.insert(third_attach_call, third_fn);
+
+    env.irs.insert(
+        callee_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: callee_file,
+                local_scope: 1,
+            },
+            root_syntax: callee_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/callee.ts", 1),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![
+                IrParameter {
+                    name: "box".to_string(),
+                    syntax: callee_box_param,
+                    binding: Some(LocalBindingId(0)),
+                    raw_value: None,
+                    is_rest: false,
+                    has_default: false,
+                },
+                IrParameter {
+                    name: "val".to_string(),
+                    syntax: callee_val_param,
+                    binding: Some(LocalBindingId(1)),
+                    raw_value: None,
+                    is_rest: false,
+                    has_default: false,
+                },
+            ],
+            bindings: vec![
+                IrLocalBinding {
+                    id: LocalBindingId(0),
+                    name: "box".to_string(),
+                    mutability: BindingMutability::Parameter,
+                    syntax: callee_box_param,
+                    symbol: None,
+                },
+                IrLocalBinding {
+                    id: LocalBindingId(1),
+                    name: "val".to_string(),
+                    mutability: BindingMutability::Parameter,
+                    syntax: callee_val_param,
+                    symbol: None,
+                },
+            ],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/callee.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/callee.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/callee.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/callee.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(callee_box_read),
+                    "src/callee.ts",
+                    Some(ValueId(0)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(callee_val_read),
+                    "src/callee.ts",
+                    Some(ValueId(1)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(1),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(callee_prop_write),
+                    "src/callee.ts",
+                    None,
+                    IrOp::PropWrite {
+                        object: ValueId(0),
+                        key: IrPropKey::Named("conn".to_string()),
+                        op: AssignOp::Assign,
+                        value: ValueId(1),
+                        is_super: false,
+                        implicit_call_kind: None,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(callee_ret_read),
+                    "src/callee.ts",
+                    Some(ValueId(2)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(8),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    8,
+                    Some(callee_ret),
+                    "src/callee.ts",
+                    None,
+                    IrOp::Return {
+                        value: Some(ValueId(2)),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Return,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 3,
+        }),
+    );
+
+    env.irs.insert(
+        entry_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: entry_file,
+                local_scope: 1,
+            },
+            root_syntax: entry_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/entry.ts", 1),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![IrParameter {
+                name: "arg".to_string(),
+                syntax: entry_arg_param,
+                binding: Some(LocalBindingId(0)),
+                raw_value: None,
+                is_rest: false,
+                has_default: false,
+            }],
+            bindings: vec![
+                IrLocalBinding {
+                    id: LocalBindingId(0),
+                    name: "arg".to_string(),
+                    mutability: BindingMutability::Parameter,
+                    syntax: entry_arg_param,
+                    symbol: None,
+                },
+                IrLocalBinding {
+                    id: LocalBindingId(1),
+                    name: "box".to_string(),
+                    mutability: BindingMutability::Const,
+                    syntax: entry_box_decl,
+                    symbol: None,
+                },
+                IrLocalBinding {
+                    id: LocalBindingId(2),
+                    name: "token".to_string(),
+                    mutability: BindingMutability::Const,
+                    syntax: entry_tok_decl,
+                    symbol: None,
+                },
+            ],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/entry.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/entry.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(entry_box_alloc),
+                    "src/entry.ts",
+                    Some(ValueId(0)),
+                    IrOp::ObjectAlloc {
+                        props: vec![],
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(entry_box_decl),
+                    "src/entry.ts",
+                    None,
+                    IrOp::AssignLocal {
+                        target: LocalBindingId(1),
+                        op: AssignOp::Assign,
+                        value: ValueId(0),
+                        is_init: true,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(entry_tok_lit),
+                    "src/entry.ts",
+                    Some(ValueId(1)),
+                    IrOp::ObjectAlloc {
+                        props: vec![],
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(entry_tok_decl),
+                    "src/entry.ts",
+                    None,
+                    IrOp::AssignLocal {
+                        target: LocalBindingId(2),
+                        op: AssignOp::Assign,
+                        value: ValueId(1),
+                        is_init: true,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(8),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    8,
+                    Some(entry_callee_ref),
+                    "src/entry.ts",
+                    Some(ValueId(2)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: entry_callee_ref,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(9),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    9,
+                    Some(entry_box_arg),
+                    "src/entry.ts",
+                    Some(ValueId(3)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(1),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(10),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    10,
+                    Some(entry_tok_arg),
+                    "src/entry.ts",
+                    Some(ValueId(4)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(2),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(11),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    11,
+                    Some(entry_attach_call),
+                    "src/entry.ts",
+                    Some(ValueId(5)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(2),
+                        receiver: None,
+                        args: vec![
+                            IrCallArg::Positional(ValueId(3)),
+                            IrCallArg::Positional(ValueId(4)),
+                        ],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(12),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    12,
+                    Some(entry_box_read2),
+                    "src/entry.ts",
+                    Some(ValueId(6)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(1),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(13),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    13,
+                    Some(entry_conn_read),
+                    "src/entry.ts",
+                    Some(ValueId(7)),
+                    IrOp::PropRead {
+                        object: ValueId(6),
+                        key: IrPropKey::Named("conn".to_string()),
+                        is_super: false,
+                        implicit_call_kind: None,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: std::iter::once((entry_conn_read.local_id(), VertexId(13))).collect(),
+            expr_to_value: [
+                (entry_tok_lit.local_id(), ValueId(1)),
+                (entry_conn_read.local_id(), ValueId(7)),
+            ]
+            .into_iter()
+            .collect(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 8,
+        }),
+    );
+
+    env.irs.insert(
+        third_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: third_file,
+                local_scope: 1,
+            },
+            root_syntax: third_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/third.ts", 1),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![],
+            bindings: vec![],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/third.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/third.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/third.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/third.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(third_box_lit),
+                    "src/third.ts",
+                    Some(ValueId(0)),
+                    IrOp::ObjectAlloc {
+                        props: vec![],
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(third_val_lit),
+                    "src/third.ts",
+                    Some(ValueId(1)),
+                    IrOp::Literal {
+                        kind: LiteralKind::String("third".to_string()),
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(third_callee_ref),
+                    "src/third.ts",
+                    Some(ValueId(2)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: third_callee_ref,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(third_attach_call),
+                    "src/third.ts",
+                    Some(ValueId(3)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(2),
+                        receiver: None,
+                        args: vec![
+                            IrCallArg::Positional(ValueId(0)),
+                            IrCallArg::Positional(ValueId(1)),
+                        ],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 4,
+        }),
+    );
+
+    env.scopes_by_file.insert(
+        entry_file,
+        vec![scope_entry(entry_fn, IrScopeKind::Function, 1, 90)],
+    );
+    env.scopes_by_file.insert(
+        callee_file,
+        vec![scope_entry(callee_fn, IrScopeKind::Function, 1, 90)],
+    );
+    env.scopes_by_file.insert(
+        third_file,
+        vec![scope_entry(third_fn, IrScopeKind::Function, 1, 90)],
+    );
+
+    let summaries = BehaviorSummaryIndex::default();
+
+    // 1. Building an entry_file shard must NOT call function_ir on external callee_file!
+    env.reset_counters();
+    let entry_shard = Arc::new(build_ir_call_graph_file_shard(
+        entry_file, &env, &env, &env, &summaries,
+    ));
+    assert!(
+        env.function_ir_calls
+            .borrow()
+            .iter()
+            .all(|&fid| fid == entry_file),
+        "building call-graph shard for entry_file must not lower callee_file IR, saw {:?}",
+        env.function_ir_calls.borrow()
+    );
+    assert!(
+        entry_shard.sites.iter().all(|s| s
+            .resolution
+            .targets
+            .iter()
+            .all(|t| t.parameter_bindings.is_empty() && t.return_expressions.is_empty())),
+        "call-graph shard should defer parameter_bindings and return_expressions"
+    );
+
+    // 2. Direct resolve_call_targets_with_summaries (calleesOf) must still enrich both eagerly.
+    let direct_targets =
+        resolve_call_targets_with_summaries(entry_attach_call, &env, &env, &env, &summaries);
+    assert_eq!(direct_targets.targets.len(), 1);
+    assert_eq!(direct_targets.targets[0].parameter_bindings.len(), 2);
+    assert_eq!(
+        direct_targets.targets[0].return_expressions,
+        vec![callee_ret_read]
+    );
+
+    // 3. Merge per-file shards and compare against monolithic full build.
+    let callee_shard = Arc::new(build_ir_call_graph_file_shard(
+        callee_file,
+        &env,
+        &env,
+        &env,
+        &summaries,
+    ));
+    let third_shard = Arc::new(build_ir_call_graph_file_shard(
+        third_file, &env, &env, &env, &summaries,
+    ));
+    let merged_graph = merge_ir_call_graph_shards([&entry_shard, &callee_shard, &third_shard]);
+    let full_graph =
+        build_ir_call_graph_with_summaries(&project_files, &env, &env, &env, &summaries);
+
+    let field_shards: Vec<Arc<IrFieldWriteIndex>> = project_files
+        .iter()
+        .map(|&fid| Arc::new(build_ir_field_write_file_shard(fid, &env, &env, &env)))
+        .collect();
+    let merged_field_index = merge_ir_field_write_shards(field_shards.iter());
+    let full_field_index = IrFieldWriteIndex::build(&project_files, &env);
+
+    // 3a. callersOf parity (including lazy parameter_bindings)
+    let callers_from_merged = find_callers_on_ir(
+        callee_fn,
+        Some(callee_sym),
+        &merged_graph,
+        &env,
+        &env,
+        &env,
+        None::<&HashSet<FileId>>,
+    );
+    let callers_from_full = find_callers_on_ir(
+        callee_fn,
+        Some(callee_sym),
+        &full_graph,
+        &env,
+        &env,
+        &env,
+        None::<&HashSet<FileId>>,
+    );
+    assert_eq!(callers_from_merged.call_sites, callers_from_full.call_sites);
+    assert_eq!(
+        callers_from_merged.is_complete,
+        callers_from_full.is_complete
+    );
+    assert_eq!(callers_from_merged.gaps, callers_from_full.gaps);
+    assert_eq!(callers_from_merged.call_sites.len(), 2);
+    assert_eq!(
+        callers_from_merged.call_sites[0].parameter_bindings.len(),
+        2
+    );
+    assert_eq!(
+        callers_from_merged.call_sites[0].parameter_bindings[0].parameter_decl_syntax,
+        Some(callee_box_param)
+    );
+    assert_eq!(
+        callers_from_merged.call_sites[0].parameter_bindings[1].parameter_decl_syntax,
+        Some(callee_val_param)
+    );
+
+    // 3b. valuePropagation parity
+    let (vp_merged, _) = trace_value_propagation(
+        &[ValueEndpointSpec {
+            syntax: entry_tok_lit,
+            symbol: None,
+        }],
+        &[ValueEndpointSpec {
+            syntax: callee_val_param,
+            symbol: None,
+        }],
+        false,
+        &project_files,
+        None::<&HashSet<FileId>>,
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&merged_graph),
+    );
+    let (vp_full, _) = trace_value_propagation(
+        &[ValueEndpointSpec {
+            syntax: entry_tok_lit,
+            symbol: None,
+        }],
+        &[ValueEndpointSpec {
+            syntax: callee_val_param,
+            symbol: None,
+        }],
+        false,
+        &project_files,
+        None::<&HashSet<FileId>>,
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&full_graph),
+    );
+    assert!(matches!(
+        (&vp_merged.results[0], &vp_full.results[0]),
+        (
+            ValuePropagationTargetOutcome::Proved { .. },
+            ValuePropagationTargetOutcome::Proved { .. }
+        )
+    ));
+
+    // 3c. resolveInstances parity
+    let (inst_merged, _, _) = resolve_instances_on_ir(
+        &[InstanceTargetSpec {
+            syntax: entry_conn_read,
+            symbol: None,
+        }],
+        &project_files,
+        None::<&HashSet<FileId>>,
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&merged_graph),
+        Some(&merged_field_index),
+    );
+    let (inst_full, _, _) = resolve_instances_on_ir(
+        &[InstanceTargetSpec {
+            syntax: entry_conn_read,
+            symbol: None,
+        }],
+        &project_files,
+        None::<&HashSet<FileId>>,
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&full_graph),
+        Some(&full_field_index),
+    );
+    match (&inst_merged.results[0], &inst_full.results[0]) {
+        (
+            InstanceResolutionOutcome::Proved { origins: o1, .. },
+            InstanceResolutionOutcome::Proved { origins: o2, .. },
+        ) => {
+            assert_eq!(o1.len(), o2.len());
+            assert_eq!(o1[0].instance_key, o2[0].instance_key);
+        }
+        other => panic!("expected Proved instance origins from both, got {other:?}"),
+    }
 }

@@ -47,6 +47,7 @@ pub struct ResolvedCallTargetData {
     pub is_default_library: bool,
     pub fn_scope_syntax: Option<SyntaxId>,
     pub implementation: Option<ResolvedImplementationFact>,
+    pub args_offset: usize,
     pub parameter_bindings: Vec<CallParameterBindingData>,
     pub return_expressions: Vec<SyntaxId>,
 }
@@ -98,7 +99,7 @@ pub struct IndexedCallEntry {
 }
 
 /// Snapshot-scoped IR call graph over all project source files.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct IrCallGraph {
     pub sites: Vec<IndexedCallEntry>,
     pub by_decl: FxHashMap<SyntaxId, Vec<usize>>,
@@ -284,6 +285,7 @@ pub fn resolve_call_targets_in_scope(
     analyze_call_vertex_with_scope(
         call_syntax,
         Some((caller_ir, call_vertex)),
+        true,
         semantic,
         syntax,
         ir_provider,
@@ -310,6 +312,7 @@ fn analyze_call_vertex(
     analyze_call_vertex_with_scope(
         call_syntax,
         None,
+        true,
         semantic,
         syntax,
         ir_provider,
@@ -324,6 +327,7 @@ fn analyze_call_vertex(
 fn analyze_call_vertex_with_scope(
     call_syntax: SyntaxId,
     known_scope: Option<(&Arc<FunctionIr>, &CfgVertex)>,
+    enrich_targets: bool,
     semantic: &dyn SemanticModel,
     syntax: &dyn SyntaxCatalog,
     ir_provider: &dyn IrProvider,
@@ -408,7 +412,9 @@ fn analyze_call_vertex_with_scope(
             receiver,
             args,
         } => {
-            arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
+            if enrich_targets {
+                arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
+            }
             let call_ctx = ActiveCallContext {
                 caller_ir: ir,
                 receiver: *receiver,
@@ -456,7 +462,9 @@ fn analyze_call_vertex_with_scope(
             }
         }
         IrOp::Construct { callee, args, .. } => {
-            arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
+            if enrich_targets {
+                arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
+            }
             let call_ctx = ActiveCallContext {
                 caller_ir: ir,
                 receiver: None,
@@ -484,7 +492,9 @@ fn analyze_call_vertex_with_scope(
     let resolved_targets = collector
         .targets
         .iter()
-        .map(|raw| enrich_target_descriptor(raw, &arg_syntaxes, semantic, ir_provider))
+        .map(|raw| {
+            enrich_target_descriptor(raw, &arg_syntaxes, enrich_targets, semantic, ir_provider)
+        })
         .collect();
 
     AnalyzedCallSite {
@@ -3958,41 +3968,91 @@ fn trace_executor_param_call_args(
     called && all_ok
 }
 
+fn compute_parameter_bindings(
+    target_ir: &FunctionIr,
+    arg_syntaxes: &[(SyntaxId, bool)],
+    args_offset: usize,
+) -> Vec<CallParameterBindingData> {
+    if target_ir.parameters.is_empty() || arg_syntaxes.len() <= args_offset {
+        return Vec::new();
+    }
+    let sliced_args = &arg_syntaxes[args_offset..];
+    let mut parameter_bindings = Vec::with_capacity(sliced_args.len());
+    let last_is_rest = target_ir.parameters.last().is_some_and(|p| p.is_rest);
+    for (idx, &(arg_syn, is_spread)) in sliced_args.iter().enumerate() {
+        let param_opt = if idx < target_ir.parameters.len() {
+            Some(&target_ir.parameters[idx])
+        } else if last_is_rest {
+            target_ir.parameters.last()
+        } else {
+            None
+        };
+        if let Some(param) = param_opt {
+            parameter_bindings.push(CallParameterBindingData {
+                argument_index: idx + args_offset,
+                argument_syntax: arg_syn,
+                parameter_name: Some(param.name.clone()),
+                parameter_decl_syntax: Some(param.syntax),
+                is_rest: param.is_rest || is_spread,
+            });
+        }
+    }
+    parameter_bindings
+}
+
+/// Lazily computes [`CallParameterBindingData`] for a single call site and resolved target.
+#[must_use]
+pub fn populate_call_site_parameter_bindings(
+    call_syntax: SyntaxId,
+    target: &ResolvedCallTargetData,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+) -> Vec<CallParameterBindingData> {
+    if !target.parameter_bindings.is_empty() {
+        return target.parameter_bindings.clone();
+    }
+    let Some(scope_syn) = target.fn_scope_syntax else {
+        return Vec::new();
+    };
+    let Ok(caller_ir) = ir_provider.enclosing_scope_ir(call_syntax) else {
+        return Vec::new();
+    };
+    let Some(call_vertex) = find_call_vertex(&caller_ir, call_syntax) else {
+        return Vec::new();
+    };
+    let arg_syntaxes = match &call_vertex.op {
+        IrOp::Call { args, .. } | IrOp::Construct { args, .. } => {
+            if args.len() <= target.args_offset {
+                return Vec::new();
+            }
+            collect_arg_syntaxes(&caller_ir, args, syntax)
+        }
+        _ => return Vec::new(),
+    };
+    if arg_syntaxes.len() <= target.args_offset {
+        return Vec::new();
+    }
+    let Ok(target_ir) = ir_provider.function_ir(scope_syn) else {
+        return Vec::new();
+    };
+    compute_parameter_bindings(&target_ir, &arg_syntaxes, target.args_offset)
+}
+
 fn enrich_target_descriptor(
     raw: &RawTargetDescriptor,
     arg_syntaxes: &[(SyntaxId, bool)],
+    enrich_targets: bool,
     semantic: &dyn SemanticModel,
     ir_provider: &dyn IrProvider,
 ) -> ResolvedCallTargetData {
     let mut parameter_bindings = Vec::new();
     let mut return_expressions = Vec::new();
 
-    if let Some(scope_syn) = raw.fn_scope_syntax
+    if enrich_targets
+        && let Some(scope_syn) = raw.fn_scope_syntax
         && let Ok(target_ir) = ir_provider.function_ir(scope_syn)
     {
-        let sliced_args = &arg_syntaxes[raw.args_offset.min(arg_syntaxes.len())..];
-        for (idx, &(arg_syn, is_spread)) in sliced_args.iter().enumerate() {
-            if target_ir.parameters.is_empty() {
-                break;
-            }
-            let last_is_rest = target_ir.parameters.last().is_some_and(|p| p.is_rest);
-            let param_opt = if idx < target_ir.parameters.len() {
-                Some(&target_ir.parameters[idx])
-            } else if last_is_rest {
-                target_ir.parameters.last()
-            } else {
-                None
-            };
-            if let Some(param) = param_opt {
-                parameter_bindings.push(CallParameterBindingData {
-                    argument_index: idx + raw.args_offset,
-                    argument_syntax: arg_syn,
-                    parameter_name: Some(param.name.clone()),
-                    parameter_decl_syntax: Some(param.syntax),
-                    is_rest: param.is_rest || is_spread,
-                });
-            }
-        }
+        parameter_bindings = compute_parameter_bindings(&target_ir, arg_syntaxes, raw.args_offset);
 
         let mut seen_ret = FxHashSet::default();
         for v in &target_ir.vertices {
@@ -4020,6 +4080,7 @@ fn enrich_target_descriptor(
         is_default_library: raw.is_default_library,
         fn_scope_syntax: raw.fn_scope_syntax,
         implementation: raw.implementation.clone(),
+        args_offset: raw.args_offset,
         parameter_bindings,
         return_expressions,
     }
@@ -4058,6 +4119,59 @@ pub fn build_ir_call_graph(
 ) -> IrCallGraph {
     let default_index = BehaviorSummaryIndex::default();
     build_ir_call_graph_with_summaries(project_files, semantic, syntax, ir_provider, &default_index)
+}
+
+/// Indexes all call and construct sites in a single `file_id` into an [`IrCallGraph`] shard.
+#[must_use]
+pub fn build_ir_call_graph_file_shard(
+    file_id: FileId,
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
+) -> IrCallGraph {
+    build_ir_call_graph_with_summaries(&[file_id], semantic, syntax, ir_provider, summary_index)
+}
+
+/// Merges multiple per-file [`IrCallGraph`] shards into a single combined [`IrCallGraph`].
+#[must_use]
+pub fn merge_ir_call_graph_shards<'a>(
+    shards: impl IntoIterator<Item = &'a Arc<IrCallGraph>>,
+) -> IrCallGraph {
+    let mut iter = shards.into_iter();
+    let Some(first) = iter.next() else {
+        return IrCallGraph::default();
+    };
+    let mut rest = iter.peekable();
+    if rest.peek().is_none() {
+        return (**first).clone();
+    }
+    let mut merged = (**first).clone();
+    for shard in rest {
+        if merged.conflict.is_none() && shard.conflict.is_some() {
+            merged.conflict.clone_from(&shard.conflict);
+        }
+        let base_offset = merged.sites.len();
+        merged.sites.extend(shard.sites.iter().cloned());
+        for (&decl, indices) in &shard.by_decl {
+            let entry = merged.by_decl.entry(decl).or_default();
+            entry.extend(indices.iter().map(|&idx| idx + base_offset));
+        }
+        for (&sym, indices) in &shard.by_symbol {
+            let entry = merged.by_symbol.entry(sym).or_default();
+            entry.extend(indices.iter().map(|&idx| idx + base_offset));
+        }
+        merged
+            .incomplete_sites
+            .extend(shard.incomplete_sites.iter().map(|&idx| idx + base_offset));
+        merged
+            .escaped_decls
+            .extend(shard.escaped_decls.iter().copied());
+        merged
+            .escaped_symbols
+            .extend(shard.escaped_symbols.iter().copied());
+    }
+    merged
 }
 
 /// Indexes all call and construct sites across `project_files` using `summary_index`.
@@ -4103,6 +4217,7 @@ pub fn build_ir_call_graph_with_summaries(
                 let analyzed = analyze_call_vertex_with_scope(
                     call_syn,
                     Some((scope_ir, vertex)),
+                    false,
                     semantic,
                     syntax,
                     ir_provider,
@@ -4508,6 +4623,8 @@ pub fn find_callers_on_ir<S: BuildHasher>(
     target_symbol: Option<SymbolId>,
     graph: &IrCallGraph,
     semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
     allowed_files: Option<&HashSet<FileId, S>>,
 ) -> CallersOutcome {
     let target_summary = semantic.resolve_declaration(target_decl_syntax);
@@ -4548,7 +4665,9 @@ pub fn find_callers_on_ir<S: BuildHasher>(
             t.declaration_syntax == target_decl_syntax
                 || (target_symbol.is_some() && t.symbol == target_symbol)
         });
-        let parameter_bindings = matching_target.map_or_default(|t| t.parameter_bindings.clone());
+        let parameter_bindings = matching_target.map_or_default(|t| {
+            populate_call_site_parameter_bindings(site.call_syntax, t, syntax, ir_provider)
+        });
         evidence.push(EvidenceItem::simple(
             "source",
             "Matched call site invoking target declaration.".to_string(),
@@ -4566,10 +4685,36 @@ pub fn find_callers_on_ir<S: BuildHasher>(
         });
     }
 
+    let gaps = collect_incomplete_caller_gaps(
+        target_decl_syntax,
+        target_symbol,
+        target_summary.as_ref(),
+        graph,
+        &matched_indices,
+        allowed_files,
+    );
+
+    let is_complete = gaps.is_empty();
+    CallersOutcome {
+        call_sites,
+        gaps,
+        is_complete,
+        evidence,
+    }
+}
+
+fn collect_incomplete_caller_gaps<S: BuildHasher>(
+    target_decl_syntax: SyntaxId,
+    target_symbol: Option<SymbolId>,
+    target_summary: Option<&DeclarationSummaryData>,
+    graph: &IrCallGraph,
+    matched_indices: &BTreeSet<usize>,
+    allowed_files: Option<&HashSet<FileId, S>>,
+) -> Vec<GapItem> {
     let mut gaps = Vec::new();
     let mut seen_gap_keys: FxHashSet<(&'static str, String)> = FxHashSet::default();
-    let target_name = target_summary.as_ref().and_then(|d| d.name.as_deref());
-    let target_is_method = target_summary.as_ref().is_some_and(|d| {
+    let target_name = target_summary.and_then(|d| d.name.as_deref());
+    let target_is_method = target_summary.is_some_and(|d| {
         matches!(
             d.kind.as_deref(),
             Some("MethodDeclaration" | "GetAccessor" | "SetAccessor" | "PropertyDeclaration")
@@ -4588,12 +4733,7 @@ pub fn find_callers_on_ir<S: BuildHasher>(
             true
         } else if site.is_untyped_dynamic_incomplete {
             // An unresolved callback/dynamic call within scope can only call targets that escape as values.
-            target_may_escape_as_value(
-                target_decl_syntax,
-                target_symbol,
-                target_summary.as_ref(),
-                graph,
-            )
+            target_may_escape_as_value(target_decl_syntax, target_symbol, target_summary, graph)
         } else if let Some(open_member) = &site.open_member_name {
             // Open polymorphic member call can target a method/accessor of the same member name.
             target_is_method && target_name == Some(open_member.as_str())
@@ -4613,13 +4753,7 @@ pub fn find_callers_on_ir<S: BuildHasher>(
         }
     }
 
-    let is_complete = gaps.is_empty();
-    CallersOutcome {
-        call_sites,
-        gaps,
-        is_complete,
-        evidence,
-    }
+    gaps
 }
 
 pub(crate) fn prop_key_static_name(key: &IrPropKey) -> Option<&str> {

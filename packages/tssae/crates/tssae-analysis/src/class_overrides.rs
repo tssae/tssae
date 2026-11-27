@@ -84,38 +84,66 @@ pub fn resolve_member_overrides(
 
     let mut targets: Vec<ResolvedMemberOverride> = Vec::new();
     let mut seen_target_syntax: FxHashSet<SyntaxId> = FxHashSet::default();
-    let mut any_exported_or_external =
-        hierarchy.receiver_is_external || (hierarchy.receiver_is_exported && !exact_instance_only);
+    let private_self_target = if hierarchy.receiver_kind == ClassOrInterfaceKind::Class
+        && hierarchy.receiver_symbols.len() == 1
+    {
+        let root_sym = hierarchy.receiver_symbols[0];
+        by_symbol.get(&root_sym).copied().and_then(|root_node| {
+            if root_node.kind == ClassOrInterfaceKind::Class {
+                find_concrete_member(root_node, member_name, access_kind)
+                    .filter(|m| m.is_private)
+                    .map(|m| (root_node, m))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
 
-    for class_sym in &target_classes {
-        let Some(class_node) = by_symbol.get(class_sym).copied() else {
-            continue;
-        };
-        if class_node.kind == ClassOrInterfaceKind::Class
-            && !exact_instance_only
-            && (class_node.is_exported || class_node.is_external)
-        {
-            any_exported_or_external = true;
-        }
+    let any_exported_or_external = if let Some((root_node, member)) = private_self_target {
+        push_member_override(root_node, member, &mut seen_target_syntax, &mut targets);
+        false
+    } else {
+        let mut any_open = hierarchy.receiver_is_external
+            || (hierarchy.receiver_is_exported && !exact_instance_only);
 
-        if class_node.kind != ClassOrInterfaceKind::Class {
-            continue;
-        }
-
-        if let Some(member) = find_concrete_member(class_node, member_name, access_kind) {
-            push_member_override(class_node, member, &mut seen_target_syntax, &mut targets);
-        } else if !class_node.is_abstract {
-            // Concrete class inherits implementation from nearest non-abstract ancestor.
-            if let Some((anc_node, anc_member)) =
-                find_inherited_member(class_node, member_name, access_kind, &by_symbol)
+        for class_sym in &target_classes {
+            let Some(class_node) = by_symbol.get(class_sym).copied() else {
+                continue;
+            };
+            if class_node.kind == ClassOrInterfaceKind::Class
+                && !exact_instance_only
+                && (class_node.is_exported || class_node.is_external)
             {
-                if anc_node.is_exported || anc_node.is_external {
-                    any_exported_or_external = !exact_instance_only && any_exported_or_external;
+                any_open = true;
+            }
+
+            if class_node.kind != ClassOrInterfaceKind::Class {
+                continue;
+            }
+
+            if let Some(member) = find_concrete_member(class_node, member_name, access_kind) {
+                push_member_override(class_node, member, &mut seen_target_syntax, &mut targets);
+            } else if !class_node.is_abstract {
+                // Concrete class inherits implementation from nearest non-abstract ancestor.
+                if let Some((anc_node, anc_member)) =
+                    find_inherited_member(class_node, member_name, access_kind, &by_symbol)
+                {
+                    if anc_node.is_exported || anc_node.is_external {
+                        any_open = !exact_instance_only && any_open;
+                    }
+                    push_member_override(
+                        anc_node,
+                        anc_member,
+                        &mut seen_target_syntax,
+                        &mut targets,
+                    );
                 }
-                push_member_override(anc_node, anc_member, &mut seen_target_syntax, &mut targets);
             }
         }
-    }
+        any_open
+    };
 
     let mut gaps = Vec::new();
     if hierarchy.has_unresolved_type {
@@ -314,6 +342,7 @@ mod tests {
             has_body: !is_abstract,
             is_abstract,
             is_static: false,
+            is_private: false,
             is_private_ecma: false,
             is_override,
             initializer_syntax: None,
@@ -462,6 +491,47 @@ mod tests {
             MemberAccessKind::MethodOrProp,
             None,
             true,
+        );
+        assert!(res.is_complete);
+        assert_eq!(res.gaps.len(), 0);
+        assert_eq!(res.targets.len(), 1);
+        assert_eq!(res.targets[0].target_syntax, SyntaxId(11));
+    }
+
+    #[test]
+    fn private_member_on_exported_class_is_closed_and_complete() {
+        let base_sym = SymbolId(1);
+        let mut private_run = mk_method(11, "run", false, false);
+        private_run.is_private = true;
+        let hierarchy = MemberTargetHierarchy {
+            receiver_kind: ClassOrInterfaceKind::Class,
+            receiver_symbols: vec![base_sym],
+            receiver_name: Some("ExportedRunner".to_string()),
+            receiver_is_exported: true,
+            receiver_is_abstract: false,
+            receiver_is_external: false,
+            is_union_or_intersection: false,
+            has_unresolved_type: false,
+            candidate_classes: vec![TypeHierarchyNode {
+                syntax: SyntaxId(10),
+                symbol: base_sym,
+                name: Some("ExportedRunner".to_string()),
+                kind: ClassOrInterfaceKind::Class,
+                is_exported: true,
+                is_abstract: false,
+                is_external: false,
+                base_symbols: Vec::new(),
+                members: vec![private_run],
+                constructor_syntax: None,
+            }],
+        };
+
+        let res = resolve_member_overrides(
+            &hierarchy,
+            "run",
+            MemberAccessKind::MethodOrProp,
+            None,
+            false,
         );
         assert!(res.is_complete);
         assert_eq!(res.gaps.len(), 0);

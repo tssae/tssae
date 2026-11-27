@@ -85,6 +85,7 @@ pub struct ClassMemberFact {
     pub has_body: bool,
     pub is_abstract: bool,
     pub is_static: bool,
+    pub is_private: bool,
     pub is_private_ecma: bool,
     pub is_override: bool,
     pub initializer_syntax: Option<SyntaxId>,

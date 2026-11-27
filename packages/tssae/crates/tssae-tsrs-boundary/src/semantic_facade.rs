@@ -1605,13 +1605,20 @@ impl SemanticModel for SemanticModelBridge<'_> {
 
     fn resolve_super_target(&self, call_syntax: SyntaxId) -> Option<DeclarationSummaryData> {
         let call_node = self.node_for_syntax(call_syntax)?;
-        let mut cur = call_node.parent();
-        let class_node = loop {
-            let n = cur?;
-            if matches!(n.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
-                break n;
+        let class_node = if matches!(
+            call_node.kind(),
+            Kind::ClassDeclaration | Kind::ClassExpression
+        ) {
+            call_node
+        } else {
+            let mut cur = call_node.parent();
+            loop {
+                let n = cur?;
+                if matches!(n.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
+                    break n;
+                }
+                cur = n.parent();
             }
-            cur = n.parent();
         };
         let clauses = if class_node.kind() == Kind::ClassDeclaration {
             class_node.as_class_declaration().heritage_clauses()?

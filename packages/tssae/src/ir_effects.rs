@@ -617,6 +617,13 @@ fn alloc_cleanup_site_payload(
     }
 }
 
+type CallEffectsBatchMaterialized = (
+    Vec<(P<Node>, MaterializedCallEffects)>,
+    Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
+    Option<tssae_common::SummaryConflictError>,
+);
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -646,12 +653,10 @@ pub fn run_call_effects(
 
     let workspace_programs = snapshot.workspace_programs();
     let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
+    let cached_field_index = snapshot.ir_field_write_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
 
-    let (materialized, conflict_opt): (
-        Vec<(P<Node>, MaterializedCallEffects)>,
-        Option<tssae_common::SummaryConflictError>,
-    ) = {
+    let (materialized, newly_built_graph, newly_built_field_index, conflict_opt): CallEffectsBatchMaterialized = {
         let env = SnapshotIrEnv::from_snapshot(
             snapshot,
             project_id,
@@ -697,7 +702,11 @@ pub fn run_call_effects(
             max_depth: max_depth.unwrap_or(DEFAULT_MAX_EFFECT_CALL_DEPTH),
         };
 
-        let batch: CallEffectsBatchOutcome = analyze_call_effects_on_ir(
+        let (batch, built_graph, built_field_index): (
+            CallEffectsBatchOutcome,
+            Option<IrCallGraph>,
+            Option<IrFieldWriteIndex>,
+        ) = analyze_call_effects_on_ir(
             &specs,
             opts,
             env.project_files(),
@@ -706,6 +715,7 @@ pub fn run_call_effects(
             &env,
             &summary_index,
             cached_graph.as_deref(),
+            cached_field_index.as_deref(),
         );
         let stats = env.summary_stats.get();
         observer.record_summary_lookup_stats(&stats);
@@ -785,8 +795,23 @@ pub fn run_call_effects(
             .collect();
 
         drop(env);
-        (mat_rows, batch.conflict)
+        (mat_rows, built_graph, built_field_index, batch.conflict)
     };
+
+    if let Some(g) = newly_built_graph {
+        let g_arc = Arc::new(g);
+        if let Some(conflict) = &g_arc.conflict {
+            return Err(conflict_rpc_err(conflict));
+        }
+        snapshot
+            .ir_call_graph_cache
+            .insert(project_id.to_string(), g_arc);
+    }
+    if let Some(fi) = newly_built_field_index {
+        snapshot
+            .ir_field_write_cache
+            .insert(project_id.to_string(), Arc::new(fi));
+    }
 
     if let Some(conflict) = conflict_opt {
         return Err(conflict_rpc_err(&conflict));

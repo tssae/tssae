@@ -1346,4 +1346,182 @@ void describe("tssae call-effects and instanceCleanup", () => {
       },
     );
   });
+
+  void it("completes deep diamond call DAGs without exponential blowup or duplicate field effects", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-dag-dedup",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/dag.ts": [
+            "class DagRunner {",
+            "  public done = false;",
+            "  f0(): void { this.f1a(); this.f1b(); this.f1c(); }",
+            "  f1a(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f1b(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f1c(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f2a(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f2b(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f2c(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f3a(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f3b(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f3c(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f4a(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f4b(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f4c(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f5a(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f5b(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f5c(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f6a(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f6b(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f6c(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f7a(): void { this.leaf(); }",
+            "  f7b(): void { this.leaf(); }",
+            "  f7c(): void { this.leaf(); }",
+            "  leaf(): void { this.done = true; }",
+            "}",
+            "export function runDag(): void {",
+            "  const runner = new DagRunner();",
+            "  runner.f0();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/dag.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runDag = fns.find((f) => f.text.includes("function runDag"));
+          assert.ok(runDag);
+
+          const startMs = Date.now();
+          const [res] = await ctx.callEffects({
+            targets: [runDag.ref],
+            includeReads: true,
+            includeWrites: true,
+            followCallbacks: true,
+          });
+          const elapsedMs = Date.now() - startMs;
+
+          assert.equal(res?.completeness, "complete");
+          assert.ok(
+            elapsedMs < 5000,
+            `expected fast DAG traversal, took ${elapsedMs}ms`,
+          );
+          const doneWrites = res.fieldWrites.filter(
+            (w) => w.propertyName === "done" && w.valueText === "true",
+          );
+          assert.equal(doneWrites.length, 1);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("does not leak unrelated external callers for unbound callback parameters or mark private methods as open-external-hierarchy", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-unbound-param",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/lib.ts": [
+            "export class Runner {",
+            "  constructor(private readonly fn: () => void) { this.run(); }",
+            "  private run(): void { this.fn(); }",
+            "}",
+            "export function createRunner(cb: () => void): Runner {",
+            "  return new Runner(cb);",
+            "}",
+            "",
+          ].join("\n"),
+          "src/unrelated.ts": [
+            'import { createRunner, type Runner } from "./lib.js";',
+            "const unrelatedState = { leakedWrite: 0 };",
+            "export function someUnrelatedCaller(): Runner {",
+            "  return createRunner(() => { unrelatedState.leakedWrite = 999; });",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const newExprs = await ctx.findSyntax({
+            files: ["src/lib.ts"],
+            kinds: ["NewExpression"],
+          });
+          const newRunnerCall = newExprs.find((n) =>
+            n.text.includes("new Runner(cb)"),
+          );
+          assert.ok(newRunnerCall);
+
+          const [res] = await ctx.callEffects({
+            targets: [newRunnerCall.ref],
+            followCallbacks: true,
+            includeWrites: true,
+          });
+          assert.ok(res);
+          assert.ok(
+            !res.fieldWrites.some((w) => w.propertyName === "leakedWrite"),
+            "must not leak unrelated callers of createRunner",
+          );
+          assert.equal(res.completeness, "incomplete");
+          assert.ok(
+            res.gaps.some((g) => g.kind === "dynamic-callee"),
+            "unbound callback parameter must report dynamic-callee gap",
+          );
+          assert.ok(
+            !res.gaps.some((g) => g.kind === "open-external-hierarchy"),
+            "private method this.run() on exported class must not report open-external-hierarchy",
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

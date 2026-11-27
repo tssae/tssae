@@ -325,6 +325,7 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
         owned_graph: &mut owned_graph,
         cached_field_index,
         owned_field_index: &mut owned_field_index,
+        allow_unanchored_caller_lookup: true,
         conflict: None,
     };
 
@@ -369,6 +370,7 @@ pub(crate) struct IrInstanceResolver<'a> {
     pub(crate) owned_graph: &'a mut Option<IrCallGraph>,
     cached_field_index: Option<&'a IrFieldWriteIndex>,
     owned_field_index: &'a mut Option<IrFieldWriteIndex>,
+    allow_unanchored_caller_lookup: bool,
     pub(crate) conflict: Option<SummaryConflictError>,
 }
 
@@ -389,6 +391,7 @@ impl<'a> IrInstanceResolver<'a> {
         owned_graph: &'a mut Option<IrCallGraph>,
         cached_field_index: Option<&'a IrFieldWriteIndex>,
         owned_field_index: &'a mut Option<IrFieldWriteIndex>,
+        allow_unanchored_caller_lookup: bool,
     ) -> Self {
         Self {
             project_files,
@@ -402,6 +405,7 @@ impl<'a> IrInstanceResolver<'a> {
             owned_graph,
             cached_field_index,
             owned_field_index,
+            allow_unanchored_caller_lookup,
             conflict: None,
         }
     }
@@ -542,7 +546,7 @@ impl<'a> IrInstanceResolver<'a> {
                     gaps: vec![GapItem::from_reason(
                         UnknownReason::MissingFunctionBody,
                         format!(
-                            "Target '{label}' resides in an external declaration without analyzable source IR."
+                            "Target '{label}' resides in an external declaration without an analyzable source implementation."
                         ),
                         target_loc.or(decl.location),
                     )],
@@ -555,7 +559,7 @@ impl<'a> IrInstanceResolver<'a> {
             origins: Vec::new(),
             gaps: vec![GapItem::from_reason(
                 UnknownReason::NoEnclosingFunction,
-                "Target syntax has no enclosing IR scope.".to_string(),
+                "Target syntax has no enclosing function or module scope.".to_string(),
                 target_loc,
             )],
             evidence: Vec::new(),
@@ -615,7 +619,7 @@ impl<'a> IrInstanceResolver<'a> {
         let mut out = TraceResult::default();
         out.push_gap(GapItem::from_reason(
             UnknownReason::UnmodeledConstruct,
-            "Target syntax is not represented as a value-producing IR expression.".to_string(),
+            "Target syntax is not an analyzable value expression.".to_string(),
             self.syntax.syntax_location(target.syntax),
         ));
         out
@@ -632,7 +636,7 @@ impl<'a> IrInstanceResolver<'a> {
             let mut out = TraceResult::default();
             out.push_gap(GapItem::from_reason(
                 UnknownReason::MissingSourceFile,
-                "Referenced expression has no enclosing IR scope.".to_string(),
+                "Referenced expression has no enclosing function or module scope.".to_string(),
                 self.syntax.syntax_location(syn),
             ));
             return out;
@@ -646,7 +650,7 @@ impl<'a> IrInstanceResolver<'a> {
         let mut out = TraceResult::default();
         out.push_gap(GapItem::from_reason(
             UnknownReason::UnmodeledConstruct,
-            "Expression could not be mapped to an IR value.".to_string(),
+            "Expression could not be mapped to an analyzable value.".to_string(),
             self.syntax.syntax_location(syn),
         ));
         out
@@ -728,7 +732,7 @@ impl<'a> IrInstanceResolver<'a> {
             let mut out = TraceResult::default();
             out.push_gap(GapItem::from_reason(
                 UnknownReason::UnmodeledConstruct,
-                "Value has no producer vertex in IR.".to_string(),
+                "Value has no traceable source expression.".to_string(),
                 read_vertex_hint.and_then(|vid| ir.vertices.get(vid.0 as usize)?.location.clone()),
             ));
             return out;
@@ -1331,7 +1335,7 @@ impl<'a> IrInstanceResolver<'a> {
             let mut out = TraceResult::default();
             out.push_gap(GapItem::from_reason(
                 UnknownReason::MissingSourceFile,
-                "Declaration scope could not be lowered to IR.".to_string(),
+                "Declaration scope could not be analyzed.".to_string(),
                 read_loc,
             ));
             return out;
@@ -1508,83 +1512,105 @@ impl<'a> IrInstanceResolver<'a> {
             );
         }
 
-        if call_stack.is_empty() {
-            let fn_syn = fn_ir.root_syntax;
-            let fn_symbol = self.semantic.symbol_at_syntax(fn_syn);
-            let mut site_syntaxes: Vec<(SyntaxId, FileId)> = Vec::new();
-            let mut seen_sites: FxHashSet<SyntaxId> = FxHashSet::default();
-            if let Some(graph) = self.call_graph() {
-                if let Some(sym) = fn_symbol
-                    && let Some(indices) = graph.by_symbol.get(&sym)
-                {
-                    for &idx in indices {
-                        let site = &graph.sites[idx];
-                        if seen_sites.insert(site.call_syntax) {
-                            site_syntaxes.push((site.call_syntax, site.file));
-                        }
-                    }
-                }
-                if let Some(indices) = graph.by_decl.get(&fn_syn) {
-                    for &idx in indices {
-                        let site = &graph.sites[idx];
-                        if seen_sites.insert(site.call_syntax) {
-                            site_syntaxes.push((site.call_syntax, site.file));
-                        }
-                    }
-                }
-            }
-            if self.conflict.is_some() {
-                return TraceResult::default();
-            }
+        if !self.allow_unanchored_caller_lookup {
+            let mut out = TraceResult::default();
+            out.push_gap(GapItem::from_reason(
+                UnknownReason::DynamicCallee,
+                format!("Parameter '{param_name}' is unbound in the analyzed call scope."),
+                param_loc,
+            ));
+            return out;
+        }
 
-            if let Some(allowed) = self.allowed_files {
-                site_syntaxes.retain(|(_, file)| allowed.contains(file));
-            }
-            site_syntaxes.sort_by_key(|(s, _)| (s.file_id().0, s.local_id().0));
-
-            if !site_syntaxes.is_empty() {
-                let mut combined = TraceResult::default();
-                for (call_syn, _) in site_syntaxes {
-                    if let Ok(caller_ir) = self.ir_provider.enclosing_scope_ir(call_syn)
-                        && let Some(call_v) = find_call_vertex_by_syntax(&caller_ir, call_syn)
-                    {
-                        let args = call_vertex_args(call_v);
-                        if let Some(arg) = args.get(param_idx).copied() {
-                            let mut sub = self.trace_call_arg(
-                                &caller_ir,
-                                call_v.id,
-                                arg,
-                                &[],
-                                depth + 1,
-                                active,
-                            );
-                            if let Some(cloc) = call_v.location.clone() {
-                                sub.prepend_step(&EvidenceItem::simple(
-                                    "source",
-                                    format!("Passed as argument '{param_name}'"),
-                                    Some(cloc),
-                                ));
-                            }
-                            combined.merge(sub);
-                            if self.conflict.is_some() {
-                                return combined;
-                            }
-                        }
-                    }
-                }
-                if !combined.hosts.is_empty()
-                    || !combined.gaps.is_empty()
-                    || !combined.non_instances.is_empty()
-                {
-                    return combined;
-                }
-            }
+        if call_stack.is_empty()
+            && let Some(combined) = self.resolve_unanchored_parameter_callers(
+                fn_ir,
+                param_idx,
+                &param_name,
+                depth,
+                active,
+            )
+        {
+            return combined;
         }
 
         let mut out = TraceResult::default();
         out.hosts
             .push(self.make_parameter_host(param_syn, &param_name, param_loc));
         out
+    }
+
+    fn resolve_unanchored_parameter_callers(
+        &mut self,
+        fn_ir: &Arc<FunctionIr>,
+        param_idx: usize,
+        param_name: &str,
+        depth: usize,
+        active: &mut Vec<VisitKey>,
+    ) -> Option<TraceResult> {
+        let fn_syn = fn_ir.root_syntax;
+        let fn_symbol = self.semantic.symbol_at_syntax(fn_syn);
+        let mut site_syntaxes: Vec<(SyntaxId, FileId)> = Vec::new();
+        let mut seen_sites: FxHashSet<SyntaxId> = FxHashSet::default();
+        if let Some(graph) = self.call_graph() {
+            if let Some(sym) = fn_symbol
+                && let Some(indices) = graph.by_symbol.get(&sym)
+            {
+                for &idx in indices {
+                    let site = &graph.sites[idx];
+                    if seen_sites.insert(site.call_syntax) {
+                        site_syntaxes.push((site.call_syntax, site.file));
+                    }
+                }
+            }
+            if let Some(indices) = graph.by_decl.get(&fn_syn) {
+                for &idx in indices {
+                    let site = &graph.sites[idx];
+                    if seen_sites.insert(site.call_syntax) {
+                        site_syntaxes.push((site.call_syntax, site.file));
+                    }
+                }
+            }
+        }
+        if self.conflict.is_some() {
+            return Some(TraceResult::default());
+        }
+
+        if let Some(allowed) = self.allowed_files {
+            site_syntaxes.retain(|(_, file)| allowed.contains(file));
+        }
+        site_syntaxes.sort_by_key(|(s, _)| (s.file_id().0, s.local_id().0));
+
+        if site_syntaxes.is_empty() {
+            return None;
+        }
+        let mut combined = TraceResult::default();
+        for (call_syn, _) in site_syntaxes {
+            if let Ok(caller_ir) = self.ir_provider.enclosing_scope_ir(call_syn)
+                && let Some(call_v) = find_call_vertex_by_syntax(&caller_ir, call_syn)
+            {
+                let args = call_vertex_args(call_v);
+                if let Some(arg) = args.get(param_idx).copied() {
+                    let mut sub =
+                        self.trace_call_arg(&caller_ir, call_v.id, arg, &[], depth + 1, active);
+                    if let Some(cloc) = call_v.location.clone() {
+                        sub.prepend_step(&EvidenceItem::simple(
+                            "source",
+                            format!("Passed as argument '{param_name}'"),
+                            Some(cloc),
+                        ));
+                    }
+                    combined.merge(sub);
+                    if self.conflict.is_some() {
+                        return Some(combined);
+                    }
+                }
+            }
+        }
+        (!combined.hosts.is_empty()
+            || !combined.gaps.is_empty()
+            || !combined.non_instances.is_empty())
+        .then_some(combined)
     }
 
     #[expect(

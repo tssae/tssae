@@ -1,3 +1,15 @@
 {
-  "waivers": []
+  "waivers": [
+    {
+      "baselineCommit": "cdfa2ef2aad2675131b7235fada6788a449f80e2",
+      "query": "valuePropagation",
+      "channel": "primary",
+      "file": "src/vs/base/test/browser/ui/tree/compressedObjectTreeModel.test.ts",
+      "target": "valuePropagation@41:10-41:71->21:19-21:75",
+      "fromStatus": "disproved",
+      "toStatus": "inconclusive",
+      "reason": "Ticket 02 fixed generator IrOp::Yield value-propagation modeling, replacing a false disproved through Iterable.map/concat generators with honest inconclusive.",
+      "regressionTest": "packages/tssae/test/value-propagation-ir.test.ts"
+    }
+  ]
 }

@@ -247,7 +247,6 @@ pub fn run_value_propagation(
     }
 
     let workspace_programs = snapshot.workspace_programs();
-    let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
@@ -260,8 +259,8 @@ pub fn run_value_propagation(
         set
     });
 
-    let (outcome, newly_built_graph): (ValuePropagationOutcome, Option<IrCallGraph>) = {
-        let env = SnapshotIrEnv::from_snapshot(
+    let outcome: ValuePropagationOutcome = {
+        let mut env = SnapshotIrEnv::from_snapshot(
             snapshot,
             project_id,
             program,
@@ -271,9 +270,19 @@ pub fn run_value_propagation(
         let from_specs = intern_endpoints(&env, &from_inputs);
         let to_specs = intern_endpoints(&env, &to_inputs);
 
-        if let Some(g) = cached_graph.as_deref()
-            && let Some(conflict) = &g.conflict
-        {
+        let is_full_project = allowed_files.is_none();
+        let target_files: Vec<FileId> = allowed_files.as_ref().map_or_else(
+            || env.project_files().to_vec(),
+            |allowed| {
+                env.project_files()
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f))
+                    .collect()
+            },
+        );
+        let cached_graph = env.ensure_call_graph(&summary_index, &target_files, is_full_project);
+        if let Some(conflict) = &cached_graph.conflict {
             let stats = env.summary_stats.get();
             observer.record_summary_lookup_stats(&stats);
             let err = conflict_rpc_err(conflict);
@@ -281,7 +290,7 @@ pub fn run_value_propagation(
             return Err(err);
         }
 
-        let result = trace_value_propagation(
+        let (result, _): (ValuePropagationOutcome, Option<IrCallGraph>) = trace_value_propagation(
             &from_specs,
             &to_specs,
             include_member_access,
@@ -291,25 +300,13 @@ pub fn run_value_propagation(
             &env,
             &env,
             &summary_index,
-            cached_graph.as_deref(),
+            Some(cached_graph.as_ref()),
         );
         let stats = env.summary_stats.get();
         observer.record_summary_lookup_stats(&stats);
         drop(env);
         result
     };
-
-    if let Some(g) = newly_built_graph {
-        let g_arc = Arc::new(g);
-        if let Some(conflict) = &g_arc.conflict {
-            return Err(conflict_rpc_err(conflict));
-        }
-        if allowed_files.is_none() {
-            snapshot
-                .ir_call_graph_cache
-                .insert(project_id.to_string(), g_arc);
-        }
-    }
 
     if let Some(conflict) = &outcome.conflict {
         return Err(conflict_rpc_err(conflict));

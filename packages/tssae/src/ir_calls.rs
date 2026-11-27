@@ -9,8 +9,11 @@ use tssae_analysis::{
     IrProvider,
     call_resolution::{
         CallParameterBindingData, CallTargetsOutcome, CallerSiteData, CallersOutcome, IrCallGraph,
-        ResolvedCallTargetData, build_ir_call_graph_with_summaries, find_callers_on_ir,
-        resolve_call_targets_with_summaries,
+        ResolvedCallTargetData, build_ir_call_graph_file_shard, find_callers_on_ir,
+        merge_ir_call_graph_shards, resolve_call_targets_with_summaries,
+    },
+    instance_identity::{
+        IrFieldWriteIndex, build_ir_field_write_file_shard, merge_ir_field_write_shards,
     },
     ir::{FunctionIr, IrScopeKind, ScopeCatalogEntry},
     summaries::BehaviorSummaryIndex,
@@ -170,6 +173,10 @@ pub struct SnapshotIrEnv<'a> {
     catalog: Arc<SnapshotProjectFileCatalog>,
     project_id: String,
     hierarchy_cache: &'a mut FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
+    ir_call_graph_cache: &'a mut FxHashMap<String, Arc<IrCallGraph>>,
+    ir_call_graph_shards: &'a mut FxHashMap<(String, FileId), Arc<IrCallGraph>>,
+    ir_field_write_cache: &'a mut FxHashMap<String, Arc<IrFieldWriteIndex>>,
+    ir_field_write_shards: &'a mut FxHashMap<(String, FileId), Arc<IrFieldWriteIndex>>,
     pub summary_stats: Cell<SummaryLookupStats>,
 }
 
@@ -228,6 +235,10 @@ impl<'a> SnapshotIrEnv<'a> {
             catalog,
             project_id: project_id.to_string(),
             hierarchy_cache: &mut snapshot.hierarchy_cache,
+            ir_call_graph_cache: &mut snapshot.ir_call_graph_cache,
+            ir_call_graph_shards: &mut snapshot.ir_call_graph_shards,
+            ir_field_write_cache: &mut snapshot.ir_field_write_cache,
+            ir_field_write_shards: &mut snapshot.ir_field_write_shards,
             summary_stats: Cell::new(SummaryLookupStats::default()),
         }
     }
@@ -235,6 +246,107 @@ impl<'a> SnapshotIrEnv<'a> {
     #[must_use]
     pub fn project_files(&self) -> &[FileId] {
         &self.catalog.project_files
+    }
+
+    pub fn ensure_call_graph(
+        &mut self,
+        summary_index: &BehaviorSummaryIndex,
+        target_files: &[FileId],
+        is_full_project: bool,
+    ) -> Arc<IrCallGraph> {
+        if let Some(cached) = self.ir_call_graph_cache.get(&self.project_id) {
+            return Arc::clone(cached);
+        }
+
+        let mut missing = Vec::new();
+        let mut seen_missing = FxHashSet::default();
+        for &fid in target_files {
+            if !self
+                .ir_call_graph_shards
+                .contains_key(&(self.project_id.clone(), fid))
+                && seen_missing.insert(fid)
+            {
+                missing.push(fid);
+            }
+        }
+
+        let mut newly_built = Vec::with_capacity(missing.len());
+        for fid in missing {
+            let shard = Arc::new(build_ir_call_graph_file_shard(
+                fid,
+                self,
+                self,
+                self,
+                summary_index,
+            ));
+            newly_built.push((fid, shard));
+        }
+
+        for (fid, shard) in newly_built {
+            self.ir_call_graph_shards
+                .insert((self.project_id.clone(), fid), shard);
+        }
+
+        let shard_refs: Vec<&Arc<IrCallGraph>> = target_files
+            .iter()
+            .filter_map(|&fid| {
+                self.ir_call_graph_shards
+                    .get(&(self.project_id.clone(), fid))
+            })
+            .collect();
+        let merged = Arc::new(merge_ir_call_graph_shards(shard_refs));
+        if is_full_project && merged.conflict.is_none() {
+            self.ir_call_graph_cache
+                .insert(self.project_id.clone(), Arc::clone(&merged));
+        }
+        merged
+    }
+
+    pub fn ensure_field_write_index(
+        &mut self,
+        target_files: &[FileId],
+        is_full_project: bool,
+    ) -> Arc<IrFieldWriteIndex> {
+        if let Some(cached) = self.ir_field_write_cache.get(&self.project_id) {
+            return Arc::clone(cached);
+        }
+
+        let mut missing = Vec::new();
+        let mut seen_missing = FxHashSet::default();
+        for &fid in target_files {
+            if !self
+                .ir_field_write_shards
+                .contains_key(&(self.project_id.clone(), fid))
+                && seen_missing.insert(fid)
+            {
+                missing.push(fid);
+            }
+        }
+
+        let mut newly_built = Vec::with_capacity(missing.len());
+        for fid in missing {
+            let shard = Arc::new(build_ir_field_write_file_shard(fid, self, self, self));
+            newly_built.push((fid, shard));
+        }
+
+        for (fid, shard) in newly_built {
+            self.ir_field_write_shards
+                .insert((self.project_id.clone(), fid), shard);
+        }
+
+        let shard_refs: Vec<&Arc<IrFieldWriteIndex>> = target_files
+            .iter()
+            .filter_map(|&fid| {
+                self.ir_field_write_shards
+                    .get(&(self.project_id.clone(), fid))
+            })
+            .collect();
+        let merged = Arc::new(merge_ir_field_write_shards(shard_refs));
+        if is_full_project {
+            self.ir_field_write_cache
+                .insert(self.project_id.clone(), Arc::clone(&merged));
+        }
+        merged
     }
 
     fn ensure_file_ir_entry(&self, file: FileId) -> Option<Arc<tssae_analysis::ir::FileIrEntry>> {
@@ -793,7 +905,6 @@ pub fn run_callers_of(
     }
 
     let workspace_programs = snapshot.workspace_programs();
-    let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
@@ -806,7 +917,7 @@ pub fn run_callers_of(
         set
     });
 
-    let (materialized_rows, newly_built_graph) = collect_materialized_callers(
+    let materialized_rows = collect_materialized_callers(
         snapshot,
         project_id,
         program,
@@ -814,16 +925,9 @@ pub fn run_callers_of(
         checker,
         &summary_index,
         decl_inputs,
-        cached_graph,
         allowed_files.as_ref(),
         observer,
     )?;
-
-    if let Some(g) = newly_built_graph {
-        snapshot
-            .ir_call_graph_cache
-            .insert(project_id.to_string(), g);
-    }
 
     let mut rows = Vec::with_capacity(materialized_rows.len());
     for row in materialized_rows {
@@ -883,45 +987,23 @@ fn collect_materialized_callers(
     checker: &mut CheckerHandle,
     summary_index: &BehaviorSummaryIndex,
     decl_inputs: Vec<(String, P<Node>, Option<P<Symbol>>)>,
-    cached_graph: Option<Arc<IrCallGraph>>,
     allowed_files: Option<&FxHashSet<FileId>>,
     observer: &mut ObserveCollector,
-) -> Result<(Vec<MaterializedCallersRow>, Option<Arc<IrCallGraph>>), RpcErr> {
-    let env =
+) -> Result<Vec<MaterializedCallersRow>, RpcErr> {
+    let mut env =
         SnapshotIrEnv::from_snapshot(snapshot, project_id, program, workspace_programs, checker);
-    let (graph_arc, built_now) = cached_graph.map_or_else(
-        || {
-            allowed_files.map_or_else(
-                || {
-                    let g = Arc::new(build_ir_call_graph_with_summaries(
-                        env.project_files(),
-                        &env,
-                        &env,
-                        &env,
-                        summary_index,
-                    ));
-                    (Arc::clone(&g), Some(g))
-                },
-                |allowed| {
-                    let scoped_files: Vec<FileId> = env
-                        .project_files()
-                        .iter()
-                        .copied()
-                        .filter(|f| allowed.contains(f))
-                        .collect();
-                    let g = Arc::new(build_ir_call_graph_with_summaries(
-                        &scoped_files,
-                        &env,
-                        &env,
-                        &env,
-                        summary_index,
-                    ));
-                    (g, None)
-                },
-            )
+    let is_full_project = allowed_files.is_none();
+    let target_files: Vec<FileId> = allowed_files.map_or_else(
+        || env.project_files().to_vec(),
+        |allowed| {
+            env.project_files()
+                .iter()
+                .copied()
+                .filter(|f| allowed.contains(f))
+                .collect()
         },
-        |existing| (existing, None),
     );
+    let graph_arc = env.ensure_call_graph(summary_index, &target_files, is_full_project);
     if let Some(conflict) = &graph_arc.conflict {
         let stats = env.summary_stats.get();
         observer.record_summary_lookup_stats(&stats);
@@ -949,7 +1031,7 @@ fn collect_materialized_callers(
                 is_complete: false,
                 evidence: Vec::new(),
             },
-            |ds| find_callers_on_ir(ds, sym_id, &graph_arc, &env, allowed_files),
+            |ds| find_callers_on_ir(ds, sym_id, &graph_arc, &env, &env, &env, allowed_files),
         );
 
         let mut sites: Vec<MaterializedCallerSite> = outcome
@@ -976,5 +1058,5 @@ fn collect_materialized_callers(
     let stats = env.summary_stats.get();
     observer.record_summary_lookup_stats(&stats);
     drop(env);
-    Ok((out, built_now))
+    Ok(out)
 }

@@ -231,9 +231,10 @@ struct IndexedPropWrite {
     rhs: ValueId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct IrFieldWriteIndex {
     writes_by_prop: FxHashMap<String, Vec<IndexedPropWrite>>,
+    covered_files: FxHashSet<FileId>,
 }
 
 impl IrFieldWriteIndex {
@@ -241,6 +242,7 @@ impl IrFieldWriteIndex {
     pub fn build(project_files: &[FileId], ir_provider: &dyn IrProvider) -> Self {
         let mut index = Self::default();
         for &file in project_files {
+            index.covered_files.insert(file);
             for scope in ir_provider.scopes_in_file(file) {
                 if let Ok(ir) = ir_provider.function_ir(scope.root_syntax) {
                     index.collect_from_ir(&ir);
@@ -248,6 +250,17 @@ impl IrFieldWriteIndex {
             }
         }
         index
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.covered_files
+            .extend(other.covered_files.iter().copied());
+        for (prop, writes) in &other.writes_by_prop {
+            self.writes_by_prop
+                .entry(prop.clone())
+                .or_default()
+                .extend(writes.iter().cloned());
+        }
     }
 
     fn collect_from_ir(&mut self, ir: &Arc<FunctionIr>) {
@@ -270,6 +283,38 @@ impl IrFieldWriteIndex {
             }
         }
     }
+}
+
+/// Indexes all static property writes in a single `file_id` into an [`IrFieldWriteIndex`] shard.
+#[must_use]
+pub fn build_ir_field_write_file_shard(
+    file_id: FileId,
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+) -> IrFieldWriteIndex {
+    let _ = (semantic, syntax);
+    IrFieldWriteIndex::build(&[file_id], ir_provider)
+}
+
+/// Merges multiple per-file [`IrFieldWriteIndex`] shards into a single combined [`IrFieldWriteIndex`].
+#[must_use]
+pub fn merge_ir_field_write_shards<'a>(
+    shards: impl IntoIterator<Item = &'a Arc<IrFieldWriteIndex>>,
+) -> IrFieldWriteIndex {
+    let mut iter = shards.into_iter();
+    let Some(first) = iter.next() else {
+        return IrFieldWriteIndex::default();
+    };
+    let mut rest = iter.peekable();
+    if rest.peek().is_none() {
+        return (**first).clone();
+    }
+    let mut merged = (**first).clone();
+    for shard in rest {
+        merged.merge_from(shard);
+    }
+    merged
 }
 
 #[derive(Clone)]
@@ -502,7 +547,17 @@ impl<'a> IrInstanceResolver<'a> {
 
     fn ensure_field_index(&mut self) -> &IrFieldWriteIndex {
         if let Some(idx) = self.cached_field_index {
-            return idx;
+            let missing_extra = self.allowed_files.is_some()
+                && self
+                    .extra_field_files
+                    .iter()
+                    .any(|f| !idx.covered_files.contains(f) && self.project_files.contains(f));
+            if !missing_extra {
+                return idx;
+            }
+            if self.owned_field_index.is_none() {
+                *self.owned_field_index = Some(idx.clone());
+            }
         }
         if self.owned_field_index.is_none() {
             let scoped_files: Vec<FileId>;
@@ -518,6 +573,19 @@ impl<'a> IrInstanceResolver<'a> {
                 self.project_files
             };
             *self.owned_field_index = Some(IrFieldWriteIndex::build(files, self.ir_provider));
+        } else if self.allowed_files.is_some()
+            && let Some(owned) = self.owned_field_index.as_mut()
+        {
+            let extra_missing: Vec<FileId> = self
+                .project_files
+                .iter()
+                .copied()
+                .filter(|f| self.extra_field_files.contains(f) && !owned.covered_files.contains(f))
+                .collect();
+            if !extra_missing.is_empty() {
+                let extra = IrFieldWriteIndex::build(&extra_missing, self.ir_provider);
+                owned.merge_from(&extra);
+            }
         }
         self.owned_field_index
             .as_ref()

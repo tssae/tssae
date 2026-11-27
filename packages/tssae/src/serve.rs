@@ -346,8 +346,12 @@ pub struct SnapshotState {
     pub file_syntax_indices: FxHashMap<FileId, Arc<FileSyntaxIndex>>,
     pub symbol_registry: tssae_tsrs_boundary::SymbolRegistry,
     pub ir_call_graph_cache: FxHashMap<String, Arc<tssae_analysis::call_resolution::IrCallGraph>>,
+    pub ir_call_graph_shards:
+        FxHashMap<(String, FileId), Arc<tssae_analysis::call_resolution::IrCallGraph>>,
     pub ir_field_write_cache:
         FxHashMap<String, Arc<tssae_analysis::instance_identity::IrFieldWriteIndex>>,
+    pub ir_field_write_shards:
+        FxHashMap<(String, FileId), Arc<tssae_analysis::instance_identity::IrFieldWriteIndex>>,
     pub hierarchy_cache: FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
     pub project_file_catalog_cache:
         FxHashMap<String, Arc<crate::ir_calls::SnapshotProjectFileCatalog>>,
@@ -852,7 +856,9 @@ impl EngineServer {
                 file_syntax_indices: FxHashMap::default(),
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
+                ir_call_graph_shards: FxHashMap::default(),
                 ir_field_write_cache: FxHashMap::default(),
+                ir_field_write_shards: FxHashMap::default(),
                 hierarchy_cache: FxHashMap::default(),
                 project_file_catalog_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -890,7 +896,9 @@ impl EngineServer {
         snapshot.summary_config = params.summaries;
         snapshot.summary_index = index;
         snapshot.ir_call_graph_cache.clear();
+        snapshot.ir_call_graph_shards.clear();
         snapshot.ir_field_write_cache.clear();
+        snapshot.ir_field_write_shards.clear();
         snapshot.hierarchy_cache.clear();
         snapshot.project_file_catalog_cache.clear();
         Ok(SnapshotSetSummariesResult { updated: true })
@@ -963,13 +971,14 @@ impl EngineServer {
         let snapshot_id = self.next_snapshot_id;
         let opened = updated.opened;
 
-        let (ir_cache, files_reused, files_invalidated) = inherit_snapshot_ir_cache(
-            &cwd,
-            old_state.as_ref(),
-            &updated.recomputed_files,
-            &updated.removed_files,
-            &opened.snapshot_data,
-        );
+        let (ir_cache, file_syntax_indices, files_reused, files_invalidated) =
+            inherit_snapshot_caches(
+                &cwd,
+                old_state.as_ref(),
+                &updated.recomputed_files,
+                &updated.removed_files,
+                &opened.snapshot_data,
+            );
         observer.record_ir_file_reuse(files_reused, files_invalidated);
         drop(old_state);
 
@@ -996,10 +1005,12 @@ impl EngineServer {
                 instance_handles: FxHashMap::default(),
                 file_ids: Arc::clone(&self.file_ids),
                 ir_cache,
-                file_syntax_indices: FxHashMap::default(),
+                file_syntax_indices,
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
+                ir_call_graph_shards: FxHashMap::default(),
                 ir_field_write_cache: FxHashMap::default(),
+                ir_field_write_shards: FxHashMap::default(),
                 hierarchy_cache: FxHashMap::default(),
                 project_file_catalog_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
@@ -1373,15 +1384,20 @@ pub fn run_branch_coverage(
     Ok(items)
 }
 
-fn inherit_snapshot_ir_cache(
+fn inherit_snapshot_caches(
     cwd: &str,
     old_state: Option<&SnapshotState>,
     recomputed_files: &[String],
     removed_files: &[String],
     new_snapshot_data: &SnapshotData,
-) -> (SnapshotIrCache, usize, usize) {
+) -> (
+    SnapshotIrCache,
+    FxHashMap<FileId, Arc<FileSyntaxIndex>>,
+    usize,
+    usize,
+) {
     let Some(prev) = old_state else {
-        return (SnapshotIrCache::new(), 0, 0);
+        return (SnapshotIrCache::new(), FxHashMap::default(), 0, 0);
     };
     let recomputed_set: BTreeSet<&str> = recomputed_files.iter().map(String::as_str).collect();
     let removed_set: BTreeSet<&str> = removed_files.iter().map(String::as_str).collect();
@@ -1395,11 +1411,28 @@ fn inherit_snapshot_ir_cache(
             }
         }
     }
-    SnapshotIrCache::inherit_from(&prev.ir_cache, |entry| {
-        !recomputed_set.contains(entry.rel_file.as_str())
-            && !removed_set.contains(entry.rel_file.as_str())
-            && new_source_file_addrs.get(entry.rel_file.as_str()) == Some(&entry.source_file_addr)
-    })
+    let (ir_cache, files_reused, files_invalidated) =
+        SnapshotIrCache::inherit_from(&prev.ir_cache, |entry| {
+            !recomputed_set.contains(entry.rel_file.as_str())
+                && !removed_set.contains(entry.rel_file.as_str())
+                && new_source_file_addrs.get(entry.rel_file.as_str())
+                    == Some(&entry.source_file_addr)
+        });
+    let mut file_syntax_indices = FxHashMap::default();
+    for (&fid, idx) in &prev.file_syntax_indices {
+        if !recomputed_set.contains(idx.rel_file.as_str())
+            && !removed_set.contains(idx.rel_file.as_str())
+            && new_source_file_addrs.get(idx.rel_file.as_str()) == Some(&idx.source_file_addr)
+        {
+            file_syntax_indices.insert(fid, Arc::clone(idx));
+        }
+    }
+    (
+        ir_cache,
+        file_syntax_indices,
+        files_reused,
+        files_invalidated,
+    )
 }
 
 fn collect_snapshot_resolved_packages(

@@ -270,8 +270,6 @@ fn alloc_origin_payloads(
 
 type InstanceBatchMaterialized = (
     Vec<(String, MaterializedOutcome)>,
-    Option<IrCallGraph>,
-    Option<IrFieldWriteIndex>,
     Option<tssae_common::SummaryConflictError>,
 );
 
@@ -294,8 +292,6 @@ pub fn run_resolve_instances(
     }
 
     let workspace_programs = snapshot.workspace_programs();
-    let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
-    let cached_field_index = snapshot.ir_field_write_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
@@ -308,23 +304,14 @@ pub fn run_resolve_instances(
         set
     });
 
-    let (materialized, newly_built_graph, newly_built_field_index, conflict_opt): InstanceBatchMaterialized = {
-        let env = SnapshotIrEnv::from_snapshot(
+    let (materialized, conflict_opt): InstanceBatchMaterialized = {
+        let mut env = SnapshotIrEnv::from_snapshot(
             snapshot,
             project_id,
             program,
             &workspace_programs,
             checker,
         );
-        if let Some(g) = cached_graph.as_deref()
-            && let Some(conflict) = &g.conflict
-        {
-            let stats = env.summary_stats.get();
-            observer.record_summary_lookup_stats(&stats);
-            let err = conflict_rpc_err(conflict);
-            drop(env);
-            return Err(err);
-        }
 
         let specs: Vec<InstanceTargetSpec> = target_inputs
             .iter()
@@ -348,7 +335,42 @@ pub fn run_resolve_instances(
             })
             .collect();
 
-        let (batch_outcome, built_graph, built_field_index): (
+        let is_full_project = allowed_files.is_none();
+        let call_target_files: Vec<FileId> = allowed_files.as_ref().map_or_else(
+            || env.project_files().to_vec(),
+            |allowed| {
+                env.project_files()
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f))
+                    .collect()
+            },
+        );
+        let cached_graph =
+            env.ensure_call_graph(&summary_index, &call_target_files, is_full_project);
+        if let Some(conflict) = &cached_graph.conflict {
+            let stats = env.summary_stats.get();
+            observer.record_summary_lookup_stats(&stats);
+            let err = conflict_rpc_err(conflict);
+            drop(env);
+            return Err(err);
+        }
+
+        let extra_field_files: FxHashSet<FileId> =
+            specs.iter().map(|t| t.syntax.file_id()).collect();
+        let field_target_files: Vec<FileId> = allowed_files.as_ref().map_or_else(
+            || env.project_files().to_vec(),
+            |allowed| {
+                env.project_files()
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f) || extra_field_files.contains(f))
+                    .collect()
+            },
+        );
+        let cached_field_index = env.ensure_field_write_index(&field_target_files, is_full_project);
+
+        let (batch_outcome, _, _): (
             ResolveInstancesBatchOutcome,
             Option<IrCallGraph>,
             Option<IrFieldWriteIndex>,
@@ -360,8 +382,8 @@ pub fn run_resolve_instances(
             &env,
             &env,
             &summary_index,
-            cached_graph.as_deref(),
-            cached_field_index.as_deref(),
+            Some(cached_graph.as_ref()),
+            Some(cached_field_index.as_ref()),
         );
 
         let stats = env.summary_stats.get();
@@ -402,32 +424,8 @@ pub fn run_resolve_instances(
             .collect();
 
         drop(env);
-        (
-            mapped,
-            built_graph,
-            built_field_index,
-            batch_outcome.conflict,
-        )
+        (mapped, batch_outcome.conflict)
     };
-
-    if let Some(g) = newly_built_graph {
-        let g_arc = Arc::new(g);
-        if let Some(conflict) = &g_arc.conflict {
-            return Err(conflict_rpc_err(conflict));
-        }
-        if allowed_files.is_none() {
-            snapshot
-                .ir_call_graph_cache
-                .insert(project_id.to_string(), g_arc);
-        }
-    }
-    if let Some(fi) = newly_built_field_index
-        && allowed_files.is_none()
-    {
-        snapshot
-            .ir_field_write_cache
-            .insert(project_id.to_string(), Arc::new(fi));
-    }
 
     if let Some(conflict) = conflict_opt {
         return Err(conflict_rpc_err(&conflict));

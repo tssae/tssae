@@ -14,7 +14,7 @@ use tssae_common::{
 
 use crate::{
     branch_coverage::{ControlFlowPathStep, StackArena, StackId},
-    call_resolution::{IrCallGraph, resolve_call_targets_with_summaries},
+    call_resolution::{CallTargetsOutcome, IrCallGraph, resolve_call_targets_with_summaries},
     instance_identity::{
         HostOrigin, InstanceOriginKind, IrCallFrame, IrFieldWriteIndex, IrInstanceResolver,
         ReceiverBinding, ResolvedInstanceOrigin, find_call_vertex_by_syntax,
@@ -241,6 +241,23 @@ fn base_instance_key(key: &str) -> &str {
     key.split("@ctx[").next().unwrap_or(key)
 }
 
+fn is_non_matching_container_item(
+    reg: &RegistrationEntry,
+    i_val: ValueId,
+    target_origin_syntaxes: &FxHashSet<SyntaxId>,
+) -> bool {
+    let Some(prod) = find_value_producer_vertex(&reg.scope_ir, i_val, Some(reg.vertex_id)) else {
+        return false;
+    };
+    match prod.op {
+        IrOp::Literal { .. } | IrOp::Unary { .. } | IrOp::TemplateString { .. } => true,
+        IrOp::Construct { .. } => prod
+            .syntax
+            .is_some_and(|s| !target_origin_syntaxes.contains(&s)),
+        _ => false,
+    }
+}
+
 /// Summary of how a `(fn_ir, call_stack)` behaves with respect to a specific target instance.
 #[derive(Clone)]
 struct FunctionTargetSummary {
@@ -341,8 +358,12 @@ pub fn evaluate_instance_cleanup_on_ir<S: BuildHasher>(
         cached_field_index,
         owned_field_index: None,
         cleanup_index: None,
+        initial_containers_by_target: None,
         call_context_cache: FxHashMap::default(),
         vertex_effect_cache: FxHashMap::default(),
+        calls_summary_cache: FxHashMap::default(),
+        effects_summary_cache: FxHashMap::default(),
+        call_targets_cache: FxHashMap::default(),
         conflict: None,
     };
 
@@ -409,8 +430,19 @@ struct CleanupAnalyzer<'a> {
     cached_field_index: Option<&'a IrFieldWriteIndex>,
     owned_field_index: Option<IrFieldWriteIndex>,
     cleanup_index: Option<IrCleanupProjectIndex>,
+    initial_containers_by_target: Option<FxHashMap<String, Vec<String>>>,
     call_context_cache: FxHashMap<(FunctionIrId, Vec<SyntaxId>), CallContextKey>,
     vertex_effect_cache: FxHashMap<VertexCacheKey, VertexCleanupEffect>,
+    calls_summary_cache: FxHashMap<
+        SyntaxId,
+        Option<(
+            DeclarationIdentity,
+            MatchedSummaryAspect<tssae_common::CallAspectSummary>,
+        )>,
+    >,
+    effects_summary_cache:
+        FxHashMap<(SyntaxId, u8), Option<MatchedSummaryAspect<EffectAspectSummary>>>,
+    call_targets_cache: FxHashMap<SyntaxId, CallTargetsOutcome>,
     conflict: Option<SummaryConflictError>,
 }
 
@@ -685,13 +717,7 @@ impl CleanupAnalyzer<'_> {
                 }
 
                 // Regular call passed as cleanup scope: enter callee(s) with call frame.
-                let res = resolve_call_targets_with_summaries(
-                    scope_syntax,
-                    self.semantic,
-                    self.syntax,
-                    self.ir_provider,
-                    self.summary_index,
-                );
+                let res = self.resolve_call_targets_cached(scope_syntax);
                 if let Some(conflict) = res.conflict {
                     self.conflict = Some(conflict);
                     return (Vec::new(), Vec::new(), Vec::new());
@@ -893,6 +919,23 @@ impl CleanupAnalyzer<'_> {
         vertex: &CfgVertex,
         call_stack: &[IrCallFrame],
     ) -> VertexCleanupEffect {
+        let Some(syn) = vertex.syntax else {
+            return VertexCleanupEffect::default();
+        };
+        if !matches!(
+            vertex.op,
+            IrOp::Call { .. }
+                | IrOp::Construct { .. }
+                | IrOp::PropWrite { .. }
+                | IrOp::Unknown { .. }
+        ) {
+            return VertexCleanupEffect::default();
+        }
+        if matches!(vertex.op, IrOp::PropWrite { .. })
+            && self.lookup_prop_write_effects_summary(syn).is_none()
+        {
+            return VertexCleanupEffect::default();
+        }
         let ctx_key = self.call_context_key(ir, call_stack);
         let cache_key = (ir.id, vertex.id, ctx_key);
         if let Some(cached) = self.vertex_effect_cache.get(&cache_key) {
@@ -900,10 +943,6 @@ impl CleanupAnalyzer<'_> {
         }
 
         let mut effect = VertexCleanupEffect::default();
-        let Some(syn) = vertex.syntax else {
-            self.vertex_effect_cache.insert(cache_key, effect.clone());
-            return effect;
-        };
 
         match &vertex.op {
             IrOp::Call {
@@ -965,13 +1004,7 @@ impl CleanupAnalyzer<'_> {
                     && matches!(call_kind, IrCallKind::ImplicitDispose { .. })
                 {
                     // Fallback for structural `[Symbol.dispose]` / `[Symbol.asyncDispose]` in `using`/`await using`.
-                    let res = resolve_call_targets_with_summaries(
-                        syn,
-                        self.semantic,
-                        self.syntax,
-                        self.ir_provider,
-                        self.summary_index,
-                    );
+                    let res = self.resolve_call_targets_cached(syn);
                     if let Some(conflict) = res.conflict {
                         self.conflict = Some(conflict);
                         return effect;
@@ -1036,9 +1069,16 @@ impl CleanupAnalyzer<'_> {
                     }
                 }
 
-                // 3. Always resolve concrete source callees (helpers, wrappers, parameter callbacks)
-                //    so `{ dispose: () => store.dispose() }` expands even when IDisposable.dispose matched.
-                if !handled_by_calls_summary {
+                // 3. Resolve concrete source callees (helpers, wrappers, parameter callbacks)
+                //    unless a complete summary already accounts for all non-disposal resource ops.
+                let needs_callee_expansion = !summary_is_complete
+                    || matched_effects_summary.as_ref().is_some_and(|m| {
+                        m.aspect
+                            .resource_ops
+                            .iter()
+                            .any(|op| matches!(op, ResourceOpSpec::DisposesTarget { .. }))
+                    });
+                if !handled_by_calls_summary && needs_callee_expansion {
                     let (callees, dynamic_gap, is_external_decl_only) = self
                         .resolve_cleanup_call_callees(
                             ir, vertex, syn, *callee, *receiver, args, call_stack,
@@ -1112,13 +1152,7 @@ impl CleanupAnalyzer<'_> {
             }
             IrOp::Construct { callee, args, .. } => {
                 let _ = callee;
-                let res = resolve_call_targets_with_summaries(
-                    syn,
-                    self.semantic,
-                    self.syntax,
-                    self.ir_provider,
-                    self.summary_index,
-                );
+                let res = self.resolve_call_targets_cached(syn);
                 if let Some(conflict) = res.conflict {
                     self.conflict = Some(conflict);
                     return effect;
@@ -1475,12 +1509,54 @@ impl CleanupAnalyzer<'_> {
             }
         }
 
-        // 2. Closure or object-literal method (`{ dispose: () => store.dispose() }`).
-        let (closure_entries, _) =
-            self.resolve_callable_value(caller_ir, callee_val, Some(call_vertex.id), call_stack);
-        if self.conflict.is_some() {
+        // 2. Standard static IR call target resolution first so default-library calls
+        //    (`Array.push`, `Math.max`, DOM APIs) and direct `this.method()` / `super.method()`
+        //    calls avoid redundant closure tracing.
+        let res = self.resolve_call_targets_cached(call_syntax);
+        if let Some(conflict) = res.conflict {
+            self.conflict = Some(conflict);
             return (Vec::new(), None, false);
         }
+        if !res.targets.is_empty()
+            && res.gaps.is_empty()
+            && res.targets.iter().all(|t| t.is_default_library)
+        {
+            return (Vec::new(), None, true);
+        }
+
+        let is_direct_static_or_method = !res.targets.is_empty()
+            && res.gaps.is_empty()
+            && res.targets.iter().all(|t| t.fn_scope_syntax.is_some())
+            && find_value_producer_vertex(caller_ir, callee_val, Some(call_vertex.id)).is_some_and(
+                |v| match v.op {
+                    IrOp::PropRead { object, .. } => {
+                        find_value_producer_vertex(caller_ir, object, Some(v.id))
+                            .is_some_and(|obj_v| matches!(obj_v.op, IrOp::ThisRef | IrOp::SuperRef))
+                    }
+                    IrOp::ReadSymbol { .. } => res.targets.iter().all(|t| {
+                        self.ir_provider
+                            .enclosing_scope_ir(t.declaration_syntax)
+                            .is_ok_and(|d| d.scope_kind == IrScopeKind::ModuleTopLevel)
+                    }),
+                    _ => false,
+                },
+            );
+
+        // 3. Closure or object-literal method (`{ dispose: () => store.dispose() }`).
+        let closure_entries = if is_direct_static_or_method {
+            Vec::new()
+        } else {
+            let (entries, _) = self.resolve_callable_value(
+                caller_ir,
+                callee_val,
+                Some(call_vertex.id),
+                call_stack,
+            );
+            if self.conflict.is_some() {
+                return (Vec::new(), None, false);
+            }
+            entries
+        };
         if !closure_entries.is_empty() {
             let invs = closure_entries
                 .into_iter()
@@ -1517,19 +1593,6 @@ impl CleanupAnalyzer<'_> {
                 })
                 .collect();
             return (invs, None, false);
-        }
-
-        // 3. Standard static IR call target resolution.
-        let res = resolve_call_targets_with_summaries(
-            call_syntax,
-            self.semantic,
-            self.syntax,
-            self.ir_provider,
-            self.summary_index,
-        );
-        if let Some(conflict) = res.conflict {
-            self.conflict = Some(conflict);
-            return (Vec::new(), None, false);
         }
 
         let mut invs = Vec::new();
@@ -1693,12 +1756,34 @@ impl CleanupAnalyzer<'_> {
         out
     }
 
-    fn collect_initial_target_containers(&mut self, target_key: &str) -> Vec<String> {
-        let mut containers = Vec::new();
-        let (registrations, slot_writes) = {
-            let idx = self.ensure_cleanup_index();
-            (idx.registrations.clone(), idx.slot_writes.clone())
-        };
+    fn build_initial_containers_by_target(&mut self) -> FxHashMap<String, Vec<String>> {
+        let mut by_target: FxHashMap<String, Vec<String>> = FxHashMap::default();
+        let registrations = self.ensure_cleanup_index().registrations.clone();
+        let target_origin_syntaxes: FxHashSet<SyntaxId> = self
+            .targets
+            .iter()
+            .filter_map(|t| t.origin_syntax)
+            .collect();
+
+        let mut extra_files = self.extra_field_files.clone();
+        for reg in &registrations {
+            extra_files.insert(reg.scope_ir.id.file);
+        }
+        let mut resolver = IrInstanceResolver::new(
+            self.project_files,
+            self.allowed_files,
+            extra_files,
+            self.semantic,
+            self.syntax,
+            self.ir_provider,
+            self.summary_index,
+            self.cached_call_graph,
+            self.owned_graph,
+            self.cached_field_index,
+            &mut self.owned_field_index,
+            true,
+        )
+        .with_call_targets_cache(&mut self.call_targets_cache);
 
         for reg in registrations {
             let Some(c_val) = slot_val_in_call(&reg.scope_ir, reg.vertex_id, &reg.container_slot)
@@ -1708,22 +1793,73 @@ impl CleanupAnalyzer<'_> {
             let Some(i_val) = slot_val_in_call(&reg.scope_ir, reg.vertex_id, &reg.item_slot) else {
                 continue;
             };
-            let i_hosts = self.trace_val_hosts(&reg.scope_ir, i_val, Some(reg.vertex_id), &[]);
-            if i_hosts.iter().any(|h| h.origin.instance_key == target_key) {
-                for ch in self.trace_val_hosts(&reg.scope_ir, c_val, Some(reg.vertex_id), &[]) {
-                    if !containers.contains(&ch.origin.instance_key) {
-                        containers.push(ch.origin.instance_key);
+            if is_non_matching_container_item(&reg, i_val, &target_origin_syntaxes) {
+                continue;
+            }
+            let mut active = Vec::new();
+            let i_hosts = resolver
+                .trace_value(
+                    &reg.scope_ir,
+                    i_val,
+                    Some(reg.vertex_id),
+                    &[],
+                    0,
+                    &mut active,
+                )
+                .hosts;
+            if let Some(conflict) = resolver.conflict.take() {
+                self.conflict = Some(conflict);
+                break;
+            }
+            let matched_keys: Vec<String> = i_hosts
+                .into_iter()
+                .map(|h| h.origin.instance_key)
+                .filter(|k| self.target_keys.contains(k))
+                .collect();
+            if matched_keys.is_empty() {
+                continue;
+            }
+            let mut c_active = Vec::new();
+            let container_keys: Vec<String> = resolver
+                .trace_value(
+                    &reg.scope_ir,
+                    c_val,
+                    Some(reg.vertex_id),
+                    &[],
+                    0,
+                    &mut c_active,
+                )
+                .hosts
+                .into_iter()
+                .map(|ch| ch.origin.instance_key)
+                .collect();
+            if let Some(conflict) = resolver.conflict.take() {
+                self.conflict = Some(conflict);
+                break;
+            }
+            for item_key in matched_keys {
+                let entry = by_target.entry(item_key).or_default();
+                for ck in &container_keys {
+                    if !entry.contains(ck) {
+                        entry.push(ck.clone());
                     }
                 }
             }
         }
+        by_target
+    }
 
-        // Also check slot-held values written before scope (e.g. MutableDisposable.value = second before slot.clear()).
-        // Wait: if a wrapper `{ dispose: () => store.dispose() }` stored `item` inside `makeStoreWrapper(item)`,
-        // tracing `item` inside `makeStoreWrapper` WITHOUT stack resolves to parameter `item`,
-        // so we also match container disposal sites expanded with the container's `captured_stack`!
-        let _ = slot_writes;
-        containers
+    fn collect_initial_target_containers(&mut self, target_key: &str) -> Vec<String> {
+        if self.initial_containers_by_target.is_none() {
+            let built = self.build_initial_containers_by_target();
+            self.initial_containers_by_target = Some(built);
+        }
+
+        self.initial_containers_by_target
+            .as_ref()
+            .and_then(|map| map.get(target_key))
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[expect(
@@ -1772,7 +1908,16 @@ impl CleanupAnalyzer<'_> {
             };
         }
 
-        let initial_containers = self.collect_initial_target_containers(&target.instance_key);
+        let live_for_any_entry = entries.iter().any(|entry| {
+            target
+                .origin_syntax
+                .is_none_or(|alloc_syn| !ir_contains_syntax(&entry.ir, alloc_syn))
+        });
+        let initial_containers = if live_for_any_entry {
+            self.collect_initial_target_containers(&target.instance_key)
+        } else {
+            Vec::new()
+        };
         let mut container_registry = initial_containers.clone();
         let initial_mask: u32 = if initial_containers.is_empty() {
             0
@@ -2542,14 +2687,14 @@ impl CleanupAnalyzer<'_> {
         }
     }
 
-    fn collect_closure_env_frames(
+    fn captured_env_frames_for_ir(
         &self,
         ir: &Arc<FunctionIr>,
-        frame: &IrCallFrame,
+        closure_env: &[IrCallFrame],
         parent_stack: &[IrCallFrame],
     ) -> Vec<SyntaxId> {
-        let mut frames: Vec<SyntaxId> = frame.closure_env.iter().map(|cf| cf.call_syntax).collect();
-        if parent_stack.is_empty() {
+        let mut frames = Vec::new();
+        if closure_env.is_empty() && parent_stack.is_empty() {
             return frames;
         }
         for v in &ir.vertices {
@@ -2570,12 +2715,27 @@ impl CleanupAnalyzer<'_> {
                     .iter()
                     .rev()
                     .find(|f| f.callee_ir.id == decl_ir.id)
+                    .or_else(|| {
+                        closure_env
+                            .iter()
+                            .rev()
+                            .find(|f| f.callee_ir.id == decl_ir.id)
+                    })
                 && !frames.contains(&pf.call_syntax)
             {
                 frames.push(pf.call_syntax);
             }
         }
         frames
+    }
+
+    fn collect_closure_env_frames(
+        &self,
+        ir: &Arc<FunctionIr>,
+        frame: &IrCallFrame,
+        parent_stack: &[IrCallFrame],
+    ) -> Vec<SyntaxId> {
+        self.captured_env_frames_for_ir(ir, &frame.closure_env, parent_stack)
     }
 
     fn call_context_key(
@@ -2627,24 +2787,33 @@ impl CleanupAnalyzer<'_> {
         let mut param_bindings = Vec::with_capacity(frame.args.len());
         for &arg in &frame.args {
             let val = arg_value_id(arg);
-            let mut host_keys: Vec<String> = self
-                .trace_val_hosts(&frame.caller_ir, val, None, parent_stack)
-                .into_iter()
-                .map(|h| self.canonicalize_ctx_host_key(&h.origin.instance_key))
-                .collect();
+            let is_primitive_op = find_value_producer_vertex(&frame.caller_ir, val, None)
+                .is_some_and(|v| {
+                    matches!(
+                        v.op,
+                        IrOp::Literal { .. } | IrOp::Unary { .. } | IrOp::TemplateString { .. }
+                    )
+                });
+            let hosts = if is_primitive_op {
+                Vec::new()
+            } else {
+                self.trace_val_hosts(&frame.caller_ir, val, None, parent_stack)
+            };
+            let mut host_keys: Vec<String> = Vec::with_capacity(hosts.len());
+            let mut callable_fns: Vec<(FunctionIrId, Vec<SyntaxId>)> = Vec::new();
+            let mut seen_callables: FxHashSet<(FunctionIrId, usize)> = FxHashSet::default();
+            for h in hosts {
+                host_keys.push(self.canonicalize_ctx_host_key(&h.origin.instance_key));
+                if let Some(fn_syn) = h.closure_fn
+                    && let Ok(callee_ir) = self.ir_provider.function_ir(fn_syn)
+                    && seen_callables.insert((callee_ir.id, h.captured_stack.len()))
+                {
+                    let cap = self.captured_env_frames_for_ir(&callee_ir, &h.captured_stack, &[]);
+                    callable_fns.push((callee_ir.id, cap));
+                }
+            }
             host_keys.sort();
             host_keys.dedup();
-
-            let (entries, _) =
-                self.resolve_callable_value(&frame.caller_ir, val, None, parent_stack);
-            let mut callable_fns: Vec<(FunctionIrId, Vec<SyntaxId>)> = entries
-                .into_iter()
-                .map(|e| {
-                    let cap: Vec<SyntaxId> =
-                        e.captured_stack.iter().map(|f| f.call_syntax).collect();
-                    (e.ir.id, cap)
-                })
-                .collect();
             callable_fns.sort_by_key(|(fid, cap)| {
                 (
                     fid.file.0,
@@ -2693,7 +2862,8 @@ impl CleanupAnalyzer<'_> {
             self.cached_field_index,
             &mut self.owned_field_index,
             call_stack.is_empty(),
-        );
+        )
+        .with_call_targets_cache(&mut self.call_targets_cache);
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);
         if let Some(conflict) = resolver.conflict.take() {
@@ -2724,7 +2894,8 @@ impl CleanupAnalyzer<'_> {
             self.cached_field_index,
             &mut self.owned_field_index,
             false,
-        );
+        )
+        .with_call_targets_cache(&mut self.call_targets_cache);
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);
         if let Some(conflict) = resolver.conflict.take() {
@@ -2747,6 +2918,21 @@ impl CleanupAnalyzer<'_> {
         (entries, res.gaps)
     }
 
+    fn resolve_call_targets_cached(&mut self, call_syntax: SyntaxId) -> CallTargetsOutcome {
+        if let Some(cached) = self.call_targets_cache.get(&call_syntax) {
+            return cached.clone();
+        }
+        let outcome = resolve_call_targets_with_summaries(
+            call_syntax,
+            self.semantic,
+            self.syntax,
+            self.ir_provider,
+            self.summary_index,
+        );
+        self.call_targets_cache.insert(call_syntax, outcome.clone());
+        outcome
+    }
+
     fn lookup_calls_summary_with_id(
         &mut self,
         call_syntax: SyntaxId,
@@ -2754,6 +2940,9 @@ impl CleanupAnalyzer<'_> {
         DeclarationIdentity,
         MatchedSummaryAspect<tssae_common::CallAspectSummary>,
     )> {
+        if let Some(cached) = self.calls_summary_cache.get(&call_syntax) {
+            return cached.clone();
+        }
         let mut syns = vec![call_syntax];
         if let Some(decl_syn) = self
             .semantic
@@ -2768,7 +2957,11 @@ impl CleanupAnalyzer<'_> {
                 continue;
             };
             match self.summary_index.resolve_calls_summary(&identity, false) {
-                Ok(Some(matched)) => return Some((identity, matched)),
+                Ok(Some(matched)) => {
+                    let res = Some((identity, matched));
+                    self.calls_summary_cache.insert(call_syntax, res.clone());
+                    return res;
+                }
                 Ok(None) => {}
                 Err(conflict) => {
                     self.conflict = Some(conflict);
@@ -2776,6 +2969,7 @@ impl CleanupAnalyzer<'_> {
                 }
             }
         }
+        self.calls_summary_cache.insert(call_syntax, None);
         None
     }
 
@@ -2784,6 +2978,15 @@ impl CleanupAnalyzer<'_> {
         call_syntax: SyntaxId,
         call_kind: IrCallKind,
     ) -> Option<MatchedSummaryAspect<EffectAspectSummary>> {
+        let kind_tag = match call_kind {
+            IrCallKind::ImplicitDispose { .. } => 1,
+            IrCallKind::ImplicitSetter => 2,
+            _ => 0,
+        };
+        let cache_key = (call_syntax, kind_tag);
+        if let Some(cached) = self.effects_summary_cache.get(&cache_key) {
+            return cached.clone();
+        }
         let mut syns = Vec::new();
         if !matches!(call_kind, IrCallKind::ImplicitDispose { .. }) {
             syns.push(call_syntax);
@@ -2800,13 +3003,7 @@ impl CleanupAnalyzer<'_> {
             call_kind,
             IrCallKind::ImplicitDispose { .. } | IrCallKind::ImplicitSetter
         ) {
-            let res = resolve_call_targets_with_summaries(
-                call_syntax,
-                self.semantic,
-                self.syntax,
-                self.ir_provider,
-                self.summary_index,
-            );
+            let res = self.resolve_call_targets_cached(call_syntax);
             if let Some(conflict) = res.conflict {
                 self.conflict = Some(conflict);
                 return None;
@@ -2822,7 +3019,11 @@ impl CleanupAnalyzer<'_> {
                 continue;
             };
             match self.summary_index.resolve_effects_summary(&identity, false) {
-                Ok(Some(matched)) => return Some(matched),
+                Ok(Some(matched)) => {
+                    let res = Some(matched);
+                    self.effects_summary_cache.insert(cache_key, res.clone());
+                    return res;
+                }
                 Ok(None) => {}
                 Err(conflict) => {
                     self.conflict = Some(conflict);
@@ -2830,6 +3031,7 @@ impl CleanupAnalyzer<'_> {
                 }
             }
         }
+        self.effects_summary_cache.insert(cache_key, None);
         None
     }
 

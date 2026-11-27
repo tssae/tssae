@@ -326,6 +326,7 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
         cached_field_index,
         owned_field_index: &mut owned_field_index,
         allow_unanchored_caller_lookup: true,
+        call_targets_cache: CallTargetsCache::Owned(FxHashMap::default()),
         conflict: None,
     };
 
@@ -358,6 +359,31 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
     )
 }
 
+enum CallTargetsCache<'a> {
+    Owned(FxHashMap<SyntaxId, call_resolution::CallTargetsOutcome>),
+    Shared(&'a mut FxHashMap<SyntaxId, call_resolution::CallTargetsOutcome>),
+}
+
+impl CallTargetsCache<'_> {
+    fn get(&self, key: SyntaxId) -> Option<&call_resolution::CallTargetsOutcome> {
+        match self {
+            Self::Owned(map) => map.get(&key),
+            Self::Shared(map) => map.get(&key),
+        }
+    }
+
+    fn insert(&mut self, key: SyntaxId, val: call_resolution::CallTargetsOutcome) {
+        match self {
+            Self::Owned(map) => {
+                map.insert(key, val);
+            }
+            Self::Shared(map) => {
+                map.insert(key, val);
+            }
+        }
+    }
+}
+
 pub(crate) struct IrInstanceResolver<'a> {
     pub(crate) project_files: &'a [FileId],
     pub(crate) allowed_files: Option<&'a FxHashSet<FileId>>,
@@ -371,6 +397,7 @@ pub(crate) struct IrInstanceResolver<'a> {
     cached_field_index: Option<&'a IrFieldWriteIndex>,
     owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     allow_unanchored_caller_lookup: bool,
+    call_targets_cache: CallTargetsCache<'a>,
     pub(crate) conflict: Option<SummaryConflictError>,
 }
 
@@ -406,8 +433,35 @@ impl<'a> IrInstanceResolver<'a> {
             cached_field_index,
             owned_field_index,
             allow_unanchored_caller_lookup,
+            call_targets_cache: CallTargetsCache::Owned(FxHashMap::default()),
             conflict: None,
         }
+    }
+
+    pub(crate) fn with_call_targets_cache(
+        mut self,
+        cache: &'a mut FxHashMap<SyntaxId, call_resolution::CallTargetsOutcome>,
+    ) -> Self {
+        self.call_targets_cache = CallTargetsCache::Shared(cache);
+        self
+    }
+
+    fn resolve_call_targets_cached(
+        &mut self,
+        call_syntax: SyntaxId,
+    ) -> call_resolution::CallTargetsOutcome {
+        if let Some(cached) = self.call_targets_cache.get(call_syntax) {
+            return cached.clone();
+        }
+        let outcome = resolve_call_targets_with_summaries(
+            call_syntax,
+            self.semantic,
+            self.syntax,
+            self.ir_provider,
+            self.summary_index,
+        );
+        self.call_targets_cache.insert(call_syntax, outcome.clone());
+        outcome
     }
     fn call_graph(&mut self) -> Option<&IrCallGraph> {
         if let Some(g) = self.cached_call_graph {
@@ -2702,13 +2756,7 @@ impl<'a> IrInstanceResolver<'a> {
 
         // 3. Fall back to Ticket 08's `call_resolution` (handles polymorphic overrides, getters,
         //    first-party workspace redirection, `Function.prototype.call/apply`, etc.).
-        let call_targets = resolve_call_targets_with_summaries(
-            call_syntax,
-            self.semantic,
-            self.syntax,
-            self.ir_provider,
-            self.summary_index,
-        );
+        let call_targets = self.resolve_call_targets_cached(call_syntax);
         if let Some(conflict) = call_targets.conflict {
             self.conflict = Some(conflict);
             return TraceResult::default();
@@ -3153,13 +3201,7 @@ impl<'a> IrInstanceResolver<'a> {
             return TraceResult::default();
         }
 
-        let call_targets = resolve_call_targets_with_summaries(
-            new_syntax,
-            self.semantic,
-            self.syntax,
-            self.ir_provider,
-            self.summary_index,
-        );
+        let call_targets = self.resolve_call_targets_cached(new_syntax);
         if let Some(conflict) = call_targets.conflict {
             self.conflict = Some(conflict);
             return TraceResult::default();

@@ -1,4 +1,27 @@
 export {
+  prepareBaselineArtifact,
+  readRepoHeadState,
+  resolveBaselineCacheDir,
+  resolveBaselineRevision,
+  resolvePerfCacheDir,
+  resolveRepoRoot,
+  type BaselineArtifact,
+  type PrepareBaselineArtifactOptions,
+  type RepoHeadState,
+  type ResolvedRevision,
+} from "./baseline.ts";
+export {
+  collectMatchingCorpusFiles,
+  materializeExternalCorpus,
+  resolveCorpusCacheDir,
+  resolveCorpusCheckoutDirName,
+  type CorpusFileMatchRule,
+  type CorpusSourceOrigin,
+  type ExternalCorpusSpec,
+  type MaterializedExternalCorpus,
+  type MaterializeExternalCorpusOptions,
+} from "./corpus.ts";
+export {
   CORE_TSSAE_PACKAGES,
   packWorkspaceArtifacts,
   type PackedArtifact,
@@ -39,14 +62,6 @@ export {
   type HostResolutionAudit,
   type VerifyHostResolutionOptions,
 } from "./verify.ts";
-export {
-  prepareBaselineArtifact,
-  readRepoHeadState,
-  resolveBaselineRevision,
-  resolvePerfCacheDir,
-  resolveRepoRoot,
-  type ResolvedRevision,
-} from "./perf/baseline.ts";
 export { runPerfCli } from "./perf/cli.ts";
 export {
   DEFAULT_SCENARIOS,
@@ -57,7 +72,6 @@ export {
 export {
   CORPUS_PROFILES,
   materializeCorpus,
-  resolveCorpusCacheDir,
   type MaterializeCorpusOptions,
 } from "./perf/corpus.ts";
 export {
@@ -85,7 +99,6 @@ export {
 } from "./perf/stats.ts";
 export type {
   AttributionReport,
-  BaselineArtifact,
   CorpusProfileId,
   CorpusProfileSpec,
   EngineStepAttribution,

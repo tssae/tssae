@@ -511,9 +511,13 @@ async function collectFromProjectContext(
     }
 
     if (fromEntries.length > 0 && toEntries.length > 0) {
-      const endpointLocByHandle = new Map<string, DiagnosticLocation>();
-      for (const entry of [...fromEntries, ...toEntries]) {
-        endpointLocByHandle.set(entry.ref.handleId, entry.location);
+      const fromLocByHandle = new Map<string, DiagnosticLocation>();
+      for (const entry of fromEntries) {
+        fromLocByHandle.set(entry.ref.handleId, entry.location);
+      }
+      const toLocByHandle = new Map<string, DiagnosticLocation>();
+      for (const entry of toEntries) {
+        toLocByHandle.set(entry.ref.handleId, entry.location);
       }
 
       const vpResult = await ctx.valuePropagation({
@@ -525,8 +529,11 @@ async function collectFromProjectContext(
       });
 
       for (const row of vpResult.results) {
-        const fromLoc = endpointLocByHandle.get(row.from.handleId);
-        const toLoc = endpointLocByHandle.get(row.to.handleId);
+        if (row.from.handleId === row.to.handleId) {
+          continue;
+        }
+        const fromLoc = fromLocByHandle.get(row.from.handleId);
+        const toLoc = toLocByHandle.get(row.to.handleId);
         if (fromLoc === undefined || toLoc === undefined) {
           continue;
         }

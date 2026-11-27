@@ -62,7 +62,7 @@ type ControlFlowModule = {
 };
 
 type ValuesAndCallsModule = {
-  runValuesAndCallsScenarios: () => void;
+  runValuesAndCallsScenarios: () => Promise<void> | void;
 };
 
 type EffectsAndCleanupModule = {
@@ -103,16 +103,26 @@ function findCallInside(
   nodes: readonly SyntaxNodeResult[],
   enclosing: DiagnosticLocation,
   prefix: string,
+  kind: SyntaxNodeResult["kind"] = "CallExpression",
+  enclosingExprPrefix?: string,
 ): SyntaxNodeResult {
+  const scopeLoc =
+    enclosingExprPrefix === undefined
+      ? enclosing
+      : (nodes.find(
+          (node) =>
+            insideSpan(node.location, enclosing) &&
+            node.text.startsWith(enclosingExprPrefix),
+        )?.location ?? enclosing);
   const found = nodes.find(
     (node) =>
-      node.kind === "CallExpression" &&
-      insideSpan(node.location, enclosing) &&
+      node.kind === kind &&
+      insideSpan(node.location, scopeLoc) &&
       node.text.startsWith(prefix),
   );
   if (!found) {
     throw new Error(
-      `Missing CallExpression starting with "${prefix}" inside ${formatLocation(enclosing)}.`,
+      `Missing ${kind} starting with "${prefix}" inside ${formatLocation(scopeLoc)}.`,
     );
   }
   return found;
@@ -226,7 +236,7 @@ export async function runSoundnessReconciliationSuite(
       )) as EffectsAndCleanupModule;
 
       cfMod.runControlFlowScenarios();
-      vcMod.runValuesAndCallsScenarios();
+      await vcMod.runValuesAndCallsScenarios();
       ecMod.runEffectsAndCleanupScenarios();
     },
   );
@@ -368,6 +378,8 @@ export async function runSoundnessReconciliationSuite(
       "val-accessor",
       "val-closure-reassign",
       "val-iterator",
+      "val-generator-next-value",
+      "val-async-generator-array-elem",
     ] as const;
 
     const valueEndpoints = valueTags.map((tag) => {
@@ -452,7 +464,20 @@ export async function runSoundnessReconciliationSuite(
       }
     }
 
-    const calleeSiteSpecs = [
+    const calleeSiteSpecs: ReadonlyArray<{
+      readonly siteTag: string;
+      readonly fnName: string;
+      readonly callPrefix: string;
+      readonly kind?: SyntaxNodeResult["kind"];
+      readonly enclosingExprPrefix?: string;
+    }> = [
+      {
+        siteTag: "callee-accessor-get",
+        fnName: "runAccessorValue",
+        callPrefix: "box.current",
+        kind: "PropertyAccessExpression",
+        enclosingExprPrefix: "readBack = box.current",
+      },
       {
         siteTag: "callee-polymorphic",
         fnName: "invokeWorker",
@@ -468,11 +493,17 @@ export async function runSoundnessReconciliationSuite(
         fnName: "invokeOptionalTarget",
         callPrefix: "helper?.ping(",
       },
-    ] as const;
+    ];
 
     const calleeCallNodes = calleeSiteSpecs.map((spec) => {
       const fn = findEnclosingFunction(vcNodes, spec.fnName);
-      return findCallInside(vcNodes, fn.location, spec.callPrefix);
+      return findCallInside(
+        vcNodes,
+        fn.location,
+        spec.callPrefix,
+        spec.kind,
+        spec.enclosingExprPrefix,
+      );
     });
     const calleeCallRefs = await resolveCallHandles(ctx, calleeCallNodes);
     const calleesResults = await ctx.calleesOf(calleeCallRefs);

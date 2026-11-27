@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 import type {
   BranchRef,
+  DiagnosticLocation,
   Gap,
   InstanceRef,
   OpenProjectOptions,
@@ -71,6 +72,13 @@ const MAX_REPRESENTATIVE_CALLS_PER_BATCH = 32;
 const MAX_REPRESENTATIVE_VARS_PER_BATCH = 32;
 const MAX_REPRESENTATIVE_BRANCH_FNS_PER_BATCH = 16;
 const MAX_REPRESENTATIVE_SCOPES_PER_BATCH = 16;
+
+function isInsideSpan(
+  inner: DiagnosticLocation,
+  outer: DiagnosticLocation,
+): boolean {
+  return inner.start >= outer.start && inner.end <= outer.end;
+}
 
 function resolveImportSpecifier(entryPath: string): string {
   if (entryPath === "tssae" || entryPath.startsWith("file://")) {
@@ -153,18 +161,15 @@ async function sweepContext(
     };
 
     const fileTargets: SyntaxRef[] = [];
-    let firstTopLevelCandidate: SyntaxRef | undefined;
+    const enclosingScopeSpans: DiagnosticLocation[] = [];
 
     for (const node of nodes) {
       if (FUNCTION_BODY_KINDS.has(node.kind) && node.body !== undefined) {
         addScope(node.ref, true);
+        enclosingScopeSpans.push(node.location);
       } else if (EXTRA_SCOPE_KINDS.has(node.kind)) {
         addScope(node.ref, false);
-      } else if (
-        firstTopLevelCandidate === undefined &&
-        TOP_LEVEL_STATEMENT_KINDS.has(node.kind)
-      ) {
-        firstTopLevelCandidate = node.ref;
+        enclosingScopeSpans.push(node.location);
       }
 
       if (CALL_NODE_KINDS.has(node.kind) && fileTargets.length < 4) {
@@ -173,7 +178,8 @@ async function sweepContext(
           repCallRefs.push({ ref: node.ref, file: relFile });
         }
       } else if (
-        node.kind === "VariableDeclaration" &&
+        (node.kind === "VariableDeclaration" ||
+          node.kind === "PropertyDeclaration") &&
         node.initializer !== undefined &&
         repVarInits.length < MAX_REPRESENTATIVE_VARS_PER_BATCH
       ) {
@@ -181,8 +187,27 @@ async function sweepContext(
       }
     }
 
-    if (firstTopLevelCandidate !== undefined) {
-      addScope(firstTopLevelCandidate, false);
+    const rootTopLevelSpans: DiagnosticLocation[] = [];
+    for (const node of nodes) {
+      if (!TOP_LEVEL_STATEMENT_KINDS.has(node.kind)) {
+        continue;
+      }
+      if (
+        enclosingScopeSpans.some((scopeSpan) =>
+          isInsideSpan(node.location, scopeSpan),
+        )
+      ) {
+        continue;
+      }
+      if (
+        rootTopLevelSpans.some((stmtSpan) =>
+          isInsideSpan(node.location, stmtSpan),
+        )
+      ) {
+        continue;
+      }
+      rootTopLevelSpans.push(node.location);
+      addScope(node.ref, false);
     }
 
     if (

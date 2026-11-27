@@ -7,10 +7,11 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { describe, it } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import {
   collectQueryDigest,
@@ -543,10 +544,7 @@ void describe("semantic diff runner and CLI on controlled fixtures", () => {
       const fixtureDir = join(tempDir, "fixture");
       createControlledFixtureProject(fixtureDir);
 
-      const tssaeDistEntry = resolve(
-        dirname(fileURLToPath(import.meta.url)),
-        "../../../../packages/tssae/dist/index.js",
-      );
+      const tssaeDistEntry = createRequire(import.meta.url).resolve("tssae");
 
       // Wrapper candidate module that flips branchCoverage primary status to trigger regression
       const regressingEntry = join(tempDir, "regressing-tssae.mjs");
@@ -655,10 +653,7 @@ void describe("semantic diff runner and CLI on controlled fixtures", () => {
         cwd: repoDir,
       });
 
-      const tssaeDistEntry = resolve(
-        dirname(fileURLToPath(import.meta.url)),
-        "../../../../packages/tssae/dist/index.js",
-      );
+      const tssaeDistEntry = createRequire(import.meta.url).resolve("tssae");
 
       const result = await runSemanticDiffGate({
         repoRoot: repoDir,

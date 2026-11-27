@@ -8,7 +8,7 @@
       "target": "valuePropagation@41:10-41:71->21:19-21:75",
       "fromStatus": "disproved",
       "toStatus": "inconclusive",
-      "reason": "Ticket 02 fixed generator IrOp::Yield value-propagation modeling, replacing a false disproved through Iterable.map/concat generators with honest inconclusive.",
+      "reason": "Fixed generator IrOp::Yield value-propagation modeling, replacing a false disproved through Iterable.map/concat generators with honest inconclusive.",
       "regressionTest": "packages/tssae/test/value-propagation-ir.test.ts"
     }
   ]

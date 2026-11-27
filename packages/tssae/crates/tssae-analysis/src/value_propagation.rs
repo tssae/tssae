@@ -2014,6 +2014,37 @@ impl PropagationEngine<'_> {
                             None,
                             item.gap_indices.clone(),
                         );
+                    } else if !item.gap_indices.is_empty()
+                        && prop_name == "value"
+                        && matches!(
+                            item.fields.field_path.last(),
+                            Some(FieldSegment::Element(_))
+                        )
+                    {
+                        // A gap-tainted iterator/generator result (e.g. `gen.next().value`)
+                        // wraps the yielded element inside `{ value, done }`; unwrap the element
+                        // segment and preserve the gap instead of emitting a false `disproved`.
+                        let mut next_fields = item.fields.clone();
+                        next_fields.field_path.pop();
+                        Self::enqueue_transition(
+                            queue,
+                            visited,
+                            untainted_visited,
+                            item,
+                            Arc::clone(ir),
+                            TraceNode::Value(out_val),
+                            v_loc,
+                            next_fields,
+                            item.stack.clone(),
+                            Some((
+                                "propertyRead",
+                                format!("Read property '.{prop_name}'"),
+                                Some(prop_name),
+                                None,
+                            )),
+                            None,
+                            item.gap_indices.clone(),
+                        );
                     }
                 } else if self.include_member_access
                     && !item.fields.omitted_properties.contains(&prop_name)
@@ -2483,12 +2514,23 @@ impl PropagationEngine<'_> {
             }
             UseRole::YieldValue => {
                 let mut next_fields = item.fields.clone();
+                let loc = v_loc.or_else(|| Some(ir.scope_location.clone()));
                 if !push_field_segment(
                     queue,
                     &mut next_fields,
                     FieldSegment::Element(None),
-                    v_loc.or_else(|| Some(ir.scope_location.clone())),
+                    loc.clone(),
                 ) {
+                    return;
+                }
+                if ir.decl_semantics.is_async
+                    && !push_field_segment(
+                        queue,
+                        &mut next_fields,
+                        FieldSegment::Element(None),
+                        loc,
+                    )
+                {
                     return;
                 }
                 let mut yielded_item = item.clone();

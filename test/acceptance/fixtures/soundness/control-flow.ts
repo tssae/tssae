@@ -1,4 +1,4 @@
-// 中文注释与表情 🚀🎉 验证 UTF-8 字节偏移与 UTF-16 码元偏移精确对齐
+// Multi-byte emoji 🚀🎉 verifies exact alignment between UTF-8 byte offsets and UTF-16 code-unit offsets.
 type EmojiMarker = "🚀🎉";
 
 const marker: EmojiMarker = "🚀🎉";

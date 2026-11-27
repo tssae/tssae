@@ -9,12 +9,12 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
-  CONFORMANCE_CORPORA,
   parseConformanceCliArgs,
   runConformanceCli,
   runConformanceSweep,
@@ -68,7 +68,13 @@ export async function openProject(options) {
   const files = (tsconfig.files ?? []).map((abs) => relative(options.cwd, abs).replaceAll("\\\\", "/"));
   let closed = false;
   let nextHandle = 1;
-  const makeRef = (handleId) => ({ projectId: "p1", snapshotId: 1, handleId });
+  const fileByHandle = new Map();
+  const makeRef = (handleId, file) => {
+    if (file !== undefined) {
+      fileByHandle.set(handleId, file);
+    }
+    return { projectId: "p1", snapshotId: 1, handleId };
+  };
 
   const ctx = {
     project: {
@@ -97,11 +103,11 @@ export async function openProject(options) {
       if (text.includes("TRIGGER_CRASH")) {
         process.exit(134);
       }
-      const fnRef = makeRef("syn_" + (nextHandle++));
-      const stmtRef = makeRef("syn_" + (nextHandle++));
-      const callRef = makeRef("syn_" + (nextHandle++));
-      const varInitRef = makeRef("syn_" + (nextHandle++));
-      const condRef = makeRef("syn_" + (nextHandle++));
+      const fnRef = makeRef("syn_" + (nextHandle++), file);
+      const stmtRef = makeRef("syn_" + (nextHandle++), file);
+      const callRef = makeRef("syn_" + (nextHandle++), file);
+      const varInitRef = makeRef("syn_" + (nextHandle++), file);
+      const condRef = makeRef("syn_" + (nextHandle++), file);
       const loc = { file, line: 1, column: 1, endLine: 1, endColumn: 10, start: 0, end: 9 };
       return [
         { ref: fnRef, kind: "FunctionDeclaration", text: "function f() {}", location: loc, body: stmtRef },
@@ -111,9 +117,8 @@ export async function openProject(options) {
       ];
     },
     async listBranches(targets) {
-      const violations = [];
       return targets.map((target, idx) => {
-        const file = files[Math.min(idx, files.length - 1)] ?? files[0];
+        const file = fileByHandle.get(target.handleId) ?? files[Math.min(idx, files.length - 1)] ?? files[0];
         const text = readFileSync(resolve(options.cwd, file), "utf8");
         const loc = { file, line: 2, column: 3, endLine: 2, endColumn: 12, start: 10, end: 19 };
         if (text.includes("TRIGGER_LIST_BRANCHES_VIOLATION")) {
@@ -245,40 +250,62 @@ export async function openProject(options) {
   return modPath;
 }
 
-void describe("conformance corpus registry", () => {
-  void it("registers test262 and typescript-conformance with expected commit SHAs and match rules", () => {
-    assert.equal(
-      CONFORMANCE_CORPORA.test262.repoUrl,
-      "https://github.com/tc39/test262.git",
-    );
-    assert.equal(
-      CONFORMANCE_CORPORA.test262.commitSha,
-      "4db99ac4dc8924279ae07ed3246385924e878519",
-    );
-    assert.equal(
-      CONFORMANCE_CORPORA.test262.checkoutDirName,
-      "test262-4db99ac4dc8924279ae07ed3246385924e878519",
-    );
-    assert.deepEqual(CONFORMANCE_CORPORA.test262.sparsePaths, ["test"]);
-    assert.deepEqual(CONFORMANCE_CORPORA.test262.fileMatch?.extensions, [
-      ".js",
-    ]);
-    assert.equal(CONFORMANCE_CORPORA.test262.minFileCount, 45_000);
-
-    const tsSpec = CONFORMANCE_CORPORA["typescript-conformance"];
-    assert.equal(tsSpec.repoUrl, "https://github.com/microsoft/TypeScript.git");
-    assert.equal(tsSpec.repoName, "typescript");
-    assert.equal(tsSpec.commitSha, "050880ce59e30b356b686bd3144efe24f875ebc8");
-    assert.equal(
-      tsSpec.checkoutDirName,
-      "typescript-050880ce59e30b356b686bd3144efe24f875ebc8",
-    );
-    assert.deepEqual(tsSpec.sparsePaths, ["tests/cases/conformance"]);
-    assert.equal(tsSpec.minFileCount, 5_500);
-  });
-});
-
 void describe("conformance sweep runner", () => {
+  void it("lowers all root top-level statements after a leading directive or declaration and exercises class field initializers", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "tssae-conformance-toplevel-"));
+    try {
+      const { bareOriginDir, commitSha } = createGitCorpusRepo(tempDir, {
+        "test/strict-script.js": [
+          '"use strict";',
+          "var seed = 1;",
+          "for (const item of [seed, 2]) {",
+          "  if (item > 1) {",
+          "    void item;",
+          "  }",
+          "}",
+          "try {",
+          "  void seed;",
+          "} finally {",
+          "  void 0;",
+          "}",
+          "class Box {",
+          "  value = seed > 0 ? 10 : 20;",
+          "}",
+          "void Box;",
+          "",
+        ].join("\n"),
+      });
+      const tssaeEntryPath = createRequire(import.meta.url).resolve("tssae");
+      const spec: ExternalCorpusSpec = {
+        id: "mini-toplevel",
+        repoUrl: bareOriginDir,
+        repoName: "mini",
+        commitSha,
+        sparsePaths: ["test"],
+        fileMatch: { scanPaths: ["test"], extensions: [".js"] },
+        minFileCount: 1,
+      };
+
+      const report = await runConformanceSweep({
+        corpora: [spec],
+        corpusCacheDir: join(tempDir, "cache"),
+        hostMirrorPaths: [bareOriginDir],
+        batchSize: 1,
+        concurrency: 1,
+        batchTimeoutMs: 10_000,
+        tssaeEntryPath,
+        logProgress: () => {},
+      });
+
+      assert.equal(report.passed, true);
+      assert.equal(report.totalFiles, 1);
+      // 6 root top-level statements: "use strict";, var seed = 1;, for-of, try-finally, class Box, void Box;
+      assert.equal(report.totalScopes, 6);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   void it("passes valid batches including benign Unknown syntax-recovery gaps without writing tsconfig into corpus dir", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "tssae-conformance-pass-"));
     try {

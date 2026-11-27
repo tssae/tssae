@@ -9,14 +9,14 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const EXPECTED_HOST_NODE_VERSION = "24.0.0";
+const expectedHostNodeVersion = "24.0.0";
 
 const nodeExecutableName = process.platform === "win32" ? "node.exe" : "node";
-const acceptanceRequire = createRequire(import.meta.url);
+const moduleDir = dirname(fileURLToPath(import.meta.url));
 
 let cachedWorkspaceNode24Executable: string | undefined;
 let cachedSharedOutOfRepoBinDir: string | undefined;
@@ -25,21 +25,27 @@ let cachedSharedOutOfRepoBinDir: string | undefined;
  * Resolves the workspace's Node 24.0.0 executable provisioned via `tssae`'s
  * package-level `devEngines.runtime`, verifying its runtime version once.
  */
-export function resolveWorkspaceNode24Executable(): string {
+function resolveWorkspaceNode24Executable(): string {
   if (cachedWorkspaceNode24Executable !== undefined) {
     return cachedWorkspaceNode24Executable;
   }
 
-  const tssaeManifestPath = acceptanceRequire.resolve("tssae/package.json");
-  const candidateBin = join(
-    dirname(tssaeManifestPath),
-    "node_modules",
-    ".bin",
-    nodeExecutableName,
+  const output = execFileSync(
+    "pnpm",
+    ["--filter", "tssae", "exec", "node", "-p", "process.execPath"],
+    {
+      cwd: moduleDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
   );
-  if (!existsSync(candidateBin)) {
+  const candidateBin = output
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .findLast((line) => line.length > 0);
+  if (candidateBin === undefined || !existsSync(candidateBin)) {
     throw new Error(
-      `Missing Node ${EXPECTED_HOST_NODE_VERSION} runtime binary at ${candidateBin}; run pnpm install in the workspace first.`,
+      `Missing Node ${expectedHostNodeVersion} runtime binary from pnpm --filter tssae exec; run pnpm install in the workspace first.`,
     );
   }
 
@@ -52,9 +58,9 @@ export function resolveWorkspaceNode24Executable(): string {
       stdio: ["ignore", "pipe", "pipe"],
     },
   ).trim();
-  if (actualVersion !== EXPECTED_HOST_NODE_VERSION) {
+  if (actualVersion !== expectedHostNodeVersion) {
     throw new Error(
-      `Expected tssae runtime binary ${resolvedBin} to report Node ${EXPECTED_HOST_NODE_VERSION}, got ${actualVersion}`,
+      `Expected tssae runtime binary ${resolvedBin} to report Node ${expectedHostNodeVersion}, got ${actualVersion}`,
     );
   }
 

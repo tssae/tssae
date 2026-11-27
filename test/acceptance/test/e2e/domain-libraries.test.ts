@@ -664,6 +664,14 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
     );
     assert.ok(tssaeArtifact && zodArtifact && drizzleArtifact);
 
+    assert.deepEqual(zodArtifact.manifest.dependencies, {
+      tssae: "^0.2.0",
+    });
+    assert.deepEqual(drizzleArtifact.manifest.dependencies, {
+      "@tssae/zod": "^0.1.0",
+      tssae: "^0.2.0",
+    });
+
     for (const artifact of [zodArtifact, drizzleArtifact]) {
       assert.equal(artifact.version, "0.1.0");
       assert.equal(artifact.manifest.private, undefined);

@@ -36,7 +36,7 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "dependencies": {
-    "tssae": "workspace:*"
+    "tssae": "workspace:^"
   },
   "devDependencies": {
     "@tssae/test-hosts": "workspace:*",

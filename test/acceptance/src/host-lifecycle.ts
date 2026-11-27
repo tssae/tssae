@@ -87,6 +87,10 @@ export type PreparedAcceptanceHost = {
  * Prepares an isolated out-of-repo acceptance host with packed `tssae`
  * artifacts installed and verified, guaranteeing LIFO resource reclamation on
  * any mid-preparation failure or subsequent `dispose()`.
+ *
+ * Materializes the managed Node `24.0.0` runtime under `runtimeDir/bin`,
+ * defaults `engineStrict` to `true` during artifact installation, and executes
+ * `runNode` and isolated host commands against that Node `24.0.0` binary.
  */
 export async function prepareAcceptanceHost(
   options: PrepareAcceptanceHostOptions = {},

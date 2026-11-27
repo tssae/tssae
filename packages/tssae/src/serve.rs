@@ -8,13 +8,6 @@ use std::{
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tsrs_api::{Session, SessionOptions, session::SnapshotData};
-use tsrs_ast::{Node, Symbol, get_source_file_of_node};
-use tsrs_checker::{Signature, Type};
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
-use tsrs_project::ID as ProjectId;
-use tsrs_vfs::{FS, bundled, osvfs};
 use tssae_analysis::{
     branch_coverage::{
         BranchBypassPath, BranchCoverageOutcome, ImplicitExceptionCoverageOutcome,
@@ -25,21 +18,18 @@ use tssae_analysis::{
 };
 use tssae_common::{BranchId, EvidenceItem, FileId, GapItem, SummaryConfigPayload, UnknownReason};
 use tssae_tsrs_boundary::{
-    FileIdRegistry, FileSyntaxIndex, ResolvedPackageInfo, collect_resolved_packages_for_program,
-    lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
-    resolve_enclosing_function,
+    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundaryProjectFileCatalog, BoundaryProjectId,
+    BoundarySession, BoundarySignature, BoundarySnapshotData, BoundarySymbol, BoundaryType,
+    FileIdRegistry, FileSyntaxIndex, ProgramHierarchyIndex, ProjectSummary, ResolvedPackageInfo,
+    SourceMapCache, SymbolRegistry, UpdateSnapshotInput, lower_scope_to_ir_boundary,
+    normalize_path, open_projects_snapshot, release_compiler_snapshot, update_projects_snapshot,
 };
 
 use crate::comments::{ScannedComment, scan_snapshot_comments};
 use crate::ir_instances::InstanceHandleData;
 use crate::observe::{EngineRpcMetrics, ObserveCollector, ObserveRequestConfig, elapsed_ms};
+pub use crate::projection::SourceLocation;
 use crate::projection::{QueryStep, execute_query_batch};
-pub use crate::projection::{SourceLocation, node_location};
-use crate::projects::{
-    ProjectSummary, UpdateSnapshotInput, normalize_path, open_projects_snapshot, relative_to_cwd,
-    release_tsrs_snapshot, update_projects_snapshot,
-};
-use tssae_tsrs_boundary::SourceMapCache;
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -275,25 +265,25 @@ impl BranchCoverageItem {
 
 #[derive(Clone, Copy)]
 pub struct BranchHandle {
-    pub function_node: P<Node>,
+    pub function_node: BoundaryNode,
     pub edge_index: usize,
 }
 
 #[derive(Clone, Copy)]
 pub enum HandlePayload {
-    Syntax(P<Node>),
+    Syntax(BoundaryNode),
     Declaration {
-        node: P<Node>,
-        symbol: Option<P<Symbol>>,
+        node: BoundaryNode,
+        symbol: Option<BoundarySymbol>,
     },
-    Call(P<Node>),
+    Call(BoundaryNode),
     Signature {
-        sig: P<Signature>,
-        call_node: Option<P<Node>>,
+        sig: BoundarySignature,
+        call_node: Option<BoundaryNode>,
     },
     Type {
-        ty: P<Type>,
-        enclosing: Option<P<Node>>,
+        ty: BoundaryType,
+        enclosing: Option<BoundaryNode>,
     },
     Branch(BranchHandle),
     Instance(usize),
@@ -301,25 +291,25 @@ pub enum HandlePayload {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum HandleInternKey {
-    Syntax(String, P<Node>),
+    Syntax(String, BoundaryNode),
     Declaration {
         project_id: String,
-        node: P<Node>,
+        node: BoundaryNode,
     },
-    Call(String, P<Node>),
+    Call(String, BoundaryNode),
     Signature {
         project_id: String,
-        sig: P<Signature>,
-        call_node: Option<P<Node>>,
+        sig: BoundarySignature,
+        call_node: Option<BoundaryNode>,
     },
     Type {
         project_id: String,
-        ty: P<Type>,
-        enclosing: Option<P<Node>>,
+        ty: BoundaryType,
+        enclosing: Option<BoundaryNode>,
     },
     Branch {
         project_id: String,
-        function_node: P<Node>,
+        function_node: BoundaryNode,
         edge_index: usize,
     },
 }
@@ -331,12 +321,12 @@ pub struct HandleEntry {
 
 pub struct SnapshotState {
     pub snapshot_id: u64,
-    pub tsrs_snapshot_id: u64,
+    pub compiler_snapshot_id: u64,
     pub cwd: String,
     pub entry_specs: Vec<String>,
     pub opened_configs: Vec<String>,
-    pub snapshot_data: Arc<SnapshotData>,
-    pub project_ids: BTreeMap<String, ProjectId>,
+    pub snapshot_data: BoundarySnapshotData,
+    pub project_ids: BTreeMap<String, BoundaryProjectId>,
     pub handles: FxHashMap<String, HandleEntry>,
     pub handle_intern: FxHashMap<HandleInternKey, String>,
     pub instances: Vec<InstanceHandleData>,
@@ -344,7 +334,7 @@ pub struct SnapshotState {
     pub file_ids: Arc<RwLock<FileIdRegistry>>,
     pub ir_cache: SnapshotIrCache,
     pub file_syntax_indices: FxHashMap<FileId, Arc<FileSyntaxIndex>>,
-    pub symbol_registry: tssae_tsrs_boundary::SymbolRegistry,
+    pub symbol_registry: SymbolRegistry,
     pub ir_call_graph_cache: FxHashMap<String, Arc<tssae_analysis::call_resolution::IrCallGraph>>,
     pub ir_call_graph_shards:
         FxHashMap<(String, FileId), Arc<tssae_analysis::call_resolution::IrCallGraph>>,
@@ -352,9 +342,8 @@ pub struct SnapshotState {
         FxHashMap<String, Arc<tssae_analysis::instance_identity::IrFieldWriteIndex>>,
     pub ir_field_write_shards:
         FxHashMap<(String, FileId), Arc<tssae_analysis::instance_identity::IrFieldWriteIndex>>,
-    pub hierarchy_cache: FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
-    pub project_file_catalog_cache:
-        FxHashMap<String, Arc<crate::ir_calls::SnapshotProjectFileCatalog>>,
+    pub hierarchy_cache: FxHashMap<String, Arc<ProgramHierarchyIndex>>,
+    pub project_file_catalog_cache: FxHashMap<String, Arc<BoundaryProjectFileCatalog>>,
     pub sourcemap_cache: SourceMapCache,
     pub resolved_package_versions: FxHashMap<String, Option<String>>,
     pub summary_config: SummaryConfigPayload,
@@ -364,14 +353,8 @@ pub struct SnapshotState {
 
 impl SnapshotState {
     #[must_use]
-    pub fn workspace_programs(&self) -> Vec<&'static tsrs_compiler::Program> {
-        self.snapshot_data
-            .snapshot
-            .project_collection
-            .projects()
-            .iter()
-            .filter_map(|proj| proj.get_program())
-            .collect()
+    pub fn workspace_programs(&self) -> Vec<BoundaryProgram> {
+        self.snapshot_data.workspace_programs()
     }
 
     fn alloc_handle(&mut self, prefix: &str, project_id: &str, payload: HandlePayload) -> String {
@@ -402,7 +385,7 @@ impl SnapshotState {
         id
     }
 
-    pub fn alloc_syntax(&mut self, project_id: &str, node: P<Node>) -> String {
+    pub fn alloc_syntax(&mut self, project_id: &str, node: BoundaryNode) -> String {
         self.alloc_interned_handle(
             "syn",
             project_id,
@@ -414,8 +397,8 @@ impl SnapshotState {
     pub fn alloc_declaration(
         &mut self,
         project_id: &str,
-        node: P<Node>,
-        symbol: Option<P<Symbol>>,
+        node: BoundaryNode,
+        symbol: Option<BoundarySymbol>,
     ) -> String {
         let key = HandleInternKey::Declaration {
             project_id: project_id.to_string(),
@@ -445,7 +428,7 @@ impl SnapshotState {
         id
     }
 
-    pub fn alloc_call(&mut self, project_id: &str, node: P<Node>) -> String {
+    pub fn alloc_call(&mut self, project_id: &str, node: BoundaryNode) -> String {
         self.alloc_interned_handle(
             "cal",
             project_id,
@@ -457,8 +440,8 @@ impl SnapshotState {
     pub fn alloc_signature(
         &mut self,
         project_id: &str,
-        sig: P<Signature>,
-        call_node: Option<P<Node>>,
+        sig: BoundarySignature,
+        call_node: Option<BoundaryNode>,
     ) -> String {
         self.alloc_interned_handle(
             "sig",
@@ -475,8 +458,8 @@ impl SnapshotState {
     pub fn alloc_type(
         &mut self,
         project_id: &str,
-        ty: P<Type>,
-        enclosing: Option<P<Node>>,
+        ty: BoundaryType,
+        enclosing: Option<BoundaryNode>,
     ) -> String {
         self.alloc_interned_handle(
             "typ",
@@ -554,7 +537,11 @@ impl SnapshotState {
         Ok(entry)
     }
 
-    pub fn get_syntax_node(&self, project_id: &str, handle_id: &str) -> Result<P<Node>, RpcErr> {
+    pub fn get_syntax_node(
+        &self,
+        project_id: &str,
+        handle_id: &str,
+    ) -> Result<BoundaryNode, RpcErr> {
         let entry = self.get_entry(project_id, handle_id)?;
         let HandlePayload::Syntax(node) = entry.payload else {
             return Err(RpcErr::new(
@@ -565,7 +552,7 @@ impl SnapshotState {
         Ok(node)
     }
 
-    pub fn get_call_node(&self, project_id: &str, handle_id: &str) -> Result<P<Node>, RpcErr> {
+    pub fn get_call_node(&self, project_id: &str, handle_id: &str) -> Result<BoundaryNode, RpcErr> {
         let entry = self.get_entry(project_id, handle_id)?;
         let HandlePayload::Call(node) = entry.payload else {
             return Err(RpcErr::new(
@@ -580,7 +567,7 @@ impl SnapshotState {
         &self,
         project_id: &str,
         handle_id: &str,
-    ) -> Result<(P<Signature>, Option<P<Node>>), RpcErr> {
+    ) -> Result<(BoundarySignature, Option<BoundaryNode>), RpcErr> {
         let entry = self.get_entry(project_id, handle_id)?;
         let HandlePayload::Signature { sig, call_node } = entry.payload else {
             return Err(RpcErr::new(
@@ -595,7 +582,7 @@ impl SnapshotState {
         &self,
         project_id: &str,
         handle_id: &str,
-    ) -> Result<(P<Type>, Option<P<Node>>), RpcErr> {
+    ) -> Result<(BoundaryType, Option<BoundaryNode>), RpcErr> {
         let entry = self.get_entry(project_id, handle_id)?;
         let HandlePayload::Type { ty, enclosing } = entry.payload else {
             return Err(RpcErr::new(
@@ -619,34 +606,34 @@ impl SnapshotState {
 
     pub fn get_or_build_ir(
         &mut self,
-        program: &'static Program,
-        checker: &mut CheckerHandle,
-        scope_node: P<Node>,
+        program: BoundaryProgram,
+        checker: &mut BoundaryChecker<'_>,
+        scope_node: BoundaryNode,
         observer: &mut ObserveCollector,
     ) -> Result<(Arc<FunctionIr>, Arc<FileSyntaxIndex>), GapItem> {
-        let Some(sf) = get_source_file_of_node(scope_node) else {
+        let Some(sf) = scope_node.source_file() else {
             return Err(GapItem::from_reason(
                 UnknownReason::MissingSourceFile,
                 "Function node has no associated source file.".to_string(),
                 None,
             ));
         };
-        let rel_file = relative_to_cwd(&self.cwd, sf.file_name());
+        let rel_file = sf.rel_path(&self.cwd);
         let file_id = self
             .file_ids
             .write()
             .map_or(FileId(0), |mut reg| reg.intern(&rel_file));
-        let source_file_addr = std::ptr::from_ref(&*sf) as usize;
+        let source_file_addr = sf.addr();
         let file_index = self
             .file_syntax_indices
             .entry(file_id)
-            .or_insert_with(|| Arc::new(FileSyntaxIndex::build(file_id, rel_file.clone(), sf)))
+            .or_insert_with(|| Arc::new(sf.build_syntax_index(file_id, rel_file.clone())))
             .clone();
-        let Some(local_syntax) = file_index.local_id_for_node(scope_node) else {
+        let Some(local_syntax) = file_index.boundary_local_id_for_node(scope_node) else {
             return Err(GapItem::from_reason(
                 UnknownReason::InvalidCfgScope,
                 "Scope node was not indexed in its source file.".to_string(),
-                Some(node_location(sf, &rel_file, scope_node)),
+                Some(scope_node.location(sf, &rel_file)),
             ));
         };
 
@@ -663,15 +650,14 @@ impl SnapshotState {
         let cwd = &self.cwd;
         let (result, is_hit) = file_entry.get_or_init_scope(local_syntax, |local_scope| {
             let started = Instant::now();
-            let lowered = lower_scope_to_ir_with_index(
+            let lowered = lower_scope_to_ir_boundary(
                 cwd,
                 program,
                 checker,
                 scope_node,
                 local_scope,
                 Some(&file_index),
-            )
-            .map(|ls| ls.ir);
+            );
             lowering_duration_ms = elapsed_ms(started);
             lowered
         });
@@ -688,7 +674,7 @@ impl SnapshotState {
 }
 
 struct EngineServer {
-    session: Option<(String, Arc<Session>)>,
+    session: Option<(String, BoundarySession)>,
     snapshots: BTreeMap<u64, SnapshotState>,
     file_ids: Arc<RwLock<FileIdRegistry>>,
     next_snapshot_id: u64,
@@ -704,25 +690,19 @@ impl EngineServer {
         }
     }
 
-    fn ensure_session(&mut self, cwd: &str) -> Arc<Session> {
+    fn ensure_session(&mut self, cwd: &str) -> BoundarySession {
         if let Some((existing_cwd, existing_session)) = &self.session
             && existing_cwd == cwd
         {
-            return Arc::clone(existing_session);
+            return existing_session.clone();
         }
         if let Some((_, old_session)) = self.session.take() {
             self.snapshots.clear();
             old_session.close();
         }
         self.file_ids = Arc::new(RwLock::new(FileIdRegistry::new()));
-        let fs: Arc<dyn FS> = Arc::new(bundled::wrap_fs(osvfs::fs()));
-        let session = Session::new(SessionOptions::new(
-            cwd.to_string(),
-            bundled::default_lib_path(),
-            fs,
-            false,
-        ));
-        self.session = Some((cwd.to_string(), Arc::clone(&session)));
+        let session = BoundarySession::new(cwd);
+        self.session = Some((cwd.to_string(), session.clone()));
         session
     }
 
@@ -828,7 +808,7 @@ impl EngineServer {
         let opened = open_projects_snapshot(&session, &cwd, &params.entries)
             .map_err(|err| RpcErr::new(err.code, err.message))?;
         let (resolved_packages, resolved_package_versions) =
-            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data, &opened.summaries);
+            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data);
         let summary_config = SummaryConfigPayload::default();
         let summary_index = Arc::new(BehaviorSummaryIndex::from_config(
             &summary_config,
@@ -841,7 +821,7 @@ impl EngineServer {
             snapshot_id,
             SnapshotState {
                 snapshot_id,
-                tsrs_snapshot_id: opened.tsrs_snapshot_id,
+                compiler_snapshot_id: opened.compiler_snapshot_id,
                 cwd,
                 entry_specs: opened.entry_specs,
                 opened_configs: opened.opened_configs,
@@ -854,7 +834,7 @@ impl EngineServer {
                 file_ids: Arc::clone(&self.file_ids),
                 ir_cache: SnapshotIrCache::new(),
                 file_syntax_indices: FxHashMap::default(),
-                symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
+                symbol_registry: SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
                 ir_call_graph_shards: FxHashMap::default(),
                 ir_field_write_cache: FxHashMap::default(),
@@ -913,7 +893,7 @@ impl EngineServer {
         params: &SnapshotUpdateParams,
         observer: &mut ObserveCollector,
     ) -> Result<SnapshotUpdateResult, RpcErr> {
-        let Some(session) = self.session.as_ref().map(|(_, s)| Arc::clone(s)) else {
+        let Some(session) = self.session.as_ref().map(|(_, s)| s.clone()) else {
             return Err(RpcErr::new(
                 "STALE_SNAPSHOT",
                 "Analysis session is not initialized.".to_string(),
@@ -922,7 +902,7 @@ impl EngineServer {
 
         let (
             cwd,
-            old_tsrs_snapshot_id,
+            old_compiler_snapshot_id,
             old_entry_specs,
             old_opened_configs,
             old_snapshot_data,
@@ -937,10 +917,10 @@ impl EngineServer {
             };
             (
                 old_state.cwd.clone(),
-                old_state.tsrs_snapshot_id,
+                old_state.compiler_snapshot_id,
                 old_state.entry_specs.clone(),
                 old_state.opened_configs.clone(),
-                Arc::clone(&old_state.snapshot_data),
+                old_state.snapshot_data.clone(),
                 old_state.project_ids.clone(),
                 old_state.summary_config.clone(),
             )
@@ -950,7 +930,7 @@ impl EngineServer {
             &session,
             &UpdateSnapshotInput {
                 cwd: &cwd,
-                old_tsrs_snapshot_id,
+                old_compiler_snapshot_id,
                 old_entry_specs: &old_entry_specs,
                 old_opened_configs: &old_opened_configs,
                 old_snapshot_data: &old_snapshot_data,
@@ -965,7 +945,7 @@ impl EngineServer {
 
         drop(old_snapshot_data);
         let old_state = self.snapshots.remove(&params.snapshot_id);
-        release_tsrs_snapshot(&session, old_tsrs_snapshot_id);
+        release_compiler_snapshot(&session, old_compiler_snapshot_id);
 
         self.next_snapshot_id += 1;
         let snapshot_id = self.next_snapshot_id;
@@ -983,7 +963,7 @@ impl EngineServer {
         drop(old_state);
 
         let (resolved_packages, resolved_package_versions) =
-            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data, &opened.summaries);
+            collect_snapshot_resolved_packages(&cwd, &opened.snapshot_data);
         let summary_index = Arc::new(BehaviorSummaryIndex::from_config(
             &old_summary_config,
             &resolved_package_versions,
@@ -993,7 +973,7 @@ impl EngineServer {
             snapshot_id,
             SnapshotState {
                 snapshot_id,
-                tsrs_snapshot_id: opened.tsrs_snapshot_id,
+                compiler_snapshot_id: opened.compiler_snapshot_id,
                 cwd,
                 entry_specs: opened.entry_specs,
                 opened_configs: opened.opened_configs,
@@ -1006,7 +986,7 @@ impl EngineServer {
                 file_ids: Arc::clone(&self.file_ids),
                 ir_cache,
                 file_syntax_indices,
-                symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
+                symbol_registry: SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
                 ir_call_graph_shards: FxHashMap::default(),
                 ir_field_write_cache: FxHashMap::default(),
@@ -1043,10 +1023,10 @@ impl EngineServer {
                 format!("Snapshot {snapshot_id} is not active."),
             ));
         };
-        let tsrs_snapshot_id = state.tsrs_snapshot_id;
+        let compiler_snapshot_id = state.compiler_snapshot_id;
         drop(state);
         if let Some((_, session)) = &self.session {
-            release_tsrs_snapshot(session, tsrs_snapshot_id);
+            release_compiler_snapshot(session, compiler_snapshot_id);
         }
         Ok(SnapshotReleaseResult { released: true })
     }
@@ -1076,7 +1056,7 @@ impl EngineServer {
         let program = snapshot
             .snapshot_data
             .get_program(&pid)
-            .map_err(|err| RpcErr::new("ENGINE_ERROR", err.to_string()))?;
+            .map_err(|err| RpcErr::new("ENGINE_ERROR", err))?;
 
         let result = execute_query_batch(
             snapshot,
@@ -1105,9 +1085,9 @@ impl EngineServer {
         let snapshots = std::mem::take(&mut self.snapshots);
         if let Some((_, session)) = self.session.take() {
             for state in snapshots.into_values() {
-                let id = state.tsrs_snapshot_id;
+                let id = state.compiler_snapshot_id;
                 drop(state);
-                release_tsrs_snapshot(&session, id);
+                release_compiler_snapshot(&session, id);
             }
             session.close();
         }
@@ -1117,15 +1097,15 @@ impl EngineServer {
 pub fn run_list_branches(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     observer: &mut ObserveCollector,
 ) -> Result<Vec<FunctionBranchesItem>, RpcErr> {
     let mut fn_nodes = Vec::with_capacity(targets.len());
     for handle_id in targets {
         let node = snapshot.get_syntax_node(project_id, handle_id)?;
-        let Some(scope_node) = normalize_cfg_scope_node(node) else {
+        let Some(scope_node) = node.normalize_cfg_scope() else {
             return Err(RpcErr::new(
                 "INVALID_REFERENCE_KIND",
                 format!(
@@ -1150,7 +1130,7 @@ pub fn run_list_branches(
                         },
                     );
                     let cond_node = file_index
-                        .node_for_syntax_id(branch.condition_syntax)
+                        .boundary_node_for_syntax_id(branch.condition_syntax)
                         .unwrap_or(scope_node);
                     let condition = snapshot.alloc_syntax(project_id, cond_node);
                     branch_items.push(BranchEdgeItem {
@@ -1184,7 +1164,7 @@ pub fn run_list_branches(
 
 pub struct BranchCoverageRequest<'a> {
     pub project_id: &'a str,
-    pub program: &'static Program,
+    pub program: BoundaryProgram,
     pub function_handle: Option<&'a str>,
     pub scope_handle: Option<&'a str>,
     pub branch_handles: &'a [String],
@@ -1196,7 +1176,7 @@ fn resolve_explicit_scope(
     project_id: &str,
     function_handle: Option<&str>,
     scope_handle: Option<&str>,
-) -> Result<Option<P<Node>>, RpcErr> {
+) -> Result<Option<BoundaryNode>, RpcErr> {
     if function_handle.is_some() && scope_handle.is_some() {
         return Err(RpcErr::new(
             "INVALID_CONFIG",
@@ -1205,7 +1185,7 @@ fn resolve_explicit_scope(
     }
     if let Some(fn_id) = function_handle {
         let node = snapshot.get_syntax_node(project_id, fn_id)?;
-        let Some(fn_node) = normalize_function_node(node) else {
+        let Some(fn_node) = node.normalize_function() else {
             return Err(RpcErr::new(
                 "INVALID_REFERENCE_KIND",
                 format!("Program reference {fn_id} is not a function-like syntax node."),
@@ -1215,7 +1195,7 @@ fn resolve_explicit_scope(
     }
     if let Some(scope_id) = scope_handle {
         let node = snapshot.get_syntax_node(project_id, scope_id)?;
-        let Some(scope_node) = normalize_cfg_scope_node(node) else {
+        let Some(scope_node) = node.normalize_cfg_scope() else {
             return Err(RpcErr::new(
                 "INVALID_REFERENCE_KIND",
                 format!(
@@ -1272,7 +1252,7 @@ fn outcome_to_branch_coverage_item(
 
 pub fn run_branch_coverage(
     snapshot: &mut SnapshotState,
-    checker: &mut CheckerHandle,
+    checker: &mut BoundaryChecker<'_>,
     req: &BranchCoverageRequest<'_>,
     observer: &mut ObserveCollector,
 ) -> Result<Vec<BranchCoverageItem>, RpcErr> {
@@ -1291,20 +1271,20 @@ pub fn run_branch_coverage(
     let mut resolved_targets = Vec::with_capacity(req.target_handles.len());
     for target_id in req.target_handles {
         let node = snapshot.get_syntax_node(req.project_id, target_id)?;
-        let Some(sf) = get_source_file_of_node(node) else {
+        let Some(sf) = node.source_file() else {
             return Err(RpcErr::new(
                 "ENGINE_ERROR",
                 format!("Target syntax node {target_id} has no source file."),
             ));
         };
-        let rel_file = relative_to_cwd(&snapshot.cwd, sf.file_name());
-        let loc = node_location(sf, &rel_file, node);
+        let rel_file = sf.rel_path(&snapshot.cwd);
+        let loc = node.location(sf, &rel_file);
         resolved_targets.push((target_id.clone(), node, loc));
     }
 
     let mut items = Vec::with_capacity(resolved_targets.len());
     for (target_id, target_node, target_loc) in resolved_targets {
-        let scope_fn = explicit_scope.or_else(|| resolve_enclosing_function(target_node));
+        let scope_fn = explicit_scope.or_else(|| target_node.resolve_enclosing_function());
         let Some(scope_node) = scope_fn else {
             let gap = GapItem::from_reason(
                 UnknownReason::NoEnclosingFunction,
@@ -1370,7 +1350,7 @@ pub fn run_branch_coverage(
             }
         }
 
-        let target_syntax = file_index.syntax_id_for_node(target_node);
+        let target_syntax = file_index.boundary_syntax_id_for_node(target_node);
         let outcome = evaluate_branch_coverage(
             &ir,
             target_syntax,
@@ -1389,7 +1369,7 @@ fn inherit_snapshot_caches(
     old_state: Option<&SnapshotState>,
     recomputed_files: &[String],
     removed_files: &[String],
-    new_snapshot_data: &SnapshotData,
+    new_snapshot_data: &BoundarySnapshotData,
 ) -> (
     SnapshotIrCache,
     FxHashMap<FileId, Arc<FileSyntaxIndex>>,
@@ -1401,16 +1381,7 @@ fn inherit_snapshot_caches(
     };
     let recomputed_set: BTreeSet<&str> = recomputed_files.iter().map(String::as_str).collect();
     let removed_set: BTreeSet<&str> = removed_files.iter().map(String::as_str).collect();
-    let mut new_source_file_addrs = FxHashMap::default();
-    for proj in new_snapshot_data.snapshot.project_collection.projects() {
-        if let Some(prog) = proj.get_program() {
-            for &sf in prog.get_source_files() {
-                let rel = relative_to_cwd(cwd, sf.file_name());
-                let addr = std::ptr::from_ref(&*sf) as usize;
-                new_source_file_addrs.insert(rel, addr);
-            }
-        }
-    }
+    let new_source_file_addrs = new_snapshot_data.source_file_addrs(cwd);
     let (ir_cache, files_reused, files_invalidated) =
         SnapshotIrCache::inherit_from(&prev.ir_cache, |entry| {
             !recomputed_set.contains(entry.rel_file.as_str())
@@ -1435,63 +1406,73 @@ fn inherit_snapshot_caches(
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SeenPackageVersion {
+    NoneYet,
+    Unique(String),
+    Multiple,
+}
+
+fn record_package_version(
+    seen: &mut FxHashMap<String, SeenPackageVersion>,
+    name: &str,
+    version: Option<&str>,
+) {
+    match version {
+        Some(ver) => match seen.get_mut(name) {
+            None => {
+                seen.insert(
+                    name.to_string(),
+                    SeenPackageVersion::Unique(ver.to_string()),
+                );
+            }
+            Some(entry @ SeenPackageVersion::NoneYet) => {
+                *entry = SeenPackageVersion::Unique(ver.to_string());
+            }
+            Some(entry @ SeenPackageVersion::Unique(_)) => {
+                if let SeenPackageVersion::Unique(existing) = entry
+                    && existing.as_str() != ver
+                {
+                    *entry = SeenPackageVersion::Multiple;
+                }
+            }
+            Some(SeenPackageVersion::Multiple) => {}
+        },
+        None => {
+            seen.entry(name.to_string())
+                .or_insert(SeenPackageVersion::NoneYet);
+        }
+    }
+}
+
+fn finalize_package_versions(
+    seen: FxHashMap<String, SeenPackageVersion>,
+) -> FxHashMap<String, Option<String>> {
+    seen.into_iter()
+        .map(|(name, state)| {
+            let ver = match state {
+                SeenPackageVersion::Unique(v) => Some(v),
+                SeenPackageVersion::NoneYet | SeenPackageVersion::Multiple => None,
+            };
+            (name, ver)
+        })
+        .collect()
+}
+
 fn collect_snapshot_resolved_packages(
     cwd: &str,
-    snapshot_data: &SnapshotData,
-    projects: &[ProjectSummary],
+    snapshot_data: &BoundarySnapshotData,
 ) -> (
     Vec<ResolvedPackagePayload>,
     FxHashMap<String, Option<String>>,
 ) {
-    let mut project_dirs_by_program_addr: FxHashMap<usize, String> = FxHashMap::default();
-    let config_by_id: FxHashMap<&str, &str> = projects
-        .iter()
-        .map(|p| (p.project_id.as_str(), p.config_file.as_str()))
-        .collect();
-    for proj in snapshot_data.snapshot.project_collection.projects() {
-        let Some(prog) = proj.get_program() else {
-            continue;
-        };
-        let cfg_rel = relative_to_cwd(cwd, proj.config_file_name());
-        let dir = std::path::Path::new(&cfg_rel)
-            .parent()
-            .and_then(|p| p.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(".")
-            .to_string();
-        project_dirs_by_program_addr.insert(std::ptr::from_ref(prog) as usize, dir);
-    }
-
     let mut merged: BTreeMap<(String, String), (ResolvedPackageInfo, BTreeSet<String>)> =
         BTreeMap::new();
-    let mut versions: FxHashMap<String, Option<String>> = FxHashMap::default();
+    let mut seen_versions: FxHashMap<String, SeenPackageVersion> = FxHashMap::default();
 
-    for proj in snapshot_data.snapshot.project_collection.projects() {
-        let Some(prog) = proj.get_program() else {
-            continue;
-        };
-        let proj_dir = project_dirs_by_program_addr
-            .get(&(std::ptr::from_ref(prog) as usize))
-            .cloned()
-            .unwrap_or_else(|| {
-                let cfg_rel = relative_to_cwd(cwd, proj.config_file_name());
-                let _ = config_by_id;
-                std::path::Path::new(&cfg_rel)
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(".")
-                    .to_string()
-            });
-
-        for pkg in collect_resolved_packages_for_program(cwd, prog) {
-            if let Some(ver) = &pkg.version {
-                versions
-                    .entry(pkg.name.clone())
-                    .or_insert_with(|| Some(ver.clone()));
-            } else {
-                versions.entry(pkg.name.clone()).or_insert(None);
-            }
+    for (prog, proj_dir) in snapshot_data.project_program_dirs(cwd) {
+        for pkg in prog.collect_resolved_packages(cwd) {
+            record_package_version(&mut seen_versions, &pkg.name, pkg.version.as_deref());
             let key = (
                 pkg.name.clone(),
                 pkg.package_root.clone().unwrap_or_default(),
@@ -1515,7 +1496,7 @@ fn collect_snapshot_resolved_packages(
             project_dirs: dirs.into_iter().collect(),
         })
         .collect();
-    (payloads, versions)
+    (payloads, finalize_package_versions(seen_versions))
 }
 
 fn read_process_rss_bytes() -> Option<u64> {
@@ -1569,4 +1550,37 @@ pub fn run_stdio() -> io::Result<()> {
 
     server.shutdown();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_package_version_map_clears_ambiguous_multi_version_fallback() {
+        let mut seen = FxHashMap::default();
+        record_package_version(&mut seen, "single-pkg", Some("1.2.0"));
+        record_package_version(&mut seen, "single-pkg", Some("1.2.0"));
+        record_package_version(&mut seen, "single-pkg", None);
+
+        record_package_version(&mut seen, "multi-pkg", Some("1.2.0"));
+        record_package_version(&mut seen, "multi-pkg", Some("2.1.0"));
+
+        record_package_version(&mut seen, "none-then-some", None);
+        record_package_version(&mut seen, "none-then-some", Some("3.0.0"));
+
+        record_package_version(&mut seen, "none-only", None);
+
+        let finalized = finalize_package_versions(seen);
+        assert_eq!(
+            finalized.get("single-pkg"),
+            Some(&Some("1.2.0".to_string()))
+        );
+        assert_eq!(finalized.get("multi-pkg"), Some(&None));
+        assert_eq!(
+            finalized.get("none-then-some"),
+            Some(&Some("3.0.0".to_string()))
+        );
+        assert_eq!(finalized.get("none-only"), Some(&None));
+    }
 }

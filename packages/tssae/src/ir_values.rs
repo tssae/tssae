@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 use serde::Serialize;
-use tsrs_ast::Node;
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
 use tssae_analysis::{
     call_resolution::IrCallGraph,
     value_propagation::{
@@ -13,7 +10,9 @@ use tssae_analysis::{
     },
 };
 use tssae_common::{EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SyntaxId};
-use tssae_tsrs_boundary::normalize_path;
+use tssae_tsrs_boundary::{
+    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundarySymbol, normalize_path,
+};
 
 use crate::ir_calls::SnapshotIrEnv;
 use crate::observe::ObserveCollector;
@@ -79,8 +78,8 @@ pub struct ValuePropagationResultPayload {
 
 struct EndpointHandleInput {
     handle_id: String,
-    node: P<Node>,
-    symbol: Option<P<tsrs_ast::Symbol>>,
+    node: BoundaryNode,
+    symbol: Option<BoundarySymbol>,
 }
 
 fn collect_endpoint_inputs(
@@ -219,8 +218,8 @@ fn conflict_rpc_err(conflict: &tssae_common::SummaryConflictError) -> RpcErr {
 pub fn run_value_propagation(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     propagation: Option<&str>,
     include_member_access: bool,
     from_handles: &[String],

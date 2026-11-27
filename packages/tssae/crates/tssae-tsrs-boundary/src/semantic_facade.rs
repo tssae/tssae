@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::{OnceCell, RefCell},
     sync::{Arc, RwLock},
 };
@@ -898,7 +899,7 @@ impl SymbolRegistry {
 pub struct SemanticModelBridge<'a> {
     cwd: &'a str,
     program: &'static Program,
-    workspace_programs: &'a [&'static Program],
+    workspace_programs: Cow<'a, [&'static Program]>,
     checker: RefCell<&'a mut CheckerHandle>,
     syntax: RefCell<SyntaxCatalogBridge>,
     file_index: Option<(&'a FileSyntaxIndex, FileId)>,
@@ -923,7 +924,7 @@ impl<'a> SemanticModelBridge<'a> {
         Self {
             cwd,
             program,
-            workspace_programs: &[],
+            workspace_programs: Cow::Borrowed(&[]),
             checker: RefCell::new(checker),
             syntax: RefCell::new(SyntaxCatalogBridge::new(cwd)),
             file_index: None,
@@ -964,6 +965,33 @@ impl<'a> SemanticModelBridge<'a> {
         cwd: &'a str,
         program: &'static Program,
         workspace_programs: &'a [&'static Program],
+        checker: &'a mut CheckerHandle,
+        file_ids: Arc<RwLock<FileIdRegistry>>,
+        file_indices: &'a mut FxHashMap<FileId, Arc<FileSyntaxIndex>>,
+        shared_symbols: &'a mut SymbolRegistry,
+        sourcemap_cache: &'a SourceMapCache,
+    ) -> Self {
+        Self::with_snapshot_store_cow(
+            cwd,
+            program,
+            Cow::Borrowed(workspace_programs),
+            checker,
+            file_ids,
+            file_indices,
+            shared_symbols,
+            sourcemap_cache,
+        )
+    }
+
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Wires snapshot multi-file syntax indices, symbol registry, source-map cache, and workspace programs."
+    )]
+    pub(crate) fn with_snapshot_store_cow(
+        cwd: &'a str,
+        program: &'static Program,
+        workspace_programs: Cow<'a, [&'static Program]>,
         checker: &'a mut CheckerHandle,
         file_ids: Arc<RwLock<FileIdRegistry>>,
         file_indices: &'a mut FxHashMap<FileId, Arc<FileSyntaxIndex>>,
@@ -1161,7 +1189,7 @@ impl<'a> SemanticModelBridge<'a> {
                 Arc::new(ProgramHierarchyIndex::build(
                     self.cwd,
                     self.program,
-                    self.workspace_programs,
+                    &self.workspace_programs,
                     &mut checker,
                 ))
             })
@@ -1875,7 +1903,7 @@ impl SemanticModel for SemanticModelBridge<'_> {
         let outcome = {
             let mut checker = self.checker.borrow_mut();
             let mut facade = SemanticFacade::new(self.cwd, self.program, &mut checker);
-            facade.resolve_implementation(input, self.workspace_programs, sm_cache)
+            facade.resolve_implementation(input, &self.workspace_programs, sm_cache)
         };
 
         let fact = self.convert_facade_impl_outcome(outcome);

@@ -6,7 +6,6 @@ mod ir_instances;
 mod ir_values;
 mod observe;
 mod projection;
-mod projects;
 mod serve;
 
 use std::{env, ffi::OsString, process::ExitCode, thread};

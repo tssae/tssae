@@ -1,8 +1,9 @@
 use serde::Serialize;
 use tssae_common::{EvidenceItem, GapItem};
 use tssae_tsrs_boundary::{
-    FacadeImplementationInput, FacadeImplementationOutcome, FacadeImplementationTarget,
-    FirstPartyResolutionSource, SemanticFacade,
+    BoundaryChecker, BoundaryImplementationInput, BoundaryImplementationOutcome,
+    BoundaryImplementationTarget, BoundaryProgram, BoundarySemanticFacade,
+    FirstPartyResolutionSource,
 };
 
 use crate::serve::{HandlePayload, RpcErr, SnapshotState, SourceLocation};
@@ -47,7 +48,7 @@ pub enum ImplementationResolutionRow {
 pub fn to_resolved_impl_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    target: FacadeImplementationTarget,
+    target: BoundaryImplementationTarget,
 ) -> ResolvedImplTargetPayload {
     let declaration = snapshot.alloc_declaration(
         project_id,
@@ -68,8 +69,8 @@ pub fn to_resolved_impl_payload(
 pub fn run_resolve_implementations(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static tsrs_compiler::Program,
-    checker: &mut tsrs_compiler::CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
 ) -> Result<Vec<ImplementationResolutionRow>, RpcErr> {
     let mut inputs = Vec::with_capacity(targets.len());
@@ -77,10 +78,10 @@ pub fn run_resolve_implementations(
         let entry = snapshot.get_entry(project_id, handle_id)?;
         let input = match entry.payload {
             HandlePayload::Call(node) | HandlePayload::Syntax(node) => {
-                FacadeImplementationInput::Node(node)
+                BoundaryImplementationInput::Node(node)
             }
             HandlePayload::Declaration { node, symbol } => {
-                FacadeImplementationInput::Declaration(node, symbol)
+                BoundaryImplementationInput::Declaration(node, symbol)
             }
             _ => {
                 return Err(RpcErr::new(
@@ -100,7 +101,7 @@ pub fn run_resolve_implementations(
 
     let mut outcomes = Vec::with_capacity(inputs.len());
     for (target_id, input) in inputs {
-        let outcome = SemanticFacade::new(&cwd, program, checker).resolve_implementation(
+        let outcome = BoundarySemanticFacade::new(&cwd, program, checker).resolve_implementation(
             input,
             &workspace_programs,
             &sourcemap_cache,
@@ -111,7 +112,7 @@ pub fn run_resolve_implementations(
     let mut rows = Vec::with_capacity(outcomes.len());
     for (target_id, outcome) in outcomes {
         let row = match outcome {
-            FacadeImplementationOutcome::Resolved(impl_target) => {
+            BoundaryImplementationOutcome::Resolved(impl_target) => {
                 let mut evidence = Vec::new();
                 if let Some(ref decl_file) = impl_target.declaration_file {
                     evidence.push(EvidenceItem::simple(
@@ -136,7 +137,7 @@ pub fn run_resolve_implementations(
                     evidence,
                 }
             }
-            FacadeImplementationOutcome::External {
+            BoundaryImplementationOutcome::External {
                 package_name,
                 declaration_file,
                 evidence,
@@ -146,7 +147,7 @@ pub fn run_resolve_implementations(
                 declaration_file,
                 evidence,
             },
-            FacadeImplementationOutcome::Inconclusive {
+            BoundaryImplementationOutcome::Inconclusive {
                 declaration_file,
                 gaps,
                 evidence,

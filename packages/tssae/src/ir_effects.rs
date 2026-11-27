@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 use serde::Serialize;
-use tsrs_ast::{Node, Symbol};
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::P;
 use tssae_analysis::{
     branch_coverage::ControlFlowPathStep,
     call_effects::{
@@ -22,7 +19,9 @@ use tssae_analysis::{
 use tssae_common::{
     EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId,
 };
-use tssae_tsrs_boundary::normalize_path;
+use tssae_tsrs_boundary::{
+    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundarySymbol, normalize_path,
+};
 
 use crate::ir_calls::SnapshotIrEnv;
 use crate::ir_instances::InstanceHandleData;
@@ -195,11 +194,11 @@ pub struct InstanceCleanupScopeRow {
     pub gaps: Vec<GapItem>,
 }
 
-type MaterializedDecl = (P<Node>, Option<P<Symbol>>);
+type MaterializedDecl = (BoundaryNode, Option<BoundarySymbol>);
 
 struct MaterializedGuard {
-    branch_syntax: Option<P<Node>>,
-    condition: Option<P<Node>>,
+    branch_syntax: Option<BoundaryNode>,
+    condition: Option<BoundaryNode>,
     condition_text: String,
     direction: &'static str,
     location: SourceLocation,
@@ -209,34 +208,34 @@ struct MaterializedFieldEffect {
     kind: &'static str,
     property_name: String,
     operator: Option<&'static str>,
-    syntax: Option<P<Node>>,
-    target_syntax: Option<P<Node>>,
-    receiver_syntax: Option<P<Node>>,
+    syntax: Option<BoundaryNode>,
+    target_syntax: Option<BoundaryNode>,
+    receiver_syntax: Option<BoundaryNode>,
     receiver_declaration: Option<MaterializedDecl>,
-    value_syntax: Option<P<Node>>,
+    value_syntax: Option<BoundaryNode>,
     value_text: Option<String>,
     location: SourceLocation,
-    via_call: Option<P<Node>>,
-    enclosing_function: Option<P<Node>>,
-    enclosing_block: Option<P<Node>>,
-    cfg_scope: Option<P<Node>>,
+    via_call: Option<BoundaryNode>,
+    enclosing_function: Option<BoundaryNode>,
+    enclosing_block: Option<BoundaryNode>,
+    cfg_scope: Option<BoundaryNode>,
     guards: Vec<MaterializedGuard>,
     evidence: Vec<EvidenceItem>,
 }
 
 struct MaterializedCallback {
     kind: &'static str,
-    call: Option<P<Node>>,
-    outer_call: Option<P<Node>>,
-    syntax: Option<P<Node>>,
-    callback_argument: Option<P<Node>>,
+    call: Option<BoundaryNode>,
+    outer_call: Option<BoundaryNode>,
+    syntax: Option<BoundaryNode>,
+    callback_argument: Option<BoundaryNode>,
     parameter_index: Option<usize>,
     target_declaration: Option<MaterializedDecl>,
     helper_declaration: Option<MaterializedDecl>,
     resolved_targets: Vec<MaterializedDecl>,
-    enclosing_function: Option<P<Node>>,
-    enclosing_block: Option<P<Node>>,
-    cfg_scope: Option<P<Node>>,
+    enclosing_function: Option<BoundaryNode>,
+    enclosing_block: Option<BoundaryNode>,
+    cfg_scope: Option<BoundaryNode>,
     location: SourceLocation,
     outer_call_location: SourceLocation,
     evidence: Vec<EvidenceItem>,
@@ -249,7 +248,7 @@ enum MaterializedCallEffects {
         writes: Vec<MaterializedFieldEffect>,
         effects: Vec<MaterializedFieldEffect>,
         callbacks: Vec<MaterializedCallback>,
-        calls: Vec<P<Node>>,
+        calls: Vec<BoundaryNode>,
         evidence: Vec<EvidenceItem>,
     },
     Incomplete {
@@ -258,7 +257,7 @@ enum MaterializedCallEffects {
         writes: Vec<MaterializedFieldEffect>,
         effects: Vec<MaterializedFieldEffect>,
         callbacks: Vec<MaterializedCallback>,
-        calls: Vec<P<Node>>,
+        calls: Vec<BoundaryNode>,
         evidence: Vec<EvidenceItem>,
         gaps: Vec<GapItem>,
     },
@@ -268,7 +267,7 @@ struct MaterializedOrigin {
     instance_key: String,
     origin_kind: &'static str,
     allocation_location: Option<SourceLocation>,
-    origin_node: Option<P<Node>>,
+    origin_node: Option<BoundaryNode>,
     summary_id: Option<String>,
     summary_source: Option<SummarySource>,
     evidence: Vec<EvidenceItem>,
@@ -277,9 +276,9 @@ struct MaterializedOrigin {
 struct MaterializedCleanupSite {
     origin: MaterializedOrigin,
     operation_kind: String,
-    syntax: Option<P<Node>>,
+    syntax: Option<BoundaryNode>,
     location: SourceLocation,
-    via_call: Option<P<Node>>,
+    via_call: Option<BoundaryNode>,
     via_call_location: Option<SourceLocation>,
     summary_id: Option<String>,
     summary_source: Option<SummarySource>,
@@ -331,7 +330,7 @@ struct MaterializedTargetCleanup {
 
 struct MaterializedScopeCleanup {
     scope_handle: String,
-    resolved_functions: Vec<P<Node>>,
+    resolved_functions: Vec<BoundaryNode>,
     target_results: Vec<MaterializedTargetCleanup>,
     disposed_instances: Vec<MaterializedCleanupSite>,
     registered_instances: Vec<MaterializedCleanupSite>,
@@ -349,7 +348,7 @@ fn resolve_target_node_and_symbol(
     snapshot: &SnapshotState,
     project_id: &str,
     handle_id: &str,
-) -> Result<(P<Node>, Option<P<Symbol>>), RpcErr> {
+) -> Result<(BoundaryNode, Option<BoundarySymbol>), RpcErr> {
     let entry = snapshot.get_entry(project_id, handle_id)?;
     match entry.payload {
         HandlePayload::Syntax(node) | HandlePayload::Call(node) => Ok((node, None)),
@@ -486,7 +485,7 @@ fn materialize_cleanup_site(
 fn alloc_field_effect_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    fallback_node: P<Node>,
+    fallback_node: BoundaryNode,
     mat: MaterializedFieldEffect,
 ) -> FieldEffectPayload {
     let syn_node = mat.syntax.unwrap_or(fallback_node);
@@ -543,7 +542,7 @@ fn alloc_field_effect_payload(
 fn alloc_callback_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    fallback_node: P<Node>,
+    fallback_node: BoundaryNode,
     cb: MaterializedCallback,
 ) -> CallbackInvocationPayload {
     let call_node = cb.call.unwrap_or(fallback_node);
@@ -584,7 +583,7 @@ fn alloc_callback_payload(
 fn alloc_cleanup_site_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    fallback_node: P<Node>,
+    fallback_node: BoundaryNode,
     site: MaterializedCleanupSite,
 ) -> CleanupSitePayload {
     let inst_ref = snapshot.alloc_instance(
@@ -618,7 +617,7 @@ fn alloc_cleanup_site_payload(
 }
 
 type CallEffectsBatchMaterialized = (
-    Vec<(P<Node>, MaterializedCallEffects)>,
+    Vec<(BoundaryNode, MaterializedCallEffects)>,
     Option<tssae_common::SummaryConflictError>,
 );
 
@@ -630,8 +629,8 @@ type CallEffectsBatchMaterialized = (
 pub fn run_call_effects(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     follow_callbacks: bool,
     include_reads: bool,
@@ -880,7 +879,7 @@ pub fn run_call_effects(
 }
 
 type CleanupBatchMaterialized = (
-    Vec<(P<Node>, MaterializedScopeCleanup)>,
+    Vec<(BoundaryNode, MaterializedScopeCleanup)>,
     Option<tssae_common::SummaryConflictError>,
 );
 
@@ -892,8 +891,8 @@ type CleanupBatchMaterialized = (
 pub fn run_instance_cleanup(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     scopes: &[String],
     targets: &[String],
     lookup_files: Option<&[String]>,

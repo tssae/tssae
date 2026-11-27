@@ -2,19 +2,13 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tsrs_compiler::{CheckerHandle, Program};
-use tsrs_core::{
-    P,
-    context::{CheckerLifetime, Context, with_checker_lifetime},
-};
 pub use tssae_common::SourceLocation;
 use tssae_common::{GapItem, UnknownReason};
-pub use tssae_tsrs_boundary::node_location;
 use tssae_tsrs_boundary::{
-    FacadeCallProjection, FacadeCallSelect, FacadeDeclarationSelect, FacadeDeclarationTarget,
-    FacadeInstantiatedParameter, FacadeParameterIndexSelection, FacadeSignatureSelect,
-    FacadeTypeSelect, FacadeTypeSummary, FindSyntaxFilter, SemanticFacade, SourceRangeSpec,
-    SyntaxLookupOptions, SyntaxView,
+    BoundaryCallProjection, BoundaryChecker, BoundaryDeclarationTarget, BoundaryNode,
+    BoundaryProgram, BoundarySemanticFacade, BoundaryTypeSummary, FacadeCallSelect,
+    FacadeDeclarationSelect, FacadeParameterIndexSelection, FacadeSignatureSelect,
+    FacadeTypeSelect, FindSyntaxFilter, SourceRangeSpec, SyntaxLookupOptions, SyntaxView,
 };
 
 use crate::ir_calls::{CallTargetsRow, DeclarationCallersRow, run_callees_of, run_callers_of};
@@ -688,36 +682,26 @@ struct SyntaxLookupRow {
 pub fn execute_query_batch(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
+    program: BoundaryProgram,
     steps: Vec<QueryStep>,
     observer: &mut ObserveCollector,
 ) -> Result<QueryBatchResult, RpcErr> {
-    // Hold one CheckerLifetime::API instance across every step in the batch so
-    // handles, signatures, instantiated types, and assignability share one checker.
-    let ctx = with_checker_lifetime(&Context::background(), CheckerLifetime::API);
-    let mut checker = program.get_type_checker(&ctx);
-    let mut results = Vec::with_capacity(steps.len());
-
-    for step in steps {
-        results.push(execute_step(
-            snapshot,
-            project_id,
-            program,
-            &mut checker,
-            step,
-            observer,
-        )?);
-    }
-
-    drop(checker);
-    Ok(QueryBatchResult { results })
+    program.with_type_checker(|checker| {
+        let mut results = Vec::with_capacity(steps.len());
+        for step in steps {
+            results.push(execute_step(
+                snapshot, project_id, program, checker, step, observer,
+            )?);
+        }
+        Ok(QueryBatchResult { results })
+    })
 }
 
 fn execute_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     step: QueryStep,
     observer: &mut ObserveCollector,
 ) -> Result<StepResult, RpcErr> {
@@ -822,8 +806,8 @@ fn execute_step(
 fn execute_extended_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     step: QueryStep,
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
@@ -871,8 +855,8 @@ fn execute_extended_step(
 fn execute_effects_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     step: QueryStep,
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
@@ -925,8 +909,8 @@ fn execute_effects_step(
 fn execute_projection_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     step: QueryStep,
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
@@ -998,8 +982,8 @@ fn execute_projection_step(
 fn execute_call_graph_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     is_callers: bool,
     lookup_files: Option<&[String]>,
@@ -1032,8 +1016,8 @@ fn execute_call_graph_step(
 fn execute_value_propagation_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     propagation: Option<&str>,
     include_member_access: bool,
     from: &[String],
@@ -1072,7 +1056,7 @@ fn execute_value_propagation_step(
 fn execute_find_syntax_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
+    program: BoundaryProgram,
     files: Option<&[String]>,
     kinds: Option<&[String]>,
     range: Option<&SourceRangeFilter>,
@@ -1112,8 +1096,8 @@ fn execute_find_syntax_step(
 fn execute_type_at_location_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
@@ -1140,8 +1124,8 @@ fn execute_type_at_location_step(
 fn execute_list_branches_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     step_start: Option<Instant>,
     observer: &mut ObserveCollector,
@@ -1177,8 +1161,8 @@ fn execute_list_branches_step(
 fn execute_branch_coverage_step(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     function: Option<&str>,
     scope: Option<&str>,
     branches: &[String],
@@ -1224,7 +1208,7 @@ fn execute_branch_coverage_step(
 fn run_find_syntax(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
+    program: BoundaryProgram,
     files: Option<&[String]>,
     kinds: Option<&[String]>,
     range: Option<&SourceRangeFilter>,
@@ -1243,7 +1227,7 @@ fn run_find_syntax(
         match_mode: r.match_mode.as_deref(),
     });
     let matches = syntax_view
-        .find_syntax(
+        .find_boundary_syntax(
             program,
             &FindSyntaxFilter {
                 files,
@@ -1304,7 +1288,7 @@ fn run_find_syntax(
 fn alloc_type_summary_payload(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    summary: FacadeTypeSummary,
+    summary: BoundaryTypeSummary,
 ) -> TypeSummaryPayload {
     let type_ref = snapshot.alloc_type(project_id, summary.ty, summary.enclosing);
     TypeSummaryPayload {
@@ -1321,7 +1305,7 @@ fn alloc_type_summary_payload(
 fn alloc_type_summary_with_gap(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    summary: FacadeTypeSummary,
+    summary: BoundaryTypeSummary,
     gaps: &mut Vec<GapItem>,
 ) -> TypeSummaryPayload {
     if summary.is_unresolved {
@@ -1340,7 +1324,7 @@ fn alloc_type_summary_with_gap(
 fn alloc_instantiated_params(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    params: Vec<FacadeInstantiatedParameter>,
+    params: Vec<tssae_tsrs_boundary::BoundaryInstantiatedParameter>,
 ) -> Vec<InstantiatedParameterPayload> {
     params
         .into_iter()
@@ -1356,8 +1340,8 @@ fn alloc_instantiated_params(
 fn run_type_at_location(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
 ) -> Result<Vec<TypeItem>, RpcErr> {
     let mut nodes = Vec::with_capacity(targets.len());
@@ -1367,7 +1351,7 @@ fn run_type_at_location(
     }
 
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let summaries: Vec<_> = nodes
         .into_iter()
         .map(|(target_id, node)| (target_id, facade.type_at_location(node)))
@@ -1396,8 +1380,8 @@ fn run_type_at_location(
 fn run_resolve_declarations(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     select: &DeclarationSelect,
 ) -> Result<Vec<DeclarationRow>, RpcErr> {
@@ -1406,13 +1390,13 @@ fn run_resolve_declarations(
         let entry = snapshot.get_entry(project_id, handle_id)?;
         let target_payload = match entry.payload {
             HandlePayload::Syntax(node) | HandlePayload::Call(node) => {
-                FacadeDeclarationTarget::Node(node)
+                BoundaryDeclarationTarget::Node(node)
             }
             HandlePayload::Signature { sig, call_node } => {
-                FacadeDeclarationTarget::Signature(sig, call_node)
+                BoundaryDeclarationTarget::Signature(sig, call_node)
             }
             HandlePayload::Declaration { node, symbol } => {
-                FacadeDeclarationTarget::Declaration(node, symbol)
+                BoundaryDeclarationTarget::Declaration(node, symbol)
             }
             HandlePayload::Type { .. } => {
                 return Err(RpcErr::new(
@@ -1444,7 +1428,7 @@ fn run_resolve_declarations(
     };
 
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let resolutions: Vec<_> = resolved_inputs
         .into_iter()
         .map(|(target_id, target_input)| {
@@ -1536,9 +1520,9 @@ struct AllocatedCallFields {
 fn allocate_call_fields(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    node: P<tsrs_ast::Node>,
+    node: BoundaryNode,
     select: &CallSelect,
-    fields: FacadeCallProjection,
+    fields: BoundaryCallProjection,
 ) -> AllocatedCallFields {
     let syntax = select
         .syntax
@@ -1599,8 +1583,8 @@ fn allocate_call_fields(
 fn run_resolve_calls(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     select: &CallSelect,
 ) -> Result<Vec<CallResolutionRow>, RpcErr> {
@@ -1612,7 +1596,7 @@ fn run_resolve_calls(
 
     let facade_select = select.to_facade();
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let resolved: Vec<_> = nodes
         .into_iter()
         .map(|(target_id, node)| (target_id, node, facade.resolve_call(node, &facade_select)))
@@ -1684,8 +1668,8 @@ fn run_resolve_calls(
 fn run_project_calls(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     select: &CallSelect,
 ) -> Result<Vec<CallProjectionRow>, RpcErr> {
@@ -1697,7 +1681,7 @@ fn run_project_calls(
 
     let facade_select = select.to_facade();
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let projected: Vec<_> = call_nodes
         .into_iter()
         .map(|(call_id, node)| (call_id, node, facade.project_call(node, &facade_select)))
@@ -1726,8 +1710,8 @@ fn run_project_calls(
 fn run_project_signatures(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     select: &SignatureSelect,
 ) -> Result<Vec<SignatureProjectionRow>, RpcErr> {
@@ -1754,7 +1738,7 @@ fn run_project_signatures(
     };
 
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let projected: Vec<_> = sig_entries
         .into_iter()
         .map(|(sig_id, sig, call_node)| {
@@ -1822,8 +1806,8 @@ fn run_project_signatures(
 fn run_project_types(
     snapshot: &mut SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     targets: &[String],
     select: &TypeSelect,
 ) -> Result<Vec<TypeProjectionRow>, RpcErr> {
@@ -1846,7 +1830,7 @@ fn run_project_types(
     };
 
     let cwd = snapshot.cwd.clone();
-    let mut facade = SemanticFacade::new(&cwd, program, checker);
+    let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
     let projected: Vec<_> = type_entries
         .into_iter()
         .map(|(type_id, ty, enclosing)| {
@@ -1922,8 +1906,8 @@ fn run_project_types(
 fn run_is_assignable_to(
     snapshot: &SnapshotState,
     project_id: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
     pairs: &[AssignabilityPairInput],
 ) -> Result<Vec<AssignabilityRow>, RpcErr> {
     let mut resolved = Vec::with_capacity(pairs.len());
@@ -1941,7 +1925,7 @@ fn run_is_assignable_to(
 
     let cwd = snapshot.cwd.clone();
     let outcomes: Vec<_> = {
-        let mut facade = SemanticFacade::new(&cwd, program, checker);
+        let mut facade = BoundarySemanticFacade::new(&cwd, program, checker);
         resolved
             .into_iter()
             .map(|(source_id, target_id, source_ty, target_ty, enclosing)| {
@@ -1982,7 +1966,7 @@ fn allocate_syntax_lookup_row(
     lookup_opts: &SyntaxLookupOptions,
     select: &SyntaxLookupSelect,
     target_id: String,
-    node_opt: Option<P<tsrs_ast::Node>>,
+    node_opt: Option<BoundaryNode>,
 ) -> SyntaxLookupRow {
     let Some(node) = node_opt else {
         return SyntaxLookupRow {
@@ -2001,7 +1985,7 @@ fn allocate_syntax_lookup_row(
         };
     };
 
-    let inspected = syntax_view.inspect_node(node, lookup_opts);
+    let inspected = syntax_view.inspect_boundary_node(node, lookup_opts);
     let syntax_ref = snapshot.alloc_syntax(project_id, inspected.node);
 
     SyntaxLookupRow {
@@ -2059,7 +2043,7 @@ fn run_syntax_of(
             | HandlePayload::Call(node)
             | HandlePayload::Declaration { node, .. } => Some(node),
             HandlePayload::Signature { sig, .. } => {
-                SemanticFacade::raw_signature_declaration_node(sig)
+                BoundarySemanticFacade::raw_signature_declaration_node(sig)
             }
             HandlePayload::Type { .. } => {
                 return Err(RpcErr::new(

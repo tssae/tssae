@@ -336,7 +336,6 @@ fn build_summaries() -> BehaviorSummaryIndex {
                     resource_ops: vec![ResourceOpSpec::DisposesTarget {
                         target: SummarySlotRef::Arg { arg_index: 0 },
                     }],
-                    mutates_receiver: None,
                 }),
             },
         ],
@@ -1544,7 +1543,6 @@ fn pre_populated_global_caches_respect_lookup_files_scoping() {
                     resource_ops: vec![ResourceOpSpec::DisposesTarget {
                         target: SummarySlotRef::Arg { arg_index: 0 },
                     }],
-                    mutates_receiver: None,
                 }),
             },
         ],

@@ -1124,7 +1124,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
             Some(EffectAspectSummary {
                 completeness: SummaryCompleteness::Complete,
                 resource_ops: Vec::new(),
-                mutates_receiver: Some(false),
             }),
         ));
 
@@ -1141,7 +1140,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
                 Some(EffectAspectSummary {
                     completeness: SummaryCompleteness::Complete,
                     resource_ops: Vec::new(),
-                    mutates_receiver: Some(false),
                 }),
             ));
         }
@@ -1215,7 +1213,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
             Some(EffectAspectSummary {
                 completeness: SummaryCompleteness::Complete,
                 resource_ops: Vec::new(),
-                mutates_receiver: Some(true),
             }),
         ));
 
@@ -1232,7 +1229,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
             Some(EffectAspectSummary {
                 completeness: SummaryCompleteness::Complete,
                 resource_ops: Vec::new(),
-                mutates_receiver: Some(false),
             }),
         ));
     }
@@ -1259,7 +1255,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
         Some(EffectAspectSummary {
             completeness: SummaryCompleteness::Complete,
             resource_ops: Vec::new(),
-            mutates_receiver: Some(false),
         }),
     ));
 
@@ -1454,7 +1449,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
         Some(EffectAspectSummary {
             completeness: SummaryCompleteness::Complete,
             resource_ops: Vec::new(),
-            mutates_receiver: Some(true),
         }),
     ));
 
@@ -1469,7 +1463,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
         Some(EffectAspectSummary {
             completeness: SummaryCompleteness::Complete,
             resource_ops: Vec::new(),
-            mutates_receiver: Some(true),
         }),
     ));
 
@@ -1488,7 +1481,6 @@ pub fn builtin_stdlib_summaries() -> Vec<BehaviorSummaryEntry> {
                 resource_ops: vec![ResourceOpSpec::DisposesTarget {
                     target: SummarySlotRef::Receiver(ForwardCallReceiver::Receiver),
                 }],
-                mutates_receiver: Some(true),
             }),
         ));
     }

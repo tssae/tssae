@@ -96,7 +96,6 @@ void describe("tssae behavior summaries", () => {
           },
           effects: {
             completeness: "complete",
-            mutatesReceiver: false,
             resourceOps: [
               {
                 kind: "registers-into-container",
@@ -1226,6 +1225,236 @@ void describe("tssae behavior summaries", () => {
         } finally {
           await session.close();
         }
+      },
+    );
+  });
+
+  void it("allows disjoint semver ranges and rejects overlapping ranges for uninstalled packages and multi-version monorepo packages", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": createPackageJson("semver-conflict-host", {
+            private: true,
+          }),
+          "apps/a/package.json": createPackageJson("app-a", { private: true }),
+          "apps/a/tsconfig.json": BASE_TSCONFIG,
+          "apps/a/src/index.ts": [
+            'import { run } from "multi-ver";',
+            "function fnA(): void {}",
+            "export function mainA(): void { run(fnA); }",
+            "",
+          ].join("\n"),
+          "apps/b/package.json": createPackageJson("app-b", { private: true }),
+          "apps/b/tsconfig.json": BASE_TSCONFIG,
+          "apps/b/src/index.ts": [
+            'import { run } from "multi-ver";',
+            "function fnB(): void {}",
+            "export function mainB(): void { run(fnB); }",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        host.writeText(
+          "packages/mv-1/package.json",
+          JSON.stringify({
+            name: "multi-ver",
+            version: "1.2.0",
+            types: "./index.d.ts",
+          }),
+        );
+        host.writeText(
+          "packages/mv-1/index.d.ts",
+          "export declare function run(cb: () => void): void;\n",
+        );
+        host.writeText(
+          "packages/mv-2/package.json",
+          JSON.stringify({
+            name: "multi-ver",
+            version: "2.1.0",
+            types: "./index.d.ts",
+          }),
+        );
+        host.writeText(
+          "packages/mv-2/index.d.ts",
+          "export declare function run(cb: () => void): void;\n",
+        );
+
+        linkNodeModulesPackage(
+          join(host.rootDir, "apps/a"),
+          "multi-ver",
+          join(host.rootDir, "packages/mv-1"),
+        );
+        linkNodeModulesPackage(
+          join(host.rootDir, "apps/b"),
+          "multi-ver",
+          join(host.rootDir, "packages/mv-2"),
+        );
+
+        // 1. Uninstalled package with disjoint complete summaries (^1.0.0 vs ^2.0.0) -> no conflict
+        //    AND multi-version resolved packages (1.2.0 and 2.1.0) with ^1.0.0 vs ^2.0.0 -> no conflict
+        const disjointSession = await openProject({
+          cwd: host.rootDir,
+          projects: ["apps/a/tsconfig.json", "apps/b/tsconfig.json"],
+          summaries: {
+            discovery: false,
+            packs: [
+              defineSummaries({
+                id: "pack-v1",
+                entries: [
+                  {
+                    match: {
+                      package: "uninstalled-foo",
+                      version: "^1.0.0",
+                      memberPath: ["doWork"],
+                    },
+                    calls: { completeness: "complete", invokesCallbacks: [] },
+                  },
+                  {
+                    match: {
+                      package: "multi-ver",
+                      version: "^1.0.0",
+                      memberPath: ["run"],
+                    },
+                    calls: {
+                      completeness: "complete",
+                      invokesCallbacks: [
+                        { callbackArgIndex: 0, timing: "synchronous" },
+                      ],
+                    },
+                  },
+                ],
+              }),
+              defineSummaries({
+                id: "pack-v2",
+                entries: [
+                  {
+                    match: {
+                      package: "uninstalled-foo",
+                      version: "^2.0.0",
+                      memberPath: ["doWork"],
+                    },
+                    calls: {
+                      completeness: "complete",
+                      invokesCallbacks: [
+                        { callbackArgIndex: 0, timing: "synchronous" },
+                      ],
+                    },
+                  },
+                  {
+                    match: {
+                      package: "multi-ver",
+                      version: "^2.0.0",
+                      memberPath: ["run"],
+                    },
+                    calls: { completeness: "complete", invokesCallbacks: [] },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        await disjointSession.close();
+
+        // 2. Uninstalled package with overlapping complete summaries (^1.0.0 vs >=1.2.0 <2.0.0) -> SUMMARY_CONFLICT
+        await assert.rejects(
+          async () =>
+            openProject({
+              cwd: host.rootDir,
+              projects: ["apps/a/tsconfig.json"],
+              summaries: {
+                discovery: false,
+                packs: [
+                  defineSummaries({
+                    id: "uninstalled-overlap-1",
+                    entries: [
+                      {
+                        match: {
+                          package: "uninstalled-foo",
+                          version: "^1.0.0",
+                          memberPath: ["doWork"],
+                        },
+                        calls: {
+                          completeness: "complete",
+                          invokesCallbacks: [],
+                        },
+                      },
+                    ],
+                  }),
+                  defineSummaries({
+                    id: "uninstalled-overlap-2",
+                    entries: [
+                      {
+                        match: {
+                          package: "uninstalled-foo",
+                          version: ">=1.2.0 <2.0.0",
+                          memberPath: ["doWork"],
+                        },
+                        calls: {
+                          completeness: "complete",
+                          invokesCallbacks: [
+                            { callbackArgIndex: 0, timing: "synchronous" },
+                          ],
+                        },
+                      },
+                    ],
+                  }),
+                ],
+              },
+            }),
+          (err: unknown) =>
+            err instanceof TssaeError && err.code === "SUMMARY_CONFLICT",
+        );
+
+        // 3. Multi-version monorepo packages retain earlier 1.2.0 version when 2.1.0 is also resolved
+        await assert.rejects(
+          async () =>
+            openProject({
+              cwd: host.rootDir,
+              projects: ["apps/a/tsconfig.json", "apps/b/tsconfig.json"],
+              summaries: {
+                discovery: false,
+                packs: [
+                  defineSummaries({
+                    id: "mv-conflict-a",
+                    entries: [
+                      {
+                        match: {
+                          package: "multi-ver",
+                          version: "^1.0.0",
+                          memberPath: ["run"],
+                        },
+                        calls: {
+                          completeness: "complete",
+                          invokesCallbacks: [
+                            { callbackArgIndex: 0, timing: "synchronous" },
+                          ],
+                        },
+                      },
+                    ],
+                  }),
+                  defineSummaries({
+                    id: "mv-conflict-b",
+                    entries: [
+                      {
+                        match: {
+                          package: "multi-ver",
+                          version: ">=1.2.0 <2.0.0",
+                          memberPath: ["run"],
+                        },
+                        calls: {
+                          completeness: "complete",
+                          invokesCallbacks: [],
+                        },
+                      },
+                    ],
+                  }),
+                ],
+              },
+            }),
+          (err: unknown) =>
+            err instanceof TssaeError && err.code === "SUMMARY_CONFLICT",
+        );
       },
     );
   });

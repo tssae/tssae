@@ -127,7 +127,6 @@ export type EffectAspectSummary = {
         readonly container: "receiver" | { readonly argIndex: number };
       }
   )[];
-  readonly mutatesReceiver?: boolean;
 };
 
 /** Single behavioral summary entry targeting one declaration matcher. */
@@ -1023,20 +1022,8 @@ function validateEffectAspect(value: unknown, path: string): void {
       `Summary "effects" aspect at "${path}" must be an object.`,
     );
   }
-  assertAllowedKeys(
-    value,
-    ["completeness", "resourceOps", "mutatesReceiver"],
-    path,
-  );
+  assertAllowedKeys(value, ["completeness", "resourceOps"], path);
   assertOptionalCompleteness(value.completeness, `${path}.completeness`);
-  if (
-    value.mutatesReceiver !== undefined &&
-    typeof value.mutatesReceiver !== "boolean"
-  ) {
-    throw invalidConfig(
-      `Summary field "${path}.mutatesReceiver" must be a boolean.`,
-    );
-  }
   if (value.resourceOps !== undefined) {
     if (!Array.isArray(value.resourceOps)) {
       throw invalidConfig(
@@ -1437,25 +1424,92 @@ function describeMatcherTarget(matcher: SummaryTargetMatcher): string {
   return member;
 }
 
+function formatAnchorTriplet(
+  major: number,
+  minor: number,
+  patch: number,
+): string {
+  return `${String(major)}.${String(minor)}.${String(patch)}`;
+}
+
+function addAnchorAndNeighbors(
+  candidates: Set<string>,
+  major: number,
+  minor: number,
+  patch: number,
+): void {
+  candidates.add(formatAnchorTriplet(major, minor, patch));
+  candidates.add(formatAnchorTriplet(major, minor, patch + 1));
+  candidates.add(formatAnchorTriplet(major, minor + 1, 0));
+  candidates.add(formatAnchorTriplet(major + 1, 0, 0));
+  if (major > 0) {
+    candidates.add(formatAnchorTriplet(major - 1, 999, 999));
+  }
+  if (minor > 0) {
+    candidates.add(formatAnchorTriplet(major, minor - 1, 999));
+  }
+  if (patch > 0) {
+    candidates.add(formatAnchorTriplet(major, minor, patch - 1));
+  }
+}
+
+function semverRangesOverlap(rangeA: string, rangeB: string): boolean {
+  const clausesA = parseSemverRange(rangeA);
+  const clausesB = parseSemverRange(rangeB);
+  if (!clausesA || !clausesB) return false;
+
+  const candidates = new Set<string>();
+  const baselineAnchors: readonly (readonly [number, number, number])[] = [
+    [0, 0, 0],
+    [0, 0, 1],
+    [0, 1, 0],
+    [1, 0, 0],
+    [2, 0, 0],
+  ];
+  for (const [major, minor, patch] of baselineAnchors) {
+    addAnchorAndNeighbors(candidates, major, minor, patch);
+  }
+  for (const clauses of [clausesA, clausesB]) {
+    for (const clause of clauses) {
+      for (const comp of clause) {
+        const { major, minor, patch, prerelease } = comp.ver;
+        addAnchorAndNeighbors(candidates, major, minor, patch);
+        if (prerelease.length > 0) {
+          const pre = prerelease.map((p) => String(p.value)).join(".");
+          candidates.add(`${formatAnchorTriplet(major, minor, patch)}-${pre}`);
+        }
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (semverMatches(candidate, rangeA) && semverMatches(candidate, rangeB)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function versionConstraintsCompatible(
   vA: string | undefined,
   vB: string | undefined,
-  resolvedPkgVersion: string | undefined,
+  resolvedVersions: ReadonlySet<string> | undefined,
 ): boolean {
-  if (vA === undefined || vB === undefined) return true;
-  if (vA === vB) return true;
-  if (resolvedPkgVersion !== undefined) {
-    return (
-      semverMatches(resolvedPkgVersion, vA) &&
-      semverMatches(resolvedPkgVersion, vB)
-    );
+  if (vA === undefined || vB === undefined || vA === vB) return true;
+  if (resolvedVersions !== undefined && resolvedVersions.size > 0) {
+    for (const ver of resolvedVersions) {
+      if (semverMatches(ver, vA) && semverMatches(ver, vB)) {
+        return true;
+      }
+    }
+    return false;
   }
-  return true;
+  return semverRangesOverlap(vA, vB);
 }
 
 function checkStaticSameTierConflicts(
   taggedPacks: readonly TaggedSummaryPack[],
-  resolvedVersionsByPackage: ReadonlyMap<string, string>,
+  resolvedVersionsByPackage: ReadonlyMap<string, ReadonlySet<string>>,
 ): void {
   const byTier = new Map<SummaryDiscoverySource, TaggedSummaryPack[]>();
   for (const tagged of taggedPacks) {
@@ -1784,13 +1838,18 @@ export async function discoverAndLoadSummaries(params: {
     }
   }
 
-  const resolvedVersions = new Map<string, string>();
+  const resolvedVersionsByPackage = new Map<string, Set<string>>();
   for (const pkg of resolvedPackages) {
     if (pkg.version !== undefined) {
-      resolvedVersions.set(pkg.name, pkg.version);
+      let versions = resolvedVersionsByPackage.get(pkg.name);
+      if (!versions) {
+        versions = new Set<string>();
+        resolvedVersionsByPackage.set(pkg.name, versions);
+      }
+      versions.add(pkg.version);
     }
   }
-  checkStaticSameTierConflicts(taggedPacks, resolvedVersions);
+  checkStaticSameTierConflicts(taggedPacks, resolvedVersionsByPackage);
 
   return {
     payload: {

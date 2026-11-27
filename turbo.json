@@ -66,27 +66,22 @@
     "tags": {
       "app": {
         "dependencies": {
-          "allow": ["library", "native", "tooling"]
+          "allow": ["library", "tooling"]
         }
       },
       "library": {
         "dependencies": {
-          "allow": ["library", "native", "tooling"]
-        }
-      },
-      "native": {
-        "dependencies": {
-          "allow": ["tooling"]
+          "allow": ["library", "tooling"]
         }
       },
       "tooling": {
         "dependencies": {
-          "deny": ["app", "library", "native", "verification"]
+          "deny": ["app", "library", "verification"]
         }
       },
       "verification": {
         "dependencies": {
-          "allow": ["app", "library", "native", "tooling", "verification"]
+          "allow": ["app", "library", "tooling", "verification"]
         }
       }
     }

@@ -29,6 +29,7 @@ export {
 export {
   locationMatchesTarget,
   locationsOverlap,
+  normalizeObserveConfig,
   type CleanupCoverageEvent,
   type EngineCallIoMetrics,
   type EngineIrCacheMetrics,
@@ -36,6 +37,7 @@ export {
   type EngineRpcMetrics,
   type EngineStepMetrics,
   type EngineSummaryLookupMetrics,
+  type NormalizedObserveConfig,
   type QueryCompletedEvent,
   type QueryObserver,
 } from "./observation.ts";

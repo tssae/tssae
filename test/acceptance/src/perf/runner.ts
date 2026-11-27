@@ -8,14 +8,14 @@ import { promisify } from "node:util";
 
 import { packWorkspaceArtifacts } from "../artifacts.ts";
 import {
-  prepareAcceptanceHost,
-  type PreparedAcceptanceHost,
-} from "../host-lifecycle.ts";
-import {
   prepareBaselineArtifact,
   readRepoHeadState,
   resolveRepoRoot,
-} from "./baseline.ts";
+} from "../baseline.ts";
+import {
+  prepareAcceptanceHost,
+  type PreparedAcceptanceHost,
+} from "../host-lifecycle.ts";
 import { materializeCorpus } from "./corpus.ts";
 import { SCENARIO_LABELS } from "./report.ts";
 import {

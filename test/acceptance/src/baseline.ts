@@ -12,14 +12,37 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { packWorkspaceArtifacts } from "../artifacts.ts";
-import type { BaselineArtifact } from "./types.ts";
+import { packWorkspaceArtifacts } from "./artifacts.ts";
 
 const execFileAsync = promisify(execFile);
 
 export type ResolvedRevision = {
   readonly rev: string;
   readonly commitSha: string;
+};
+
+export type RepoHeadState = {
+  readonly commitSha: string;
+  readonly dirty: boolean;
+};
+
+export type BaselineArtifact = {
+  readonly rev: string;
+  readonly commitSha: string;
+  readonly cacheKey: string;
+  readonly cacheDir: string;
+  readonly tarballPath: string;
+  readonly version: string;
+  readonly sha256: string;
+  readonly binarySha256: string;
+  readonly cacheHit: boolean;
+};
+
+export type PrepareBaselineArtifactOptions = {
+  readonly repoRoot?: string;
+  readonly baselineRev?: string;
+  readonly cacheDir?: string;
+  readonly refreshBaseline?: boolean;
 };
 
 type BaselineReadyMetadata = {
@@ -32,8 +55,11 @@ type BaselineReadyMetadata = {
   readonly binarySha256: string;
 };
 
-/** Resolves the external A/B baseline cache directory (outside the Git repository). */
-export function resolvePerfCacheDir(override?: string): string {
+/**
+ * Resolves the external A/B baseline cache directory (outside the Git repository),
+ * keeping compatibility with `TSSAE_PERF_CACHE_DIR` so perf and semantic diff share caches.
+ */
+export function resolveBaselineCacheDir(override?: string): string {
   const configured = override ?? process.env.TSSAE_PERF_CACHE_DIR?.trim();
   if (configured !== undefined && configured.length > 0) {
     return resolve(configured);
@@ -46,6 +72,9 @@ export function resolvePerfCacheDir(override?: string): string {
   return join(baseCache, "tssae", "perf-ab");
 }
 
+/** Alias retained for existing perf callers and unit tests. */
+export const resolvePerfCacheDir = resolveBaselineCacheDir;
+
 /** Finds the Git top-level directory containing `startDir`. */
 export function resolveRepoRoot(startDir: string = process.cwd()): string {
   return execFileSync("git", ["rev-parse", "--show-toplevel"], {
@@ -56,10 +85,7 @@ export function resolveRepoRoot(startDir: string = process.cwd()): string {
 }
 
 /** Returns current HEAD commit SHA and whether the working tree has uncommitted edits. */
-export function readRepoHeadState(repoRoot: string): {
-  readonly commitSha: string;
-  readonly dirty: boolean;
-} {
+export function readRepoHeadState(repoRoot: string): RepoHeadState {
   const commitSha = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repoRoot,
     encoding: "utf8",
@@ -266,19 +292,14 @@ async function tryLoadCachedBaseline(
  * Builds and caches the baseline `tssae` tarball from an isolated `git archive`
  * snapshot so the active working tree and `.git/worktrees` remain untouched.
  */
-export async function prepareBaselineArtifact(options: {
-  readonly repoRoot: string;
-  readonly baselineRev?: string;
-  readonly cacheDir?: string;
-  readonly refreshBaseline?: boolean;
-}): Promise<BaselineArtifact> {
-  const resolved = resolveBaselineRevision(
-    options.repoRoot,
-    options.baselineRev,
-  );
+export async function prepareBaselineArtifact(
+  options: PrepareBaselineArtifactOptions = {},
+): Promise<BaselineArtifact> {
+  const repoRoot = options.repoRoot ?? resolveRepoRoot();
+  const resolved = resolveBaselineRevision(repoRoot, options.baselineRev);
   const nodeMajor = process.versions.node.split(".")[0] ?? "0";
   const cacheKey = `${resolved.commitSha}-${process.platform}-${process.arch}-node${nodeMajor}`;
-  const cacheRoot = resolvePerfCacheDir(options.cacheDir);
+  const cacheRoot = resolveBaselineCacheDir(options.cacheDir);
   const baselinesRoot = join(cacheRoot, "baselines");
   const cacheDir = join(baselinesRoot, cacheKey);
 
@@ -300,7 +321,7 @@ export async function prepareBaselineArtifact(options: {
   mkdirSync(outDir, { recursive: true });
 
   try {
-    await extractGitRevision(options.repoRoot, resolved.commitSha, sourceDir);
+    await extractGitRevision(repoRoot, resolved.commitSha, sourceDir);
     await runCommand("pnpm", ["install", "--frozen-lockfile"], sourceDir);
     await runCommand("pnpm", ["--filter", "tssae", "build"], sourceDir);
     await runCommand(

@@ -185,11 +185,60 @@ struct VertexCleanupEffect {
 }
 
 #[derive(Clone)]
+enum CalleeStackKind {
+    /// Reconstruct `next_stack` from the caller's current `call_stack` plus `closure_env` and `frame`.
+    AppendFrame {
+        include_caller_stack: bool,
+        extra_closure_env: Vec<IrCallFrame>,
+        frame: Box<IrCallFrame>,
+    },
+    /// Reuse the caller's current `call_stack` directly (for inline synchronous callbacks).
+    CurrentCallerStack,
+    /// Use a pre-resolved captured stack (for parameter or outer-factory callbacks).
+    FixedStack(Vec<IrCallFrame>),
+}
+
+#[derive(Clone)]
 struct CalleeInvocation {
     callee_ir: Arc<FunctionIr>,
     call_syntax: SyntaxId,
     call_location: Option<DiagnosticLocation>,
-    next_stack: Vec<IrCallFrame>,
+    stack_kind: CalleeStackKind,
+}
+
+impl CalleeInvocation {
+    fn resolve_next_stack(&self, caller_stack: &[IrCallFrame]) -> Vec<IrCallFrame> {
+        match &self.stack_kind {
+            CalleeStackKind::AppendFrame {
+                include_caller_stack,
+                extra_closure_env,
+                frame,
+            } => {
+                let mut next_stack = caller_stack.to_vec();
+                let mut effective_env = if *include_caller_stack {
+                    caller_stack.to_vec()
+                } else {
+                    Vec::new()
+                };
+                effective_env.extend(extra_closure_env.iter().cloned());
+                for cf in &effective_env {
+                    if !next_stack.iter().any(|x| x.call_syntax == cf.call_syntax) {
+                        next_stack.push(cf.clone());
+                    }
+                }
+                let mut resolved_frame = (**frame).clone();
+                resolved_frame.closure_env = effective_env;
+                next_stack.push(resolved_frame);
+                next_stack
+            }
+            CalleeStackKind::CurrentCallerStack => caller_stack.to_vec(),
+            CalleeStackKind::FixedStack(stack) => stack.clone(),
+        }
+    }
+}
+
+fn base_instance_key(key: &str) -> &str {
+    key.split("@ctx[").next().unwrap_or(key)
 }
 
 /// Summary of how a `(fn_ir, call_stack)` behaves with respect to a specific target instance.
@@ -270,9 +319,16 @@ pub fn evaluate_instance_cleanup_on_ir<S: BuildHasher>(
                 .filter_map(|t| t.origin_syntax.map(SyntaxId::file_id)),
         )
         .collect();
+    let target_keys: FxHashSet<String> = targets.iter().map(|t| t.instance_key.clone()).collect();
+    let target_base_keys: FxHashSet<String> = targets
+        .iter()
+        .map(|t| base_instance_key(&t.instance_key).to_string())
+        .collect();
     let mut owned_graph: Option<IrCallGraph> = None;
     let mut engine = CleanupAnalyzer {
         targets,
+        target_keys,
+        target_base_keys,
         project_files,
         allowed_files: owned_allowed.as_ref(),
         extra_field_files,
@@ -339,6 +395,8 @@ type VertexCacheKey = (FunctionIrId, VertexId, CallContextKey);
 
 struct CleanupAnalyzer<'a> {
     targets: &'a [CleanupTargetSpec],
+    target_keys: FxHashSet<String>,
+    target_base_keys: FxHashSet<String>,
     project_files: &'a [FileId],
     allowed_files: Option<&'a FxHashSet<FileId>>,
     extra_field_files: FxHashSet<FileId>,
@@ -807,9 +865,10 @@ impl CleanupAnalyzer<'_> {
                         callee.call_location.clone(),
                     ),
                 );
+                let next_stack = callee.resolve_next_stack(call_stack);
                 self.collect_scope_actions(
                     &callee.callee_ir,
-                    &callee.next_stack,
+                    &next_stack,
                     Some(top_site.unwrap_or(callee.call_syntax)),
                     Some(via_call.unwrap_or(callee.call_syntax)),
                     &next_ev,
@@ -853,20 +912,6 @@ impl CleanupAnalyzer<'_> {
                 receiver,
                 args,
             } => {
-                // Record any instances passed as receiver or args.
-                if let Some(rv) = receiver {
-                    for h in self.trace_val_hosts(ir, *rv, Some(vertex.id), call_stack) {
-                        effect.touched_instances.insert(h.origin.instance_key);
-                    }
-                }
-                for &arg in args {
-                    for h in
-                        self.trace_val_hosts(ir, arg_value_id(arg), Some(vertex.id), call_stack)
-                    {
-                        effect.touched_instances.insert(h.origin.instance_key);
-                    }
-                }
-
                 // 1. Check `calls` summary (e.g. Array.prototype.forEach synchronous callbacks).
                 let mut handled_by_calls_summary = false;
                 if let Some((_, call_summary)) = self.lookup_calls_summary_with_id(syn)
@@ -887,11 +932,21 @@ impl CleanupAnalyzer<'_> {
                                 effect.dynamic_gap = Some(g);
                             }
                             for e in entries {
+                                let matches_caller = e.captured_stack.len() == call_stack.len()
+                                    && e.captured_stack
+                                        .iter()
+                                        .zip(call_stack)
+                                        .all(|(a, b)| a.call_syntax == b.call_syntax);
+                                let stack_kind = if matches_caller {
+                                    CalleeStackKind::CurrentCallerStack
+                                } else {
+                                    CalleeStackKind::FixedStack(e.captured_stack)
+                                };
                                 effect.summary_sync_callbacks.push(CalleeInvocation {
                                     callee_ir: e.ir,
                                     call_syntax: syn,
                                     call_location: vertex.location.clone(),
-                                    next_stack: e.captured_stack,
+                                    stack_kind,
                                 });
                             }
                         }
@@ -1032,16 +1087,30 @@ impl CleanupAnalyzer<'_> {
                             ));
                         }
                     }
+                    if effect.unmodeled_external_gap.is_some() {
+                        if let Some(rv) = receiver {
+                            for h in self.trace_val_hosts(ir, *rv, Some(vertex.id), call_stack) {
+                                if self.target_keys.contains(&h.origin.instance_key) {
+                                    effect.touched_instances.insert(h.origin.instance_key);
+                                }
+                            }
+                        }
+                        for &arg in args {
+                            for h in self.trace_val_hosts(
+                                ir,
+                                arg_value_id(arg),
+                                Some(vertex.id),
+                                call_stack,
+                            ) {
+                                if self.target_keys.contains(&h.origin.instance_key) {
+                                    effect.touched_instances.insert(h.origin.instance_key);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             IrOp::Construct { callee, args, .. } => {
-                for &arg in args {
-                    for h in
-                        self.trace_val_hosts(ir, arg_value_id(arg), Some(vertex.id), call_stack)
-                    {
-                        effect.touched_instances.insert(h.origin.instance_key);
-                    }
-                }
                 let _ = callee;
                 let res = resolve_call_targets_with_summaries(
                     syn,
@@ -1060,22 +1129,24 @@ impl CleanupAnalyzer<'_> {
                         && let Some(fn_syn) = t.fn_scope_syntax
                         && let Ok(callee_ir) = self.ir_provider.function_ir(fn_syn)
                     {
-                        let mut next_stack = call_stack.to_vec();
-                        next_stack.push(IrCallFrame {
-                            call_syntax: syn,
-                            call_location: vertex.location.clone(),
-                            caller_ir: Arc::clone(ir),
-                            callee_ir: Arc::clone(&callee_ir),
-                            receiver: None,
-                            args: args.clone(),
-                            is_construct: true,
-                            closure_env: Vec::new(),
-                        });
                         effect.explicit_callees.push(CalleeInvocation {
-                            callee_ir,
+                            callee_ir: Arc::clone(&callee_ir),
                             call_syntax: syn,
                             call_location: vertex.location.clone(),
-                            next_stack,
+                            stack_kind: CalleeStackKind::AppendFrame {
+                                include_caller_stack: false,
+                                extra_closure_env: Vec::new(),
+                                frame: Box::new(IrCallFrame {
+                                    call_syntax: syn,
+                                    call_location: vertex.location.clone(),
+                                    caller_ir: Arc::clone(ir),
+                                    callee_ir,
+                                    receiver: None,
+                                    args: args.clone(),
+                                    is_construct: true,
+                                    closure_env: Vec::new(),
+                                }),
+                            },
                         });
                     }
                 }
@@ -1106,10 +1177,11 @@ impl CleanupAnalyzer<'_> {
                             .or_else(|| self.syntax.syntax_location(syn));
                         let slot_writes = self.ensure_cleanup_index().slot_writes.clone();
 
-                        for slot_host in &slot_hosts {
-                            effect
-                                .touched_instances
-                                .insert(slot_host.origin.instance_key.clone());
+                        let lhs_hosts: BTreeSet<String> = slot_hosts
+                            .into_iter()
+                            .map(|h| h.origin.instance_key)
+                            .collect();
+                        for lhs_key in &lhs_hosts {
                             for sw in &slot_writes {
                                 if sw.write_syntax == syn {
                                     continue;
@@ -1123,10 +1195,7 @@ impl CleanupAnalyzer<'_> {
                                     Some(sw.vertex_id),
                                     &[],
                                 );
-                                if !sw_slots
-                                    .iter()
-                                    .any(|o| o.origin.instance_key == slot_host.origin.instance_key)
-                                {
+                                if !sw_slots.iter().any(|o| o.origin.instance_key == *lhs_key) {
                                     continue;
                                 }
                                 let prev_items = self.trace_val_hosts(
@@ -1399,7 +1468,7 @@ impl CleanupAnalyzer<'_> {
                         callee_ir: e.ir,
                         call_syntax,
                         call_location: call_vertex.location.clone(),
-                        next_stack: e.captured_stack,
+                        stack_kind: CalleeStackKind::FixedStack(e.captured_stack),
                     })
                     .collect();
                 return (invs, gaps.into_iter().next(), false);
@@ -1416,27 +1485,34 @@ impl CleanupAnalyzer<'_> {
             let invs = closure_entries
                 .into_iter()
                 .map(|e| {
-                    let mut next_stack = call_stack.to_vec();
-                    for cf in &e.captured_stack {
-                        if !next_stack.iter().any(|x| x.call_syntax == cf.call_syntax) {
-                            next_stack.push(cf.clone());
-                        }
-                    }
-                    next_stack.push(IrCallFrame {
-                        call_syntax,
-                        call_location: call_vertex.location.clone(),
-                        caller_ir: Arc::clone(caller_ir),
-                        callee_ir: Arc::clone(&e.ir),
-                        receiver: receiver.map(ReceiverBinding::Value),
-                        args: args.to_vec(),
-                        is_construct: false,
-                        closure_env: e.captured_stack,
-                    });
+                    let include_caller_stack = e.captured_stack.len() >= call_stack.len()
+                        && e.captured_stack[..call_stack.len()]
+                            .iter()
+                            .zip(call_stack)
+                            .all(|(a, b)| a.call_syntax == b.call_syntax);
+                    let extra_closure_env = if include_caller_stack {
+                        e.captured_stack[call_stack.len()..].to_vec()
+                    } else {
+                        e.captured_stack
+                    };
                     CalleeInvocation {
-                        callee_ir: e.ir,
+                        callee_ir: Arc::clone(&e.ir),
                         call_syntax,
                         call_location: call_vertex.location.clone(),
-                        next_stack,
+                        stack_kind: CalleeStackKind::AppendFrame {
+                            include_caller_stack,
+                            extra_closure_env,
+                            frame: Box::new(IrCallFrame {
+                                call_syntax,
+                                call_location: call_vertex.location.clone(),
+                                caller_ir: Arc::clone(caller_ir),
+                                callee_ir: e.ir,
+                                receiver: receiver.map(ReceiverBinding::Value),
+                                args: args.to_vec(),
+                                is_construct: false,
+                                closure_env: Vec::new(),
+                            }),
+                        },
                     }
                 })
                 .collect();
@@ -1466,22 +1542,24 @@ impl CleanupAnalyzer<'_> {
             if let Some(fn_syn) = t.fn_scope_syntax
                 && let Ok(callee_ir) = self.ir_provider.function_ir(fn_syn)
             {
-                let mut next_stack = call_stack.to_vec();
-                next_stack.push(IrCallFrame {
-                    call_syntax,
-                    call_location: call_vertex.location.clone(),
-                    caller_ir: Arc::clone(caller_ir),
-                    callee_ir: Arc::clone(&callee_ir),
-                    receiver: receiver.map(ReceiverBinding::Value),
-                    args: args.to_vec(),
-                    is_construct: false,
-                    closure_env: Vec::new(),
-                });
                 invs.push(CalleeInvocation {
-                    callee_ir,
+                    callee_ir: Arc::clone(&callee_ir),
                     call_syntax,
                     call_location: call_vertex.location.clone(),
-                    next_stack,
+                    stack_kind: CalleeStackKind::AppendFrame {
+                        include_caller_stack: false,
+                        extra_closure_env: Vec::new(),
+                        frame: Box::new(IrCallFrame {
+                            call_syntax,
+                            call_location: call_vertex.location.clone(),
+                            caller_ir: Arc::clone(caller_ir),
+                            callee_ir,
+                            receiver: receiver.map(ReceiverBinding::Value),
+                            args: args.to_vec(),
+                            is_construct: false,
+                            closure_env: Vec::new(),
+                        }),
+                    },
                 });
             }
         }
@@ -2012,9 +2090,10 @@ impl CleanupAnalyzer<'_> {
                 let mut helper_uncleaned = Vec::new();
 
                 for callee in callees {
+                    let next_stack = callee.resolve_next_stack(call_stack);
                     let sub = self.evaluate_fn_for_target(
                         &callee.callee_ir,
-                        &callee.next_stack,
+                        &next_stack,
                         target,
                         true,
                         initial_mask,
@@ -2440,6 +2519,29 @@ impl CleanupAnalyzer<'_> {
             || effect.touched_instances.iter().any(|k| key_has_marker(k))
     }
 
+    fn canonicalize_ctx_host_key(&self, key: &str) -> String {
+        let Some((base, rest)) = key.split_once("@ctx[") else {
+            return key.to_string();
+        };
+        let inner = rest.strip_suffix(']').unwrap_or(rest);
+        let tokens: Vec<&str> = inner.split("->").filter(|s| !s.is_empty()).collect();
+        if tokens.is_empty() {
+            return base.to_string();
+        }
+        if self.target_base_keys.contains(base) {
+            let mut deduped: Vec<&str> = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                if !deduped.contains(&tok) {
+                    deduped.push(tok);
+                }
+            }
+            format!("{base}@ctx[{}]", deduped.join("->"))
+        } else {
+            let last = tokens.last().copied().unwrap_or("");
+            format!("{base}@ctx[{last}]")
+        }
+    }
+
     fn collect_closure_env_frames(
         &self,
         ir: &Arc<FunctionIr>,
@@ -2463,16 +2565,14 @@ impl CleanupAnalyzer<'_> {
                     .and_then(|d| d.primary_syntax)
                 && let Ok(decl_ir) = self.ir_provider.enclosing_scope_ir(decl_syn)
                 && decl_ir.scope_kind != IrScopeKind::ModuleTopLevel
-                && parent_stack
+                && decl_ir.id != ir.id
+                && let Some(pf) = parent_stack
                     .iter()
-                    .any(|f| f.callee_ir.id == decl_ir.id || f.caller_ir.id == decl_ir.id)
+                    .rev()
+                    .find(|f| f.callee_ir.id == decl_ir.id)
+                && !frames.contains(&pf.call_syntax)
             {
-                for pf in parent_stack {
-                    if !frames.contains(&pf.call_syntax) {
-                        frames.push(pf.call_syntax);
-                    }
-                }
-                break;
+                frames.push(pf.call_syntax);
             }
         }
         frames
@@ -2513,11 +2613,11 @@ impl CleanupAnalyzer<'_> {
                 ReceiverBinding::Value(rv) => self
                     .trace_val_hosts(&frame.caller_ir, *rv, None, parent_stack)
                     .into_iter()
-                    .map(|h| h.origin.instance_key)
+                    .map(|h| self.canonicalize_ctx_host_key(&h.origin.instance_key))
                     .collect(),
                 ReceiverBinding::PreResolved(hosts) => hosts
                     .iter()
-                    .map(|h| h.origin.instance_key.clone())
+                    .map(|h| self.canonicalize_ctx_host_key(&h.origin.instance_key))
                     .collect(),
             };
             receiver_hosts.sort();
@@ -2530,7 +2630,7 @@ impl CleanupAnalyzer<'_> {
             let mut host_keys: Vec<String> = self
                 .trace_val_hosts(&frame.caller_ir, val, None, parent_stack)
                 .into_iter()
-                .map(|h| h.origin.instance_key)
+                .map(|h| self.canonicalize_ctx_host_key(&h.origin.instance_key))
                 .collect();
             host_keys.sort();
             host_keys.dedup();

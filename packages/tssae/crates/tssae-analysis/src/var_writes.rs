@@ -122,11 +122,15 @@ pub fn collect_all_writes_for_decl(
     ir_provider: &dyn IrProvider,
 ) -> VarWritesResult {
     if let Ok(decl_ir) = ir_provider.enclosing_scope_ir(decl_syntax) {
-        if let Some(binding_info) = decl_ir
-            .bindings
-            .iter()
-            .find(|b| b.syntax == decl_syntax || (symbol.is_some() && b.symbol == symbol))
-        {
+        if let Some(binding_info) = decl_ir.bindings.iter().find(|b| {
+            b.syntax == decl_syntax
+                || (symbol.is_some()
+                    && (b.symbol == symbol || semantic.symbol_at_syntax(b.syntax) == symbol))
+                || semantic
+                    .resolve_declaration(b.syntax)
+                    .and_then(|d| d.primary_syntax)
+                    == Some(decl_syntax)
+        }) {
             return collect_all_writes_for_local(
                 &decl_ir,
                 binding_info.id,

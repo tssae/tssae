@@ -67,27 +67,38 @@ pub fn is_class_scope_node(node: P<Node>) -> bool {
 pub fn resolve_enclosing_cfg_owner(node: P<Node>) -> Option<P<Node>> {
     let mut prev = node;
     let mut cur = node.parent();
+    let mut from_param_decorator = false;
     while let Some(p) = cur {
-        if is_function_like_declaration(Some(p)) {
-            if !p.decorators().contains(&prev) && p.name() != Some(prev) {
+        if p.kind() == Kind::Parameter && p.decorators().contains(&prev) {
+            from_param_decorator = true;
+        } else if is_function_like_declaration(Some(p)) {
+            let skip_for_param_decorator = from_param_decorator && p.parameters().contains(&prev);
+            from_param_decorator = false;
+            if !skip_for_param_decorator
+                && !p.decorators().contains(&prev)
+                && p.name() != Some(prev)
+            {
                 return Some(p);
             }
-        } else if p.kind() == Kind::ClassStaticBlockDeclaration {
-            return Some(p);
-        } else if p.kind() == Kind::PropertyDeclaration {
-            let prop = p.as_property_declaration();
-            if prop.initializer() == Some(prev)
-                && let Some(cls) = p.parent()
-                && is_class_scope_node(cls)
-            {
-                let sem = extract_decl_semantics(p);
-                if !sem.is_static {
-                    let explicit_ctor = cls
-                        .members()
-                        .iter()
-                        .copied()
-                        .find(|m| m.kind() == Kind::Constructor && m.body().is_some());
-                    return Some(explicit_ctor.unwrap_or(cls));
+        } else {
+            from_param_decorator = false;
+            if p.kind() == Kind::ClassStaticBlockDeclaration {
+                return Some(p);
+            } else if p.kind() == Kind::PropertyDeclaration {
+                let prop = p.as_property_declaration();
+                if prop.initializer() == Some(prev)
+                    && let Some(cls) = p.parent()
+                    && is_class_scope_node(cls)
+                {
+                    let sem = extract_decl_semantics(p);
+                    if !sem.is_static {
+                        let explicit_ctor = cls
+                            .members()
+                            .iter()
+                            .copied()
+                            .find(|m| m.kind() == Kind::Constructor && m.body().is_some());
+                        return Some(explicit_ctor.unwrap_or(cls));
+                    }
                 }
             }
         }
@@ -6298,7 +6309,21 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             }
         }
 
-        // Evaluate class and member decorators in source order at class definition time.
+        // Evaluate class and member/parameter decorators in source order at class definition time.
+        for &member in node.members().iter().rev() {
+            if is_function_like_declaration(Some(member)) {
+                for &param in member.parameters().iter().rev() {
+                    for &dec in param.decorators().iter().rev() {
+                        let (entry, _) = self.lower_decorator_expr(dec, cont);
+                        cont = entry;
+                    }
+                }
+            }
+            for &dec in member.decorators().iter().rev() {
+                let (entry, _) = self.lower_decorator_expr(dec, cont);
+                cont = entry;
+            }
+        }
         for &dec in node.decorators().iter().rev() {
             let (entry, _) = self.lower_decorator_expr(dec, cont);
             cont = entry;

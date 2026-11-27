@@ -117,6 +117,42 @@ export type {
   WorkerRunSample,
 } from "./perf/types.ts";
 export {
+  runConformanceCli,
+  type RunConformanceCliHost,
+} from "./conformance/cli.ts";
+export {
+  formatConformanceCliUsage,
+  parseConformanceCliArgs,
+  type ConformanceCliOptions,
+} from "./conformance/cli-args.ts";
+export {
+  CONFORMANCE_CORPORA,
+  DEFAULT_CONFORMANCE_CORPORA,
+} from "./conformance/corpora.ts";
+export {
+  formatConformanceConsoleReport,
+  formatConformanceMarkdownReport,
+  writeConformanceReportFiles,
+} from "./conformance/report.ts";
+export {
+  DEFAULT_CONFORMANCE_BATCH_SIZE,
+  DEFAULT_CONFORMANCE_BATCH_TIMEOUT_MS,
+  DEFAULT_CONFORMANCE_CONCURRENCY,
+  runConformanceSweep,
+  type RunConformanceSweepOptions,
+} from "./conformance/runner.ts";
+export type {
+  ConformanceBatchWorkerConfig,
+  ConformanceBatchWorkerResult,
+  ConformanceCorpusId,
+  ConformanceCorpusResult,
+  ConformanceCorpusSpecMap,
+  ConformanceFailureKind,
+  ConformanceFailureRecord,
+  ConformanceReport,
+  ConformanceViolation,
+} from "./conformance/types.ts";
+export {
   checkSoundness,
   collectPreciseCoverage,
   runSoundnessReconciliationSuite,

@@ -1,9 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { performance } from "node:perf_hooks";
-import {
-  createInterface,
-  type Interface as ReadlineInterface,
-} from "node:readline";
 
 import { engineExecutablePath } from "./binary.ts";
 import type { EngineCallIoMetrics, EngineRpcMetrics } from "./observation.ts";
@@ -64,9 +60,9 @@ function mapEngineErrorCode(code: string): TssaeErrorCode {
 /** Manages a single `tssae-engine serve --stdio` subprocess over NDJSON RPC. */
 export class EngineClient {
   readonly #child: ChildProcessWithoutNullStreams;
-  readonly #lines: ReadlineInterface;
   readonly #pending = new Map<number, PendingCall>();
   readonly #stderrChunks: string[] = [];
+  #stdoutBuffer: Buffer = Buffer.alloc(0);
   #nextId = 1;
   #closed = false;
 
@@ -74,69 +70,36 @@ export class EngineClient {
     this.#child = spawn(engineExecutablePath, ["serve", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.#lines = createInterface({
-      input: this.#child.stdout,
-      crlfDelay: Infinity,
-    });
 
     this.#child.stderr.setEncoding("utf8");
     this.#child.stderr.on("data", (chunk: string) => {
       this.#stderrChunks.push(chunk);
     });
 
-    this.#lines.on("line", (line) => {
-      if (line.trim() === "") return;
-      let parsed: RpcResponse;
-      try {
-        parsed = JSON.parse(line) as RpcResponse;
-      } catch (err) {
-        this.#failAll(
-          new TssaeError(
-            "ENGINE_ERROR",
-            `Malformed engine response: ${String(err)}`,
-          ),
-        );
-        return;
-      }
-
-      const call = this.#pending.get(parsed.id);
-      if (!call) return;
-      this.#pending.delete(parsed.id);
-
-      if (call.onMetrics) {
-        const bytesReceived = Buffer.byteLength(line, "utf8") + 1;
-        call.onMetrics({
-          isQueryBatch: call.isQueryBatch,
-          bytesSent: call.bytesSent,
-          bytesReceived,
-          encodeMs: call.encodeMs,
-          writeMs: call.getWriteMs(),
-          ...(parsed.ok && parsed.metrics !== undefined
-            ? { engineMetrics: parsed.metrics }
-            : {}),
-        });
-      }
-
-      if (parsed.ok) {
-        call.resolve(parsed.result);
-      } else {
-        const mappedCode = mapEngineErrorCode(parsed.error.code);
-        call.reject(
-          new TssaeError(
-            mappedCode,
-            parsed.error.message,
-            mappedCode === "SUMMARY_CONFLICT" &&
-              parsed.error.details !== undefined
-              ? {
-                  summaryConflict: parsed.error
-                    .details as SummaryConflictDetails,
-                }
-              : undefined,
-          ),
-        );
+    // Split NDJSON strictly on `\n` (0x0A): `node:readline` treats U+2028/U+2029
+    // inside valid JSON strings as line terminators and splits responses mid-string.
+    this.#child.stdout.on("data", (chunk: Buffer) => {
+      this.#stdoutBuffer =
+        this.#stdoutBuffer.length === 0
+          ? chunk
+          : Buffer.concat([this.#stdoutBuffer, chunk]);
+      let newlineIdx = this.#stdoutBuffer.indexOf(0x0a);
+      while (newlineIdx !== -1) {
+        const lineBuf = this.#stdoutBuffer.subarray(0, newlineIdx);
+        this.#stdoutBuffer = this.#stdoutBuffer.subarray(newlineIdx + 1);
+        const line = lineBuf.toString("utf8").replace(/\r$/u, "");
+        this.#handleLine(line);
+        newlineIdx = this.#stdoutBuffer.indexOf(0x0a);
       }
     });
 
+    this.#child.stdout.on("end", () => {
+      if (!this.#closed && this.#stdoutBuffer.length > 0) {
+        const line = this.#stdoutBuffer.toString("utf8").replace(/\r$/u, "");
+        this.#stdoutBuffer = Buffer.alloc(0);
+        this.#handleLine(line);
+      }
+    });
     this.#child.on("error", (err) => {
       this.#failAll(
         new TssaeError(
@@ -161,6 +124,58 @@ export class EngineClient {
         );
       }
     });
+  }
+
+  #handleLine(line: string): void {
+    if (line.trim() === "") return;
+    let parsed: RpcResponse;
+    try {
+      parsed = JSON.parse(line) as RpcResponse;
+    } catch (err) {
+      this.#failAll(
+        new TssaeError(
+          "ENGINE_ERROR",
+          `Malformed engine response: ${String(err)}`,
+        ),
+      );
+      return;
+    }
+
+    const call = this.#pending.get(parsed.id);
+    if (!call) return;
+    this.#pending.delete(parsed.id);
+
+    if (call.onMetrics) {
+      const bytesReceived = Buffer.byteLength(line, "utf8") + 1;
+      call.onMetrics({
+        isQueryBatch: call.isQueryBatch,
+        bytesSent: call.bytesSent,
+        bytesReceived,
+        encodeMs: call.encodeMs,
+        writeMs: call.getWriteMs(),
+        ...(parsed.ok && parsed.metrics !== undefined
+          ? { engineMetrics: parsed.metrics }
+          : {}),
+      });
+    }
+
+    if (parsed.ok) {
+      call.resolve(parsed.result);
+    } else {
+      const mappedCode = mapEngineErrorCode(parsed.error.code);
+      call.reject(
+        new TssaeError(
+          mappedCode,
+          parsed.error.message,
+          mappedCode === "SUMMARY_CONFLICT" &&
+            parsed.error.details !== undefined
+            ? {
+                summaryConflict: parsed.error.details as SummaryConflictDetails,
+              }
+            : undefined,
+        ),
+      );
+    }
   }
 
   #failAll(error: TssaeError): void {
@@ -231,7 +246,7 @@ export class EngineClient {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    this.#lines.close();
+    this.#stdoutBuffer = Buffer.alloc(0);
 
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       return;

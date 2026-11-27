@@ -96,8 +96,7 @@
         "no_proxy",
         "XDG_CACHE_HOME",
         "CARGO_NET_OFFLINE",
-        "TSSAE_ACCEPTANCE_PACK_DIR",
-        "TSSAE_ACCEPTANCE_CRATE_PATH"
+        "TSSAE_ACCEPTANCE_PACK_DIR"
       ],
       "inputs": ["$TURBO_DEFAULT$"],
       "outputs": [],

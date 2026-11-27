@@ -12,13 +12,6 @@
   "oxc.fmt.configPath": "./oxfmt.config.ts",
   "rust-analyzer.cargo.features": "all",
   "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.linkedProjects": [
-    "./packages/tssae/Cargo.toml",
-    "./packages/adapter-api/Cargo.toml",
-    "./packages/adapters/native/zod/Cargo.toml",
-    "./packages/adapters/native/drizzle/Cargo.toml",
-    "./test/adapter-fixture/native/Cargo.toml",
-    "./test/adapter-fixture-complement/native/Cargo.toml"
-  ],
+  "rust-analyzer.linkedProjects": ["packages/tssae/Cargo.toml"],
   "rust-analyzer.procMacro.enable": true
 }

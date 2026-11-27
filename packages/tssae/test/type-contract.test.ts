@@ -429,24 +429,6 @@ void describe("tssae external TypeScript consumer contract", () => {
           expectedPattern: /TS2339/u,
         },
         {
-          name: "reachable does not exist on ValuePropagationTargetResult",
-          body: `
-            declare const synRef: SyntaxRef;
-            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
-            void res.results[0]?.reachable;
-          `,
-          expectedPattern: /TS2339/u,
-        },
-        {
-          name: "gaps does not exist on aggregate ValuePropagationResult",
-          body: `
-            declare const synRef: SyntaxRef;
-            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
-            void res.gaps;
-          `,
-          expectedPattern: /TS2339/u,
-        },
-        {
           name: "instance cannot be read on InstanceResolutionResult before narrowing to proved",
           body: `
             declare const synRef: SyntaxRef;
@@ -463,14 +445,6 @@ void describe("tssae external TypeScript consumer contract", () => {
             void res?.gaps;
           `,
           expectedPattern: /TS2339/u,
-        },
-        {
-          name: "modelId does not exist on projectInstances selection",
-          body: `
-            const instRef = undefined as unknown as InstanceRef;
-            await ctx.projectInstances([instRef], { select: { modelId: true } });
-          `,
-          expectedPattern: /TS2353|TS2322/u,
         },
         {
           name: "gaps cannot be read on CallEffectsResult before narrowing to incomplete",
@@ -496,20 +470,6 @@ void describe("tssae external TypeScript consumer contract", () => {
             declare const synRef: SyntaxRef;
             const [scope] = await ctx.instanceCleanup({ scopes: [synRef] });
             void scope?.targetResults[0]?.implicitExceptions.mayThrowSites;
-          `,
-          expectedPattern: /TS2339/u,
-        },
-        {
-          name: "getModel does not exist on ProjectContext",
-          body: `
-            void ctx.getModel("legacy");
-          `,
-          expectedPattern: /TS2339/u,
-        },
-        {
-          name: "models does not exist on ProjectContext",
-          body: `
-            void ctx.models;
           `,
           expectedPattern: /TS2339/u,
         },

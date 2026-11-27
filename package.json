@@ -15,7 +15,7 @@
     "perf": "TSSAE_PERF_CWD=\"${INIT_CWD:-$PWD}\" turbo run @tssae/acceptance#perf --",
     "boundaries": "turbo boundaries",
     "toolchain:prepare": "cargo --version",
-    "publication:pack": "node --conditions=source scripts/publication-pack.ts",
+    "publication:pack": "rm -rf .changeset/packed && mkdir -p .changeset/packed && turbo run build && changeset pack --out-dir .changeset/packed",
     "publication:publish": "changeset publish --from-pack-dir .changeset/packed"
   },
   "devDependencies": {

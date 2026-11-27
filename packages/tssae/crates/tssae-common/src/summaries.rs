@@ -293,8 +293,6 @@ pub struct EffectAspectSummary {
     pub completeness: SummaryCompleteness,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_ops: Vec<ResourceOpSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutates_receiver: Option<bool>,
 }
 
 /// Single entry inside a [`BehaviorSummaryPack`].

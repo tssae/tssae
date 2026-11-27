@@ -1651,4 +1651,151 @@ void describe("tssae call-effects and instanceCleanup", () => {
       },
     );
   });
+
+  void it("honors calls summary precedence over source body, emits summary evidence, and marks partial calls summaries incomplete", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-summary-precedence",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/index.ts": [
+            "const state = { bodyWritten: 0, callbackWritten: 0, partialBodyWritten: 0 };",
+            "function overrideTarget(): void {",
+            "  state.bodyWritten = 1;",
+            "}",
+            "function partialTarget(cb: () => void): void {",
+            "  state.partialBodyWritten = 3;",
+            "  cb();",
+            "}",
+            "export function callCompleteOverride(): void {",
+            "  overrideTarget();",
+            "}",
+            "export function callPartialSummary(): void {",
+            "  partialTarget(() => {",
+            "    state.callbackWritten = 2;",
+            "  });",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: {
+            discovery: false,
+            packs: [
+              defineSummaries({
+                id: "calls-override-pack",
+                entries: [
+                  {
+                    id: "override-complete",
+                    match: {
+                      module: "src/index.ts",
+                      memberPath: ["overrideTarget"],
+                    },
+                    calls: {
+                      completeness: "complete",
+                      invokesCallbacks: [],
+                    },
+                  },
+                  {
+                    id: "override-partial",
+                    match: {
+                      module: "src/index.ts",
+                      memberPath: ["partialTarget"],
+                    },
+                    calls: {
+                      completeness: "partial",
+                      invokesCallbacks: [
+                        { callbackArgIndex: 0, timing: "synchronous" },
+                      ],
+                    },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/index.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const completeCaller = fns.find((f) =>
+            f.text.includes("function callCompleteOverride"),
+          );
+          const partialCaller = fns.find((f) =>
+            f.text.includes("function callPartialSummary"),
+          );
+          assert.ok(completeCaller && partialCaller);
+
+          const [completeRes, partialRes] = await ctx.callEffects({
+            targets: [completeCaller.ref, partialCaller.ref],
+            followCallbacks: true,
+            includeWrites: true,
+          });
+          assert.ok(completeRes && partialRes);
+
+          assert.equal(completeRes.completeness, "complete");
+          assert.deepEqual(completeRes.fieldWrites, []);
+          assert.ok(
+            completeRes.evidence.some(
+              (ev) =>
+                ev.kind === "summary" &&
+                ev.summaryId === "calls-override-pack" &&
+                ev.summarySource === "local",
+            ),
+            "expected summary evidence for complete calls override",
+          );
+
+          assert.equal(partialRes.completeness, "incomplete");
+          assert.ok(
+            partialRes.gaps.some((g) => g.kind === "missing-behavior-summary"),
+            "expected missing-behavior-summary gap for partial calls summary",
+          );
+          assert.ok(
+            partialRes.fieldWrites.some(
+              (w) => w.propertyName === "callbackWritten",
+            ),
+            "expected callback field write to be followed from partial calls summary",
+          );
+          assert.ok(
+            !partialRes.fieldWrites.some(
+              (w) => w.propertyName === "partialBodyWritten",
+            ),
+            "expected partial calls summary to take precedence over callee body",
+          );
+          assert.ok(
+            partialRes.evidence.some(
+              (ev) =>
+                ev.kind === "summary" &&
+                ev.summaryId === "calls-override-pack" &&
+                ev.summarySource === "local",
+            ),
+            "expected summary evidence for partial calls summary",
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

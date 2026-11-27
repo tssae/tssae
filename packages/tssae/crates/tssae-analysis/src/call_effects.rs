@@ -3,8 +3,9 @@ use std::{collections::VecDeque, sync::Arc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_common::{
     BranchId, CallbackTiming, DiagnosticLocation, EvidenceItem, FileId, ForwardCallTarget,
-    FunctionIrId, GapItem, SemanticModel, SummaryConflictError, SummaryThisArg, SymbolId,
-    SyntaxCatalog, SyntaxId, UnknownReason, ValueId, VertexId,
+    FunctionIrId, GapItem, SemanticModel, SummaryCompleteness, SummaryConflictError,
+    SummaryTargetMatcher, SummaryThisArg, SymbolId, SyntaxCatalog, SyntaxId, UnknownReason,
+    ValueId, VertexId,
 };
 
 use crate::{
@@ -742,6 +743,34 @@ impl CallEffectsAnalyzer<'_> {
         }
         if let Some(matched) = summary_match {
             self.semantic.record_summary_lookup(Some(matched.source));
+            let target_label = format_summary_target_label(&matched.matcher);
+            push_unique_evidence(
+                &mut out.evidence,
+                EvidenceItem::summary(
+                    format!(
+                        "Applied {} behavior summary '{}' for '{target_label}'.",
+                        matched.source.as_str(),
+                        matched.pack_id
+                    ),
+                    call_loc.clone(),
+                    matched.source.as_str().to_string(),
+                    matched.pack_id.clone(),
+                    Some(target_label),
+                ),
+            );
+            if matched.aspect.completeness == SummaryCompleteness::Partial {
+                push_unique_gap(
+                    &mut out.gaps,
+                    GapItem::from_reason(
+                        UnknownReason::MissingBehaviorSummary,
+                        format!(
+                            "Behavior summary '{}' declares partial 'calls' coverage; additional call effects may occur.",
+                            matched.pack_id
+                        ),
+                        call_loc.clone(),
+                    ),
+                );
+            }
             if let Some(fwd) = &matched.aspect.forwards_call {
                 let target_val = match fwd.target {
                     ForwardCallTarget::Receiver(_) => receiver,
@@ -787,53 +816,53 @@ impl CallEffectsAnalyzer<'_> {
                         out,
                     );
                 }
-                return;
+                if self.conflict.is_some() {
+                    return;
+                }
             }
-            if !matched.aspect.invokes_callbacks.is_empty() {
-                if self.options.follow_callbacks {
-                    for cb_spec in &matched.aspect.invokes_callbacks {
-                        if matches!(cb_spec.timing, CallbackTiming::Deferred) {
-                            // Keep summary callback traversal aligned with synchronous/explicitly followed callbacks.
+            if !matched.aspect.invokes_callbacks.is_empty() && self.options.follow_callbacks {
+                for cb_spec in &matched.aspect.invokes_callbacks {
+                    if matches!(cb_spec.timing, CallbackTiming::Deferred) {
+                        // Keep summary callback traversal aligned with synchronous/explicitly followed callbacks.
+                    }
+                    if let Some(arg) = args.get(cb_spec.callback_arg_index) {
+                        let arg_val = arg_value_id(*arg);
+                        let arg_syn = resolve_value_syntax(
+                            caller_ir,
+                            arg_val,
+                            Some(call_vertex.id),
+                            self.syntax,
+                        );
+                        let mut cb_gaps = Vec::new();
+                        let cb_targets = self.resolve_value_callables(
+                            caller_ir,
+                            arg_val,
+                            Some(call_vertex.id),
+                            call_stack,
+                            arg_syn,
+                            &mut cb_gaps,
+                        );
+                        for g in cb_gaps {
+                            push_unique_gap(&mut out.gaps, g);
                         }
-                        if let Some(arg) = args.get(cb_spec.callback_arg_index) {
-                            let arg_val = arg_value_id(*arg);
-                            let arg_syn = resolve_value_syntax(
-                                caller_ir,
-                                arg_val,
-                                Some(call_vertex.id),
-                                self.syntax,
-                            );
-                            let mut cb_gaps = Vec::new();
-                            let cb_targets = self.resolve_value_callables(
-                                caller_ir,
-                                arg_val,
-                                Some(call_vertex.id),
-                                call_stack,
-                                arg_syn,
-                                &mut cb_gaps,
-                            );
-                            for g in cb_gaps {
-                                push_unique_gap(&mut out.gaps, g);
-                            }
-                            self.enter_resolved_targets(
-                                caller_ir,
-                                call_syntax,
-                                call_loc.as_ref(),
-                                None,
-                                &[],
-                                &cb_targets,
-                                call_stack,
-                                depth,
-                                via_call,
-                                chain_evidence,
-                                visited,
-                                out,
-                            );
-                        }
+                        self.enter_resolved_targets(
+                            caller_ir,
+                            call_syntax,
+                            call_loc.as_ref(),
+                            None,
+                            &[],
+                            &cb_targets,
+                            call_stack,
+                            depth,
+                            via_call,
+                            chain_evidence,
+                            visited,
+                            out,
+                        );
                     }
                 }
-                return;
             }
+            return;
         }
 
         // 3. Resolve static targets via `call_resolution` + local closure/object-method resolution.
@@ -1854,6 +1883,17 @@ fn push_unique_gap(gaps: &mut Vec<GapItem>, gap: GapItem) {
 fn push_unique_evidence(evidence: &mut Vec<EvidenceItem>, item: EvidenceItem) {
     if !evidence.contains(&item) {
         evidence.push(item);
+    }
+}
+
+fn format_summary_target_label(matcher: &SummaryTargetMatcher) -> String {
+    let member = matcher.member_path.join(".");
+    if let Some(pkg) = &matcher.package {
+        format!("{pkg}:{member}")
+    } else if let Some(module) = &matcher.module {
+        format!("{module}:{member}")
+    } else {
+        member
     }
 }
 

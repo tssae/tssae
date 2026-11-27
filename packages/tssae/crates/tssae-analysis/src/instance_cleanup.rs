@@ -1036,7 +1036,6 @@ impl CleanupAnalyzer<'_> {
                                         tssae_common::ForwardCallReceiver::Receiver,
                                     ),
                                 }],
-                                mutates_receiver: Some(true),
                             },
                         });
                     }
@@ -3546,7 +3545,6 @@ mod tests {
                         resource_ops: vec![ResourceOpSpec::DisposesTarget {
                             target: SummarySlotRef::Arg { arg_index: 0 },
                         }],
-                        mutates_receiver: None,
                     }),
                 },
             ],

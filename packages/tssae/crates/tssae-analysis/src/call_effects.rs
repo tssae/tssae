@@ -925,8 +925,8 @@ impl CallEffectsAnalyzer<'_> {
                 && let Ok(callee_ir) = self.ir_provider.function_ir(fn_syn)
             {
                 targets.push(ResolvedCalleeTarget {
+                    captured_stack: self.captured_stack_for_static_callee(&callee_ir, call_stack),
                     callee_ir,
-                    captured_stack: call_stack.to_vec(),
                     decl_override: Some((t.declaration_syntax, t.symbol)),
                 });
             }
@@ -1073,8 +1073,8 @@ impl CallEffectsAnalyzer<'_> {
                 && let Ok(callee_ir) = self.ir_provider.function_ir(fn_syn)
             {
                 targets.push(ResolvedCalleeTarget {
+                    captured_stack: self.captured_stack_for_static_callee(&callee_ir, call_stack),
                     callee_ir,
-                    captured_stack: call_stack.to_vec(),
                     decl_override: Some((t.declaration_syntax, t.symbol)),
                 });
             }
@@ -1117,6 +1117,54 @@ impl CallEffectsAnalyzer<'_> {
             return (targets, trace_gaps);
         }
         (targets, resolution.gaps)
+    }
+
+    fn captured_stack_for_static_callee(
+        &self,
+        callee_ir: &Arc<FunctionIr>,
+        call_stack: &[EffectFrame],
+    ) -> Vec<EffectFrame> {
+        if call_stack.is_empty() {
+            return Vec::new();
+        }
+        let mut max_match_idx: Option<usize> = None;
+        for v in &callee_ir.vertices {
+            let sym_syn = match v.op {
+                IrOp::ReadSymbol { ident_syntax } => Some(ident_syntax),
+                IrOp::AssignSymbol { target_syntax, .. } => Some(target_syntax),
+                _ => None,
+            };
+            let Some(syn) = sym_syn else {
+                continue;
+            };
+            let Some(decl_syn) = self
+                .semantic
+                .resolve_declaration(syn)
+                .and_then(|d| d.primary_syntax)
+            else {
+                continue;
+            };
+            let Ok(decl_ir) = self.ir_provider.enclosing_scope_ir(decl_syn) else {
+                continue;
+            };
+            if decl_ir.scope_kind == IrScopeKind::ModuleTopLevel || decl_ir.id == callee_ir.id {
+                continue;
+            }
+            if let Some(idx) = call_stack
+                .iter()
+                .rposition(|f| f.callee_ir.id == decl_ir.id || f.caller_ir.id == decl_ir.id)
+            {
+                max_match_idx = Some(max_match_idx.map_or(idx, |prev| prev.max(idx)));
+            }
+        }
+        let Some(end_idx) = max_match_idx else {
+            return Vec::new();
+        };
+        call_stack[..=end_idx]
+            .iter()
+            .filter(|f| f.callee_ir.id != callee_ir.id)
+            .cloned()
+            .collect()
     }
 
     fn collect_value_allowed_files(

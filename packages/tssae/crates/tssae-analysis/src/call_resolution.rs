@@ -4276,9 +4276,11 @@ fn mark_escaped_syntax(
     syn: SyntaxId,
     semantic: &dyn SemanticModel,
     graph: &mut IrCallGraph,
+    seen_syntaxes: &mut FxHashSet<SyntaxId>,
     resolved_syms: &mut FxHashSet<SymbolId>,
 ) {
-    if !graph.escaped_decls.insert(syn) {
+    graph.escaped_decls.insert(syn);
+    if !seen_syntaxes.insert(syn) {
         return;
     }
     if let Some(sym) = semantic.symbol_at_syntax(syn) {
@@ -4510,11 +4512,18 @@ fn collect_escaped_callables_in_file(
     graph: &mut IrCallGraph,
 ) {
     let mut exported_names: FxHashSet<String> = FxHashSet::default();
+    let mut seen_syntaxes: FxHashSet<SyntaxId> = FxHashSet::default();
     let mut resolved_syms: FxHashSet<SymbolId> = FxHashSet::default();
 
     for scope_ir in scopes {
         if scope_ir.decl_semantics.is_exported || scope_ir.decl_semantics.is_default_export {
-            mark_escaped_syntax(scope_ir.root_syntax, semantic, graph, &mut resolved_syms);
+            mark_escaped_syntax(
+                scope_ir.root_syntax,
+                semantic,
+                graph,
+                &mut seen_syntaxes,
+                &mut resolved_syms,
+            );
         }
 
         if scope_ir.scope_kind == IrScopeKind::ModuleTopLevel {
@@ -4542,26 +4551,46 @@ fn collect_escaped_callables_in_file(
             match &v.op {
                 IrOp::FunctionLiteral { syntax: fn_syn, .. }
                 | IrOp::ClassLiteral { syntax: fn_syn } => {
-                    mark_escaped_syntax(*fn_syn, semantic, graph, &mut resolved_syms);
+                    mark_escaped_syntax(
+                        *fn_syn,
+                        semantic,
+                        graph,
+                        &mut seen_syntaxes,
+                        &mut resolved_syms,
+                    );
                 }
                 IrOp::ReadLocal { binding } => {
                     if let Some(b) = scope_ir.bindings.get(binding.0 as usize) {
-                        graph.escaped_decls.insert(b.syntax);
                         if let Some(sym) = b.symbol {
                             graph.escaped_symbols.insert(sym);
-                            if !resolved_syms.insert(sym) {
-                                continue;
-                            }
                         }
-                        mark_escaped_syntax(b.syntax, semantic, graph, &mut resolved_syms);
+                        mark_escaped_syntax(
+                            b.syntax,
+                            semantic,
+                            graph,
+                            &mut seen_syntaxes,
+                            &mut resolved_syms,
+                        );
                     }
                 }
                 IrOp::ReadSymbol { ident_syntax } => {
-                    mark_escaped_syntax(*ident_syntax, semantic, graph, &mut resolved_syms);
+                    mark_escaped_syntax(
+                        *ident_syntax,
+                        semantic,
+                        graph,
+                        &mut seen_syntaxes,
+                        &mut resolved_syms,
+                    );
                 }
                 IrOp::PropRead { .. } => {
                     if let Some(prop_syn) = v.syntax {
-                        mark_escaped_syntax(prop_syn, semantic, graph, &mut resolved_syms);
+                        mark_escaped_syntax(
+                            prop_syn,
+                            semantic,
+                            graph,
+                            &mut seen_syntaxes,
+                            &mut resolved_syms,
+                        );
                     }
                 }
                 _ => {}
@@ -4570,25 +4599,48 @@ fn collect_escaped_callables_in_file(
     }
 
     if !exported_names.is_empty() {
-        for scope_ir in scopes {
-            if scope_ir.scope_kind == IrScopeKind::ModuleTopLevel {
-                for b in &scope_ir.bindings {
-                    if exported_names.contains(&b.name) {
-                        graph.escaped_decls.insert(b.syntax);
-                        if let Some(sym) = b.symbol {
-                            graph.escaped_symbols.insert(sym);
-                        }
-                        mark_escaped_syntax(b.syntax, semantic, graph, &mut resolved_syms);
+        mark_exported_names_escaped(
+            scopes,
+            &exported_names,
+            semantic,
+            graph,
+            &mut seen_syntaxes,
+            &mut resolved_syms,
+        );
+    }
+}
+
+fn mark_exported_names_escaped(
+    scopes: &[Arc<FunctionIr>],
+    exported_names: &FxHashSet<String>,
+    semantic: &dyn SemanticModel,
+    graph: &mut IrCallGraph,
+    seen_syntaxes: &mut FxHashSet<SyntaxId>,
+    resolved_syms: &mut FxHashSet<SymbolId>,
+) {
+    for scope_ir in scopes {
+        if scope_ir.scope_kind == IrScopeKind::ModuleTopLevel {
+            for b in &scope_ir.bindings {
+                if exported_names.contains(&b.name) {
+                    if let Some(sym) = b.symbol {
+                        graph.escaped_symbols.insert(sym);
                     }
+                    mark_escaped_syntax(b.syntax, semantic, graph, seen_syntaxes, resolved_syms);
                 }
-            } else if let Some(decl) = semantic.resolve_declaration(scope_ir.root_syntax)
-                && decl
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| exported_names.contains(n))
-            {
-                mark_escaped_syntax(scope_ir.root_syntax, semantic, graph, &mut resolved_syms);
             }
+        } else if let Some(decl) = semantic.resolve_declaration(scope_ir.root_syntax)
+            && decl
+                .name
+                .as_deref()
+                .is_some_and(|n| exported_names.contains(n))
+        {
+            mark_escaped_syntax(
+                scope_ir.root_syntax,
+                semantic,
+                graph,
+                seen_syntaxes,
+                resolved_syms,
+            );
         }
     }
 }

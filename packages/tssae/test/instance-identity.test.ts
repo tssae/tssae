@@ -922,4 +922,179 @@ void describe("tssae instance identity", () => {
       },
     );
   });
+
+  void it("does not poison snapshot call graph cache when valuePropagation runs with lookupFiles, and handles recursive member-access/AssignSymbol", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-value-prop-fixes",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/a.ts": [
+            "export function forwardA(x: string): string {",
+            "  return x;",
+            "}",
+            "export function callA(): string {",
+            '  return forwardA("fromA");',
+            "}",
+            "",
+            "let _keepObserved: unknown;",
+            "export function setKeepObserved(v: unknown): void {",
+            "  _keepObserved = v;",
+            "}",
+            "",
+            "interface TreeNode { child?: TreeNode; }",
+            "function numberHash(_obj: TreeNode, h: number): number {",
+            "  return h;",
+            "}",
+            "export function doHash(obj: TreeNode, hashVal: number): number {",
+            "  if (obj.child) {",
+            "    return doHash(obj.child, hashVal);",
+            "  }",
+            "  return numberHash(obj, hashVal);",
+            "}",
+            "",
+            "export interface Win {",
+            "  parent: Win;",
+            "  get location(): string;",
+            "}",
+            "export function getParentWindowLocation(w: Win): string {",
+            "  let cur = w;",
+            "  for (let i = 0; i < 3; i++) {",
+            "    cur = cur.parent;",
+            "  }",
+            "  const parentLocation = cur.parent.location;",
+            "  return parentLocation;",
+            "}",
+            "",
+          ].join("\n"),
+          "src/b.ts": [
+            'import { forwardA } from "./a.js";',
+            "export function callB(): string {",
+            '  const outB = forwardA("fromB");',
+            "  return outB;",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+
+          // 1. lookupFiles valuePropagation must NOT poison snapshot.ir_call_graph_cache.
+          const aParams = await ctx.findSyntax({
+            files: ["src/a.ts"],
+            kinds: ["Parameter"],
+          });
+          const aDecls = await ctx.findSyntax({
+            files: ["src/a.ts"],
+            kinds: ["VariableDeclaration"],
+          });
+          const aCalls = await ctx.findSyntax({
+            files: ["src/a.ts"],
+            kinds: ["CallExpression"],
+          });
+          const bDecls = await ctx.findSyntax({
+            files: ["src/b.ts"],
+            kinds: ["VariableDeclaration"],
+          });
+          const xParam = aParams.find((p) => p.text.startsWith("x:"));
+          const callAForward = aCalls.find((c) =>
+            c.text.includes('forwardA("fromA")'),
+          );
+          const outBDecl = bDecls.find((d) => d.text.startsWith("outB"));
+          assert.ok(xParam && callAForward && outBDecl);
+
+          const scopedProp = await ctx.valuePropagation({
+            from: xParam.ref,
+            to: [callAForward.ref],
+            lookupFiles: ["src/a.ts"],
+          });
+          assert.equal(scopedProp.results[0]?.status, "proved");
+
+          const fullProp = await ctx.valuePropagation({
+            from: xParam.ref,
+            to: [outBDecl.ref],
+          });
+          assert.equal(fullProp.results[0]?.status, "proved");
+
+          // 2. AssignSymbol against module-level VariableDeclaration target.
+          const vParam = aParams.find((p) => p.text.startsWith("v:"));
+          const keepDecl = aDecls.find((d) =>
+            d.text.startsWith("_keepObserved"),
+          );
+          assert.ok(vParam && keepDecl);
+
+          const assignSymProp = await ctx.valuePropagation({
+            from: vParam.ref,
+            to: [keepDecl.ref],
+            lookupFiles: ["src/a.ts"],
+          });
+          assert.equal(assignSymProp.results[0]?.status, "proved");
+
+          // 3. Recursive doHash(obj) finds 1-step sibling numberHash(obj, hashVal) via FIFO BFS.
+          const objParam = aParams.find((p) => p.text.startsWith("obj:"));
+          const hashArgReads = await ctx.findSyntax({
+            files: ["src/a.ts"],
+            kinds: ["Identifier"],
+          });
+          const numHashCall = aCalls.find((c) =>
+            c.text.includes("numberHash(obj"),
+          );
+          assert.ok(objParam && numHashCall);
+          const numHashObjArg = hashArgReads.find(
+            (id) =>
+              id.text === "obj" &&
+              id.location.line === numHashCall.location.line &&
+              id.location.column > numHashCall.location.column,
+          );
+          assert.ok(numHashObjArg);
+
+          const hashProp = await ctx.valuePropagation({
+            from: objParam.ref,
+            to: [numHashObjArg.ref],
+            includeMemberAccess: true,
+            lookupFiles: ["src/a.ts"],
+          });
+          assert.equal(hashProp.results[0]?.status, "proved");
+
+          // 4. Self-recursive w = w.parent converges cleanly and reaches external getter `location` as inconclusive (not disproved).
+          const wParam = aParams.find((p) => p.text.startsWith("w:"));
+          const parentLocDecl = aDecls.find((d) =>
+            d.text.startsWith("parentLocation"),
+          );
+          assert.ok(wParam && parentLocDecl);
+
+          const parentLocProp = await ctx.valuePropagation({
+            from: wParam.ref,
+            to: [parentLocDecl.ref],
+            includeMemberAccess: true,
+            lookupFiles: ["src/a.ts"],
+          });
+          assert.notEqual(parentLocProp.results[0]?.status, "disproved");
+          assert.equal(parentLocProp.results[0]?.status, "inconclusive");
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

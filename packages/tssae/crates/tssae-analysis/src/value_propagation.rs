@@ -29,6 +29,42 @@ use crate::{
 const MAX_PROP_STATES: usize = 8192;
 const MAX_CALL_STACK_DEPTH: usize = 16;
 const MAX_PATHS_PER_PAIR: usize = 8;
+const MAX_FIELD_PATH_DEPTH: usize = 8;
+
+#[derive(Default)]
+struct DualQueue {
+    untainted: VecDeque<TraceItem>,
+    tainted: VecDeque<TraceItem>,
+    hit_state_budget: Option<DiagnosticLocation>,
+}
+
+impl DualQueue {
+    fn pop_next(&mut self) -> Option<TraceItem> {
+        self.untainted
+            .pop_front()
+            .or_else(|| self.tainted.pop_front())
+    }
+
+    fn record_budget_hit(&mut self, loc: Option<DiagnosticLocation>) {
+        if self.hit_state_budget.is_none() {
+            self.hit_state_budget = loc;
+        }
+    }
+}
+
+fn push_field_segment(
+    queue: &mut DualQueue,
+    fields: &mut ValueFieldState,
+    seg: FieldSegment,
+    loc: Option<DiagnosticLocation>,
+) -> bool {
+    if fields.field_path.len() >= MAX_FIELD_PATH_DEPTH {
+        queue.record_budget_hit(loc);
+        return false;
+    }
+    fields.field_path.push(seg);
+    true
+}
 
 /// Endpoint handle and optional canonical symbol passed into [`trace_value_propagation`].
 #[derive(Clone, Copy, Debug)]
@@ -891,13 +927,13 @@ impl PropagationEngine<'_> {
         self.target_evidence.iter_mut().for_each(Vec::clear);
 
         let from_loc = self.syntax.syntax_location(from_spec.syntax);
-        let mut queue = VecDeque::new();
+        let mut queue = DualQueue::default();
         let mut visited = FxHashSet::default();
         let mut untainted_visited = FxHashSet::default();
 
         self.seed_from_endpoint(from_spec, &mut queue, &mut visited, &mut untainted_visited);
 
-        while let Some(item) = queue.pop_front() {
+        while let Some(item) = queue.pop_next() {
             if self.conflict.is_some() {
                 break;
             }
@@ -922,11 +958,22 @@ impl PropagationEngine<'_> {
                     }
                 }
                 outcomes.push(ValuePropagationTargetOutcome::Proved { paths, evidence });
-            } else if !gap_set.is_empty() {
-                let gaps: Vec<GapItem> = gap_set
+            } else if !gap_set.is_empty() || queue.hit_state_budget.is_some() {
+                let mut gaps: Vec<GapItem> = gap_set
                     .into_iter()
                     .filter_map(|gi| self.all_gaps.get(gi).cloned())
                     .collect();
+                if let Some(budget_loc) = &queue.hit_state_budget {
+                    let budget_gap = GapItem::from_reason(
+                        UnknownReason::UnmodeledConstruct,
+                        "Value propagation exceeded state exploration budget before exhausting all paths."
+                            .to_string(),
+                        Some(budget_loc.clone()),
+                    );
+                    if !gaps.contains(&budget_gap) {
+                        gaps.push(budget_gap);
+                    }
+                }
                 let mut evidence = Vec::new();
                 if let Some(loc) = &from_loc {
                     evidence.push(EvidenceItem::simple(
@@ -974,7 +1021,7 @@ impl PropagationEngine<'_> {
     }
 
     fn enqueue(
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -984,9 +1031,6 @@ impl PropagationEngine<'_> {
         )>,
         item: TraceItem,
     ) {
-        if visited.len() >= MAX_PROP_STATES {
-            return;
-        }
         let is_tainted = !item.gap_indices.is_empty();
         let stack_keys: Vec<CallFrameKey> = item.stack.iter().map(CallFrameData::key).collect();
         if is_tainted
@@ -1006,15 +1050,23 @@ impl PropagationEngine<'_> {
             stack: stack_keys.clone(),
             is_gap_tainted: is_tainted,
         };
-        if visited.insert(key) {
-            if !is_tainted {
-                untainted_visited.insert((item.ir.id, item.node, item.fields.clone(), stack_keys));
-            }
-            if is_tainted {
-                queue.push_back(item);
-            } else {
-                queue.push_front(item);
-            }
+        if visited.contains(&key) {
+            return;
+        }
+        if visited.len() >= MAX_PROP_STATES {
+            queue.record_budget_hit(
+                item.location
+                    .clone()
+                    .or_else(|| Some(item.ir.scope_location.clone())),
+            );
+            return;
+        }
+        visited.insert(key);
+        if is_tainted {
+            queue.tainted.push_back(item);
+        } else {
+            untainted_visited.insert((item.ir.id, item.node, item.fields.clone(), stack_keys));
+            queue.untainted.push_back(item);
         }
     }
 
@@ -1023,7 +1075,7 @@ impl PropagationEngine<'_> {
         reason = "Queues one propagation step with optional step record, summary evidence, and gap indices."
     )]
     fn enqueue_transition(
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1082,7 +1134,7 @@ impl PropagationEngine<'_> {
     fn seed_from_endpoint(
         &mut self,
         from_spec: ValueEndpointSpec,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1193,7 +1245,7 @@ impl PropagationEngine<'_> {
         from_ir: &Arc<FunctionIr>,
         from_loc: Option<DiagnosticLocation>,
         primary_syn: Option<SyntaxId>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1319,7 +1371,7 @@ impl PropagationEngine<'_> {
         ir: &Arc<FunctionIr>,
         binding: LocalBindingId,
         from_loc: Option<DiagnosticLocation>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1431,6 +1483,25 @@ impl PropagationEngine<'_> {
                             || target.binding_syntax == Some(b_info.syntax)
                             || (target.symbol.is_some()
                                 && self.semantic.symbol_at_syntax(b_info.syntax) == target.symbol)
+                    } else if target.is_decl_target
+                        && let IrOp::AssignSymbol {
+                            target_syntax,
+                            op: AssignOp::Assign,
+                            ..
+                        } = v.op
+                    {
+                        let decl = self.semantic.resolve_declaration(target_syntax);
+                        let decl_syn = decl.as_ref().and_then(|d| d.primary_syntax);
+                        let sym = self
+                            .semantic
+                            .symbol_at_syntax(target_syntax)
+                            .or_else(|| decl.as_ref().and_then(|d| d.symbol));
+                        target_syntax == target.syntax
+                            || target.binding_syntax == Some(target_syntax)
+                            || decl_syn.is_some_and(|ds| {
+                                ds == target.syntax || target.binding_syntax == Some(ds)
+                            })
+                            || (target.symbol.is_some() && sym == target.symbol)
                     } else {
                         false
                     }
@@ -1475,7 +1546,7 @@ impl PropagationEngine<'_> {
     fn expand_item(
         &mut self,
         item: &TraceItem,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1565,7 +1636,7 @@ impl PropagationEngine<'_> {
         idx: &IrValueIndex,
         vid: VertexId,
         role: UseRole,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -1936,7 +2007,25 @@ impl PropagationEngine<'_> {
                     && !item.fields.omitted_properties.contains(&prop_name)
                 {
                     let mut next_fields = item.fields.clone();
-                    next_fields.source_path.push(prop_name.clone());
+                    let mut next_gaps = item.gap_indices.clone();
+                    let sp_len = next_fields.source_path.len();
+                    let repeats_tail = sp_len >= 2
+                        && next_fields.source_path[sp_len - 1] == prop_name
+                        && next_fields.source_path[sp_len - 2] == prop_name;
+                    if repeats_tail {
+                        // Collapse consecutive self-recursive property cycles (`w = w.parent`).
+                    } else if sp_len >= MAX_FIELD_PATH_DEPTH {
+                        let gap_idx = self.record_gap(GapItem::from_reason(
+                            UnknownReason::UnmodeledConstruct,
+                            format!(
+                                "Member-access path depth exceeded limit ({MAX_FIELD_PATH_DEPTH}) at '.{prop_name}'."
+                            ),
+                            v_loc.clone(),
+                        ));
+                        next_gaps.insert(gap_idx);
+                    } else {
+                        next_fields.source_path.push(prop_name.clone());
+                    }
                     next_fields.omitted_properties.clear();
                     let step_kind = if v.syntax.and_then(|s| self.syntax.syntax_kind(s)).as_deref()
                         == Some("BindingElement")
@@ -1962,7 +2051,7 @@ impl PropagationEngine<'_> {
                         item.stack.clone(),
                         Some((step_kind, desc, Some(prop_name), None)),
                         None,
-                        item.gap_indices.clone(),
+                        next_gaps,
                     );
                 }
             }
@@ -2074,9 +2163,14 @@ impl PropagationEngine<'_> {
                     return;
                 }
                 let mut next_fields = item.fields.clone();
-                next_fields
-                    .field_path
-                    .push(FieldSegment::Prop(prop_name.clone()));
+                if !push_field_segment(
+                    queue,
+                    &mut next_fields,
+                    FieldSegment::Prop(prop_name.clone()),
+                    v_loc.clone().or_else(|| Some(ir.scope_location.clone())),
+                ) {
+                    return;
+                }
                 Self::enqueue_transition(
                     queue,
                     visited,
@@ -2153,7 +2247,14 @@ impl PropagationEngine<'_> {
                     .any(|e| matches!(e, IrArrayElem::Spread(_)));
                 let slot_idx = (!seen_spread_before).then_some(elem_index);
                 let mut next_fields = item.fields.clone();
-                next_fields.field_path.push(FieldSegment::Element(slot_idx));
+                if !push_field_segment(
+                    queue,
+                    &mut next_fields,
+                    FieldSegment::Element(slot_idx),
+                    v_loc.clone().or_else(|| Some(ir.scope_location.clone())),
+                ) {
+                    return;
+                }
                 Self::enqueue_transition(
                     queue,
                     visited,
@@ -2421,7 +2522,7 @@ impl PropagationEngine<'_> {
         binding: LocalBindingId,
         fields: &ValueFieldState,
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -2500,7 +2601,7 @@ impl PropagationEngine<'_> {
         base: &TraceItem,
         write_vid: VertexId,
         target_syntax: SyntaxId,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -2604,7 +2705,7 @@ impl PropagationEngine<'_> {
         local_write_check: Option<(LocalBindingId, VertexId)>,
         fields: &ValueFieldState,
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -2778,7 +2879,7 @@ impl PropagationEngine<'_> {
         object_val: ValueId,
         prop_name: Option<&str>,
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -2903,7 +3004,7 @@ impl PropagationEngine<'_> {
         stack: &[CallFrameData],
         prop_name: Option<&str>,
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -2959,7 +3060,7 @@ impl PropagationEngine<'_> {
         item: &TraceItem,
         call_v: &CfgVertex,
         arrival: CallArrivalRole,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -3305,7 +3406,7 @@ impl PropagationEngine<'_> {
         target_name: Option<&str>,
         target_ir: &Arc<FunctionIr>,
         arrival: CallArrivalRole,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -3458,8 +3559,18 @@ impl PropagationEngine<'_> {
                 if has_spread_before {
                     for param in target_ir.parameters.iter().skip(shifted_idx) {
                         let mut next_fields = item.fields.clone();
-                        if param.is_rest {
-                            next_fields.field_path.push(FieldSegment::Element(None));
+                        if param.is_rest
+                            && !push_field_segment(
+                                queue,
+                                &mut next_fields,
+                                FieldSegment::Element(None),
+                                call_v
+                                    .location
+                                    .clone()
+                                    .or_else(|| Some(item.ir.scope_location.clone())),
+                            )
+                        {
+                            continue;
                         }
                         self.bind_into_parameter(
                             item,
@@ -3476,8 +3587,18 @@ impl PropagationEngine<'_> {
                     }
                 } else if let Some(param) = target_ir.parameters.get(shifted_idx) {
                     let mut next_fields = item.fields.clone();
-                    if param.is_rest {
-                        next_fields.field_path.push(FieldSegment::Element(Some(0)));
+                    if param.is_rest
+                        && !push_field_segment(
+                            queue,
+                            &mut next_fields,
+                            FieldSegment::Element(Some(0)),
+                            call_v
+                                .location
+                                .clone()
+                                .or_else(|| Some(item.ir.scope_location.clone())),
+                        )
+                    {
+                        return;
                     }
                     self.bind_into_parameter(
                         item,
@@ -3494,9 +3615,17 @@ impl PropagationEngine<'_> {
                 } else if last_is_rest && let Some(rest_param) = target_ir.parameters.last() {
                     let rest_idx = target_ir.parameters.len() - 1;
                     let mut next_fields = item.fields.clone();
-                    next_fields
-                        .field_path
-                        .push(FieldSegment::Element(Some(shifted_idx - rest_idx)));
+                    if !push_field_segment(
+                        queue,
+                        &mut next_fields,
+                        FieldSegment::Element(Some(shifted_idx - rest_idx)),
+                        call_v
+                            .location
+                            .clone()
+                            .or_else(|| Some(item.ir.scope_location.clone())),
+                    ) {
+                        return;
+                    }
                     self.bind_into_parameter(
                         item,
                         target_ir,
@@ -3528,7 +3657,7 @@ impl PropagationEngine<'_> {
         next_fields: ValueFieldState,
         next_stack: &[CallFrameData],
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -3662,7 +3791,7 @@ impl PropagationEngine<'_> {
         item: &TraceItem,
         call_args: &[IrCallArg],
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -3759,7 +3888,7 @@ impl PropagationEngine<'_> {
         stack: &[CallFrameData],
         sum_ev: Option<&EvidenceItem>,
         gaps: &BTreeSet<usize>,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -3808,7 +3937,17 @@ impl PropagationEngine<'_> {
             }
             SummaryValueRef::Named(SummaryNamedValueRef::ReturnElement) => {
                 if let Some(out_val) = call_v.value {
-                    next_fields.field_path.push(FieldSegment::Element(None));
+                    if !push_field_segment(
+                        queue,
+                        &mut next_fields,
+                        FieldSegment::Element(None),
+                        call_v
+                            .location
+                            .clone()
+                            .or_else(|| Some(call_ir.scope_location.clone())),
+                    ) {
+                        return;
+                    }
                     Self::enqueue_transition(
                         queue,
                         visited,
@@ -3836,8 +3975,16 @@ impl PropagationEngine<'_> {
                 if matches!(
                     target,
                     SummaryValueRef::Named(SummaryNamedValueRef::ReceiverElement)
+                ) && !push_field_segment(
+                    queue,
+                    &mut next_fields,
+                    FieldSegment::Element(None),
+                    call_v
+                        .location
+                        .clone()
+                        .or_else(|| Some(call_ir.scope_location.clone())),
                 ) {
-                    next_fields.field_path.push(FieldSegment::Element(None));
+                    return;
                 }
                 if let Some(recv_val) = call_recv
                     && let Some(recv_b) = resolve_local_binding_of_value(call_ir, recv_val)
@@ -3969,7 +4116,7 @@ impl PropagationEngine<'_> {
         item: &TraceItem,
         cb_param_idx: usize,
         arg_index: usize,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -4058,7 +4205,7 @@ impl PropagationEngine<'_> {
         &mut self,
         item: &TraceItem,
         ret_v: &CfgVertex,
-        queue: &mut VecDeque<TraceItem>,
+        queue: &mut DualQueue,
         visited: &mut FxHashSet<TraceKey>,
         untainted_visited: &mut FxHashSet<(
             FunctionIrId,
@@ -5382,5 +5529,186 @@ mod tests {
             outcome.results[2],
             ValuePropagationTargetOutcome::Disproved { .. }
         ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Constructs > MAX_PROP_STATES synthetic vertices to test state budget exhaustion."
+    )]
+    fn state_budget_exhaustion_reports_inconclusive_never_silent_disproved() {
+        use crate::ir::LiteralKind;
+        let mut env = SyntheticEnv::new();
+        let fn_syn = syn(1);
+        let src_syn = syn(10);
+        let final_syn = syn(11);
+        for s in [fn_syn, src_syn, final_syn] {
+            env.locations.insert(s, loc(s.local_id().0));
+            env.enclosing.insert(s, fn_syn);
+        }
+
+        // Build > MAX_PROP_STATES shallow local copies from `v0` so exploration hits the state budget
+        // without quadratic step-vector cloning.
+        let count = MAX_PROP_STATES + 100;
+        let mut bindings = Vec::with_capacity(count + 1);
+        let mut vertices = vec![
+            mk_vertex(
+                0,
+                None,
+                IrOp::Entry,
+                None,
+                vec![ExplicitEdge {
+                    target: VertexId(4),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+            ),
+            mk_vertex(
+                1,
+                None,
+                IrOp::NopMerge,
+                None,
+                vec![ExplicitEdge {
+                    target: VertexId(3),
+                    kind: ExplicitEdgeKind::ExitMerge,
+                }],
+            ),
+            mk_vertex(2, None, IrOp::NopMerge, None, vec![]),
+            mk_vertex(3, None, IrOp::Exit, None, vec![]),
+        ];
+
+        bindings.push(IrLocalBinding {
+            id: LocalBindingId(0),
+            syntax: src_syn,
+            name: "v0".to_string(),
+            mutability: BindingMutability::Const,
+            symbol: None,
+        });
+        vertices.push(mk_vertex(
+            4,
+            Some(src_syn),
+            IrOp::Literal {
+                kind: LiteralKind::String("seed".to_string()),
+                as_const: false,
+            },
+            Some(ValueId(0)),
+            vec![ExplicitEdge {
+                target: VertexId(5),
+                kind: ExplicitEdgeKind::Fallthrough,
+            }],
+        ));
+
+        let mut next_vid = 5u32;
+        let mut next_val = 1u32;
+        for i in 1..=count {
+            let decl_s = syn(100 + u32::try_from(i).unwrap());
+            env.locations.insert(decl_s, loc(decl_s.local_id().0));
+            env.enclosing.insert(decl_s, fn_syn);
+            let b_id = LocalBindingId(u32::try_from(i).unwrap());
+            bindings.push(IrLocalBinding {
+                id: b_id,
+                syntax: decl_s,
+                name: format!("v{i}"),
+                mutability: BindingMutability::Const,
+                symbol: None,
+            });
+            let assign_vid = next_vid;
+            let read_vid = next_vid + 1;
+            let out_val = ValueId(next_val);
+            next_vid += 2;
+            next_val += 1;
+
+            vertices.push(mk_vertex(
+                assign_vid,
+                Some(decl_s),
+                IrOp::AssignLocal {
+                    target: b_id,
+                    op: AssignOp::Assign,
+                    value: ValueId(0),
+                    is_init: true,
+                },
+                Some(ValueId(0)),
+                vec![ExplicitEdge {
+                    target: VertexId(read_vid),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+            ));
+            let next_target = if i == count {
+                VertexId(1)
+            } else {
+                VertexId(next_vid)
+            };
+            vertices.push(mk_vertex(
+                read_vid,
+                if i == count { Some(final_syn) } else { None },
+                IrOp::ReadLocal { binding: b_id },
+                Some(out_val),
+                vec![ExplicitEdge {
+                    target: next_target,
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+            ));
+        }
+
+        let mut expr_to_value = FxHashMap::default();
+        expr_to_value.insert(src_syn.local_id(), ValueId(0));
+        expr_to_value.insert(final_syn.local_id(), ValueId(next_val - 1));
+
+        let ir = Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: FileId(0),
+                local_scope: 1,
+            },
+            root_syntax: fn_syn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc(1),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: Vec::new(),
+            bindings,
+            captured_bindings: Vec::new(),
+            vertices,
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value,
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: next_val,
+        });
+        env.irs.insert(fn_syn, ir);
+
+        let summaries = BehaviorSummaryIndex::default();
+        let (outcome, _) = trace_value_propagation(
+            &[ValueEndpointSpec {
+                syntax: src_syn,
+                symbol: None,
+            }],
+            &[ValueEndpointSpec {
+                syntax: final_syn,
+                symbol: None,
+            }],
+            false,
+            &[FileId(0)],
+            None::<&HashSet<FileId>>,
+            &env,
+            &env,
+            &env,
+            &summaries,
+            None,
+        );
+
+        match &outcome.results[0] {
+            ValuePropagationTargetOutcome::Inconclusive { gaps, .. } => {
+                assert!(
+                    gaps.iter().any(|g| g.kind == "unmodeled-construct"
+                        && g.message.contains("state exploration budget")),
+                    "expected budget gap, got {gaps:?}"
+                );
+            }
+            other => panic!("expected Inconclusive on budget exhaustion, got {other:?}"),
+        }
     }
 }

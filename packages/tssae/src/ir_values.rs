@@ -304,9 +304,11 @@ pub fn run_value_propagation(
         if let Some(conflict) = &g_arc.conflict {
             return Err(conflict_rpc_err(conflict));
         }
-        snapshot
-            .ir_call_graph_cache
-            .insert(project_id.to_string(), g_arc);
+        if allowed_files.is_none() {
+            snapshot
+                .ir_call_graph_cache
+                .insert(project_id.to_string(), g_arc);
+        }
     }
 
     if let Some(conflict) = &outcome.conflict {

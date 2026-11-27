@@ -2,11 +2,14 @@ use std::{cell::RefCell, collections::HashSet, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_analysis::{
+    call_resolution::build_ir_call_graph_with_summaries,
     instance_cleanup::{
         CleanupScopeSpec, CleanupTargetSpec, TargetCleanupStatusData,
         evaluate_instance_cleanup_on_ir,
     },
-    instance_identity::{InstanceResolutionOutcome, InstanceTargetSpec, resolve_instances_on_ir},
+    instance_identity::{
+        InstanceResolutionOutcome, InstanceTargetSpec, IrFieldWriteIndex, resolve_instances_on_ir,
+    },
     ir::{
         AssignOp, BindingMutability, CfgVertex, DeclarationSemantics, ExplicitEdge,
         ExplicitEdgeKind, FunctionIr, IrCallArg, IrCallKind, IrLocalBinding, IrOp, IrParameter,
@@ -1456,4 +1459,1174 @@ fn lookup_files_never_scans_background_files() {
         cleanup_outcome.results[0].target_results[0].status
     );
     env.assert_no_bg_file_touched(&bg_files);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tests that pre-populated whole-project IrCallGraph and IrFieldWriteIndex respect allowed_files."
+)]
+fn pre_populated_global_caches_respect_lookup_files_scoping() {
+    let mut env = ScopedTestEnv::default();
+
+    let entry_file = FileId(0);
+    let pool_file = FileId(1);
+    let bg_file = FileId(2);
+    let project_files = vec![entry_file, pool_file, bg_file];
+
+    env.file_paths
+        .insert(entry_file, "src/entry.ts".to_string());
+    env.file_paths.insert(pool_file, "src/pool.ts".to_string());
+    env.file_paths.insert(bg_file, "src/bg_0.ts".to_string());
+
+    // Summaries: pool.ts:acquire() and bg_0.ts:bgAcquire() allocate fresh instances;
+    // entry.ts:release(x) disposes arg 0.
+    let pack = BehaviorSummaryPack {
+        id: "test-cache-scoping-pack".to_string(),
+        version: None,
+        description: None,
+        entries: vec![
+            BehaviorSummaryEntry {
+                id: Some("acquire".to_string()),
+                matcher: SummaryTargetMatcher {
+                    package: None,
+                    version: None,
+                    export_path: None,
+                    module: Some("src/pool.ts".to_string()),
+                    member_path: vec!["acquire".to_string()],
+                },
+                description: None,
+                calls: None,
+                values: None,
+                instances: Some(InstanceAspectSummary {
+                    completeness: SummaryCompleteness::Complete,
+                    outcome: InstanceOutcome::AllocatesFreshInstance,
+                }),
+                effects: None,
+            },
+            BehaviorSummaryEntry {
+                id: Some("bgAcquire".to_string()),
+                matcher: SummaryTargetMatcher {
+                    package: None,
+                    version: None,
+                    export_path: None,
+                    module: Some("src/bg_0.ts".to_string()),
+                    member_path: vec!["bgAcquire".to_string()],
+                },
+                description: None,
+                calls: None,
+                values: None,
+                instances: Some(InstanceAspectSummary {
+                    completeness: SummaryCompleteness::Complete,
+                    outcome: InstanceOutcome::AllocatesFreshInstance,
+                }),
+                effects: None,
+            },
+            BehaviorSummaryEntry {
+                id: Some("release".to_string()),
+                matcher: SummaryTargetMatcher {
+                    package: None,
+                    version: None,
+                    export_path: None,
+                    module: Some("src/entry.ts".to_string()),
+                    member_path: vec!["release".to_string()],
+                },
+                description: None,
+                calls: None,
+                values: None,
+                instances: None,
+                effects: Some(EffectAspectSummary {
+                    completeness: SummaryCompleteness::Complete,
+                    resource_ops: vec![ResourceOpSpec::DisposesTarget {
+                        target: SummarySlotRef::Arg { arg_index: 0 },
+                    }],
+                    mutates_receiver: None,
+                }),
+            },
+        ],
+    };
+    let summaries = BehaviorSummaryIndex::from_config(
+        &SummaryConfigPayload {
+            packs: vec![TaggedSummaryPack {
+                source: SummarySource::Local,
+                origin_file: None,
+                pack,
+            }],
+            enable_builtin: false,
+        },
+        &FxHashMap::default(),
+    );
+
+    // pool.ts: export function attachConn(h) { h.conn = acquire(); }
+    let pool_attach_fn = syn(pool_file.0, 1);
+    let pool_h_param = syn(pool_file.0, 2);
+    let pool_h_read = syn(pool_file.0, 3);
+    let pool_acq_callee = syn(pool_file.0, 4);
+    let pool_acq_call = syn(pool_file.0, 5);
+    let pool_prop_write = syn(pool_file.0, 6);
+    let pool_attach_sym = SymbolId(10);
+    let pool_acq_sym = SymbolId(11);
+    for s in [
+        pool_attach_fn,
+        pool_h_param,
+        pool_h_read,
+        pool_acq_callee,
+        pool_acq_call,
+        pool_prop_write,
+    ] {
+        env.locations
+            .insert(s, loc("src/pool.ts", s.local_id().0 * 10));
+        env.enclosing.insert(s, pool_attach_fn);
+    }
+    env.symbols.insert(pool_attach_fn, pool_attach_sym);
+    env.symbols.insert(pool_acq_callee, pool_acq_sym);
+    env.decls.insert(
+        pool_attach_fn,
+        DeclarationSummaryData {
+            symbol: Some(pool_attach_sym),
+            primary_syntax: Some(pool_attach_fn),
+            name: Some("attachConn".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/pool.ts", 10)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(pool_attach_fn),
+        },
+    );
+    env.decls.insert(
+        pool_acq_callee,
+        DeclarationSummaryData {
+            symbol: Some(pool_acq_sym),
+            primary_syntax: Some(pool_acq_callee),
+            name: Some("acquire".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/pool.ts", 40)),
+            is_external: true,
+            is_default_library: false,
+            has_body: false,
+            is_signature_only: true,
+            initializer_syntax: None,
+            callable_syntax: None,
+        },
+    );
+    env.identities.insert(
+        pool_acq_callee,
+        DeclarationIdentity {
+            package_name: None,
+            package_version: None,
+            module_path: Some("src/pool.ts".to_string()),
+            export_path: None,
+            member_paths: vec![vec!["acquire".to_string()]],
+            is_default_library: false,
+            is_instance_member: false,
+        },
+    );
+    env.identities.insert(
+        pool_acq_call,
+        env.identities.get(&pool_acq_callee).unwrap().clone(),
+    );
+    env.irs.insert(
+        pool_attach_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: pool_file,
+                local_scope: 1,
+            },
+            root_syntax: pool_attach_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/pool.ts", 10),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![IrParameter {
+                syntax: pool_h_param,
+                name: "h".to_string(),
+                binding: Some(LocalBindingId(0)),
+                raw_value: None,
+                is_rest: false,
+                has_default: false,
+            }],
+            bindings: vec![IrLocalBinding {
+                id: LocalBindingId(0),
+                syntax: pool_h_param,
+                name: "h".to_string(),
+                mutability: BindingMutability::Parameter,
+                symbol: None,
+            }],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/pool.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/pool.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/pool.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/pool.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(pool_h_read),
+                    "src/pool.ts",
+                    Some(ValueId(0)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(pool_acq_callee),
+                    "src/pool.ts",
+                    Some(ValueId(1)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: pool_acq_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(pool_acq_call),
+                    "src/pool.ts",
+                    Some(ValueId(2)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(1),
+                        receiver: None,
+                        args: vec![],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(pool_prop_write),
+                    "src/pool.ts",
+                    None,
+                    IrOp::PropWrite {
+                        object: ValueId(0),
+                        key: IrPropKey::Named("conn".to_string()),
+                        op: AssignOp::Assign,
+                        value: ValueId(2),
+                        is_super: false,
+                        implicit_call_kind: None,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: std::iter::once((pool_acq_call.local_id(), ValueId(2))).collect(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 3,
+        }),
+    );
+
+    // entry.ts:
+    // - useConn(h) { const c = h.conn; release(c); }
+    // - entryCaller() { const box = {}; attachConn(box); useConn(box); }
+    let entry_use_fn = syn(entry_file.0, 1);
+    let entry_h_param = syn(entry_file.0, 2);
+    let entry_h_read = syn(entry_file.0, 3);
+    let entry_conn_read = syn(entry_file.0, 4);
+    let entry_c_decl = syn(entry_file.0, 5);
+    let entry_rel_callee = syn(entry_file.0, 6);
+    let entry_conn_var_read = syn(entry_file.0, 7);
+    let entry_rel_call = syn(entry_file.0, 8);
+    let entry_use_sym = SymbolId(20);
+    let entry_rel_sym = SymbolId(21);
+    for s in [
+        entry_use_fn,
+        entry_h_param,
+        entry_h_read,
+        entry_conn_read,
+        entry_c_decl,
+        entry_rel_callee,
+        entry_conn_var_read,
+        entry_rel_call,
+    ] {
+        env.locations
+            .insert(s, loc("src/entry.ts", s.local_id().0 * 10));
+        env.enclosing.insert(s, entry_use_fn);
+    }
+    env.symbols.insert(entry_use_fn, entry_use_sym);
+    env.symbols.insert(entry_rel_callee, entry_rel_sym);
+    env.decls.insert(
+        entry_use_fn,
+        DeclarationSummaryData {
+            symbol: Some(entry_use_sym),
+            primary_syntax: Some(entry_use_fn),
+            name: Some("useConn".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/entry.ts", 10)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(entry_use_fn),
+        },
+    );
+    env.decls.insert(
+        entry_rel_callee,
+        DeclarationSummaryData {
+            symbol: Some(entry_rel_sym),
+            primary_syntax: Some(entry_rel_callee),
+            name: Some("release".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/entry.ts", 60)),
+            is_external: true,
+            is_default_library: false,
+            has_body: false,
+            is_signature_only: true,
+            initializer_syntax: None,
+            callable_syntax: None,
+        },
+    );
+    env.identities.insert(
+        entry_rel_callee,
+        DeclarationIdentity {
+            package_name: None,
+            package_version: None,
+            module_path: Some("src/entry.ts".to_string()),
+            export_path: None,
+            member_paths: vec![vec!["release".to_string()]],
+            is_default_library: false,
+            is_instance_member: false,
+        },
+    );
+    env.identities.insert(
+        entry_rel_call,
+        env.identities.get(&entry_rel_callee).unwrap().clone(),
+    );
+    env.irs.insert(
+        entry_use_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: entry_file,
+                local_scope: 1,
+            },
+            root_syntax: entry_use_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/entry.ts", 10),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![IrParameter {
+                syntax: entry_h_param,
+                name: "h".to_string(),
+                binding: Some(LocalBindingId(0)),
+                raw_value: None,
+                is_rest: false,
+                has_default: false,
+            }],
+            bindings: vec![
+                IrLocalBinding {
+                    id: LocalBindingId(0),
+                    syntax: entry_h_param,
+                    name: "h".to_string(),
+                    mutability: BindingMutability::Parameter,
+                    symbol: None,
+                },
+                IrLocalBinding {
+                    id: LocalBindingId(1),
+                    syntax: entry_c_decl,
+                    name: "c".to_string(),
+                    mutability: BindingMutability::Const,
+                    symbol: None,
+                },
+            ],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/entry.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/entry.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(entry_h_read),
+                    "src/entry.ts",
+                    Some(ValueId(0)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(entry_conn_read),
+                    "src/entry.ts",
+                    Some(ValueId(1)),
+                    IrOp::PropRead {
+                        object: ValueId(0),
+                        key: IrPropKey::Named("conn".to_string()),
+                        is_super: false,
+                        implicit_call_kind: None,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(entry_c_decl),
+                    "src/entry.ts",
+                    None,
+                    IrOp::AssignLocal {
+                        target: LocalBindingId(1),
+                        op: AssignOp::Assign,
+                        value: ValueId(1),
+                        is_init: true,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(entry_rel_callee),
+                    "src/entry.ts",
+                    Some(ValueId(2)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: entry_rel_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(8),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    8,
+                    Some(entry_conn_var_read),
+                    "src/entry.ts",
+                    Some(ValueId(3)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(1),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(9),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    9,
+                    Some(entry_rel_call),
+                    "src/entry.ts",
+                    Some(ValueId(4)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(2),
+                        receiver: None,
+                        args: vec![IrCallArg::Positional(ValueId(3))],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: std::iter::once((entry_conn_read.local_id(), ValueId(1))).collect(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 5,
+        }),
+    );
+
+    let entry_caller_fn = syn(entry_file.0, 20);
+    let entry_box_decl = syn(entry_file.0, 21);
+    let entry_box_alloc = syn(entry_file.0, 22);
+    let entry_att_callee = syn(entry_file.0, 23);
+    let entry_box_r1 = syn(entry_file.0, 24);
+    let entry_att_call = syn(entry_file.0, 25);
+    let entry_use_callee = syn(entry_file.0, 26);
+    let entry_box_r2 = syn(entry_file.0, 27);
+    let entry_use_call = syn(entry_file.0, 28);
+    for s in [
+        entry_caller_fn,
+        entry_box_decl,
+        entry_box_alloc,
+        entry_att_callee,
+        entry_box_r1,
+        entry_att_call,
+        entry_use_callee,
+        entry_box_r2,
+        entry_use_call,
+    ] {
+        env.locations
+            .insert(s, loc("src/entry.ts", s.local_id().0 * 10));
+        env.enclosing.insert(s, entry_caller_fn);
+    }
+    env.symbols.insert(entry_att_callee, pool_attach_sym);
+    env.symbols.insert(entry_use_callee, entry_use_sym);
+    env.decls.insert(
+        entry_att_callee,
+        DeclarationSummaryData {
+            symbol: Some(pool_attach_sym),
+            primary_syntax: Some(pool_attach_fn),
+            name: Some("attachConn".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/pool.ts", 10)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(pool_attach_fn),
+        },
+    );
+    env.decls.insert(
+        entry_use_callee,
+        DeclarationSummaryData {
+            symbol: Some(entry_use_sym),
+            primary_syntax: Some(entry_use_fn),
+            name: Some("useConn".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/entry.ts", 10)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(entry_use_fn),
+        },
+    );
+    env.irs.insert(
+        entry_caller_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: entry_file,
+                local_scope: 20,
+            },
+            root_syntax: entry_caller_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/entry.ts", 200),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![],
+            bindings: vec![IrLocalBinding {
+                id: LocalBindingId(0),
+                syntax: entry_box_decl,
+                name: "box".to_string(),
+                mutability: BindingMutability::Const,
+                symbol: None,
+            }],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/entry.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/entry.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/entry.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(entry_box_alloc),
+                    "src/entry.ts",
+                    Some(ValueId(0)),
+                    IrOp::ObjectAlloc {
+                        props: vec![],
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(entry_box_decl),
+                    "src/entry.ts",
+                    None,
+                    IrOp::AssignLocal {
+                        target: LocalBindingId(0),
+                        op: AssignOp::Assign,
+                        value: ValueId(0),
+                        is_init: true,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(entry_att_callee),
+                    "src/entry.ts",
+                    Some(ValueId(1)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: entry_att_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(entry_box_r1),
+                    "src/entry.ts",
+                    Some(ValueId(2)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(8),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    8,
+                    Some(entry_att_call),
+                    "src/entry.ts",
+                    Some(ValueId(3)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(1),
+                        receiver: None,
+                        args: vec![IrCallArg::Positional(ValueId(2))],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(9),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    9,
+                    Some(entry_use_callee),
+                    "src/entry.ts",
+                    Some(ValueId(4)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: entry_use_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(10),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    10,
+                    Some(entry_box_r2),
+                    "src/entry.ts",
+                    Some(ValueId(5)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(11),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    11,
+                    Some(entry_use_call),
+                    "src/entry.ts",
+                    Some(ValueId(6)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(4),
+                        receiver: None,
+                        args: vec![IrCallArg::Positional(ValueId(5))],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 7,
+        }),
+    );
+
+    // bg_0.ts:
+    // - writes `.conn = bgAcquire()` AND calls `useConn(bgBox)` with a separate bgBox!
+    let bg_fn = syn(bg_file.0, 1);
+    let bg_box_decl = syn(bg_file.0, 2);
+    let bg_box_alloc = syn(bg_file.0, 3);
+    let bg_acq_callee = syn(bg_file.0, 4);
+    let bg_acq_call = syn(bg_file.0, 5);
+    let bg_box_r1 = syn(bg_file.0, 6);
+    let bg_prop_write = syn(bg_file.0, 7);
+    let bg_use_callee = syn(bg_file.0, 8);
+    let bg_box_r2 = syn(bg_file.0, 9);
+    let bg_use_call = syn(bg_file.0, 10);
+    let bg_acq_sym = SymbolId(30);
+    for s in [
+        bg_fn,
+        bg_box_decl,
+        bg_box_alloc,
+        bg_acq_callee,
+        bg_acq_call,
+        bg_box_r1,
+        bg_prop_write,
+        bg_use_callee,
+        bg_box_r2,
+        bg_use_call,
+    ] {
+        env.locations
+            .insert(s, loc("src/bg_0.ts", s.local_id().0 * 10));
+        env.enclosing.insert(s, bg_fn);
+    }
+    env.symbols.insert(bg_acq_callee, bg_acq_sym);
+    env.symbols.insert(bg_use_callee, entry_use_sym);
+    env.decls.insert(
+        bg_acq_callee,
+        DeclarationSummaryData {
+            symbol: Some(bg_acq_sym),
+            primary_syntax: Some(bg_acq_callee),
+            name: Some("bgAcquire".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/bg_0.ts", 40)),
+            is_external: true,
+            is_default_library: false,
+            has_body: false,
+            is_signature_only: true,
+            initializer_syntax: None,
+            callable_syntax: None,
+        },
+    );
+    env.identities.insert(
+        bg_acq_callee,
+        DeclarationIdentity {
+            package_name: None,
+            package_version: None,
+            module_path: Some("src/bg_0.ts".to_string()),
+            export_path: None,
+            member_paths: vec![vec!["bgAcquire".to_string()]],
+            is_default_library: false,
+            is_instance_member: false,
+        },
+    );
+    env.identities.insert(
+        bg_acq_call,
+        env.identities.get(&bg_acq_callee).unwrap().clone(),
+    );
+    env.decls.insert(
+        bg_use_callee,
+        DeclarationSummaryData {
+            symbol: Some(entry_use_sym),
+            primary_syntax: Some(entry_use_fn),
+            name: Some("useConn".to_string()),
+            container_name: None,
+            kind: Some("FunctionDeclaration".to_string()),
+            location: Some(loc("src/entry.ts", 10)),
+            is_external: false,
+            is_default_library: false,
+            has_body: true,
+            is_signature_only: false,
+            initializer_syntax: None,
+            callable_syntax: Some(entry_use_fn),
+        },
+    );
+    env.irs.insert(
+        bg_fn,
+        Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: bg_file,
+                local_scope: 1,
+            },
+            root_syntax: bg_fn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc("src/bg_0.ts", 10),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![],
+            bindings: vec![IrLocalBinding {
+                id: LocalBindingId(0),
+                syntax: bg_box_decl,
+                name: "bgBox".to_string(),
+                mutability: BindingMutability::Const,
+                symbol: None,
+            }],
+            captured_bindings: Vec::new(),
+            vertices: vec![
+                mk_vertex(
+                    0,
+                    None,
+                    "src/bg_0.ts",
+                    None,
+                    IrOp::Entry,
+                    vec![ExplicitEdge {
+                        target: VertexId(4),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    1,
+                    None,
+                    "src/bg_0.ts",
+                    None,
+                    IrOp::NopMerge,
+                    vec![ExplicitEdge {
+                        target: VertexId(3),
+                        kind: ExplicitEdgeKind::ExitMerge,
+                    }],
+                ),
+                mk_vertex(2, None, "src/bg_0.ts", None, IrOp::NopMerge, vec![]),
+                mk_vertex(3, None, "src/bg_0.ts", None, IrOp::Exit, vec![]),
+                mk_vertex(
+                    4,
+                    Some(bg_box_alloc),
+                    "src/bg_0.ts",
+                    Some(ValueId(0)),
+                    IrOp::ObjectAlloc {
+                        props: vec![],
+                        as_const: false,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(5),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    5,
+                    Some(bg_box_decl),
+                    "src/bg_0.ts",
+                    None,
+                    IrOp::AssignLocal {
+                        target: LocalBindingId(0),
+                        op: AssignOp::Assign,
+                        value: ValueId(0),
+                        is_init: true,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(6),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    6,
+                    Some(bg_acq_callee),
+                    "src/bg_0.ts",
+                    Some(ValueId(1)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: bg_acq_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(7),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    7,
+                    Some(bg_acq_call),
+                    "src/bg_0.ts",
+                    Some(ValueId(2)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(1),
+                        receiver: None,
+                        args: vec![],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(8),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    8,
+                    Some(bg_box_r1),
+                    "src/bg_0.ts",
+                    Some(ValueId(3)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(9),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    9,
+                    Some(bg_prop_write),
+                    "src/bg_0.ts",
+                    None,
+                    IrOp::PropWrite {
+                        object: ValueId(3),
+                        key: IrPropKey::Named("conn".to_string()),
+                        op: AssignOp::Assign,
+                        value: ValueId(2),
+                        is_super: false,
+                        implicit_call_kind: None,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(10),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    10,
+                    Some(bg_use_callee),
+                    "src/bg_0.ts",
+                    Some(ValueId(4)),
+                    IrOp::ReadSymbol {
+                        ident_syntax: bg_use_callee,
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(11),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    11,
+                    Some(bg_box_r2),
+                    "src/bg_0.ts",
+                    Some(ValueId(5)),
+                    IrOp::ReadLocal {
+                        binding: LocalBindingId(0),
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(12),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+                mk_vertex(
+                    12,
+                    Some(bg_use_call),
+                    "src/bg_0.ts",
+                    Some(ValueId(6)),
+                    IrOp::Call {
+                        call_kind: IrCallKind::Explicit,
+                        callee: ValueId(4),
+                        receiver: None,
+                        args: vec![IrCallArg::Positional(ValueId(5))],
+                    },
+                    vec![ExplicitEdge {
+                        target: VertexId(1),
+                        kind: ExplicitEdgeKind::Fallthrough,
+                    }],
+                ),
+            ],
+            entry: VertexId(0),
+            normal_exit: VertexId(1),
+            exceptional_exit: VertexId(2),
+            exit: VertexId(3),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: std::iter::once((bg_acq_call.local_id(), ValueId(2))).collect(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 7,
+        }),
+    );
+
+    env.scopes_by_file.insert(
+        pool_file,
+        vec![scope_entry(pool_attach_fn, IrScopeKind::Function, 10, 80)],
+    );
+    env.scopes_by_file.insert(
+        entry_file,
+        vec![
+            scope_entry(entry_use_fn, IrScopeKind::Function, 10, 95),
+            scope_entry(entry_caller_fn, IrScopeKind::Function, 200, 290),
+        ],
+    );
+    env.scopes_by_file.insert(
+        bg_file,
+        vec![scope_entry(bg_fn, IrScopeKind::Function, 10, 120)],
+    );
+
+    // Pre-populate whole-project IrCallGraph and IrFieldWriteIndex containing bg_0.ts!
+    let cached_call_graph =
+        build_ir_call_graph_with_summaries(&project_files, &env, &env, &env, &summaries);
+    let cached_field_index = IrFieldWriteIndex::build(&project_files, &env);
+
+    // Resolve bgAcquire's origin beforehand to verify it is excluded when scoped.
+    let (bg_res, _, _) = resolve_instances_on_ir(
+        &[InstanceTargetSpec {
+            syntax: bg_acq_call,
+            symbol: None,
+        }],
+        &project_files,
+        None::<&HashSet<FileId>>,
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&cached_call_graph),
+        Some(&cached_field_index),
+    );
+    let bg_origin = match &bg_res.results[0] {
+        InstanceResolutionOutcome::Proved { origins, .. } => origins[0].clone(),
+        other => panic!("expected bgAcquire origin, got {other:?}"),
+    };
+
+    let allowed: HashSet<FileId> = [entry_file, pool_file].into_iter().collect();
+    env.reset_counters();
+
+    // 1. resolve_instances_on_ir with pre-populated whole-project caches must ignore bg_0.ts.
+    let (inst_outcome, _, _) = resolve_instances_on_ir(
+        &[InstanceTargetSpec {
+            syntax: entry_conn_read,
+            symbol: None,
+        }],
+        &project_files,
+        Some(&allowed),
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&cached_call_graph),
+        Some(&cached_field_index),
+    );
+    let pool_origin = match &inst_outcome.results[0] {
+        InstanceResolutionOutcome::Proved { origins, .. } => {
+            assert_eq!(
+                origins.len(),
+                1,
+                "expected only pool.ts origin when bg_0.ts is excluded by allowed_files, got {origins:?}"
+            );
+            assert_eq!(origins[0].origin_syntax, Some(pool_acq_call));
+            origins[0].clone()
+        }
+        other => panic!("expected Proved origin from pool.ts, got {other:?}"),
+    };
+
+    // 2. evaluate_instance_cleanup_on_ir with pre-populated caches must prove pool_origin
+    //    and MUST NOT prove bg_origin via bg_0.ts callers or field writes.
+    let (cleanup_outcome, _, _) = evaluate_instance_cleanup_on_ir(
+        &[CleanupScopeSpec {
+            syntax: entry_use_fn,
+        }],
+        &[
+            CleanupTargetSpec {
+                instance_key: pool_origin.instance_key,
+                origin_kind: pool_origin.origin_kind,
+                allocation_location: pool_origin.allocation_location,
+                origin_syntax: pool_origin.origin_syntax,
+                summary_id: pool_origin.summary_id,
+                summary_source: pool_origin.summary_source,
+                evidence: pool_origin.evidence,
+            },
+            CleanupTargetSpec {
+                instance_key: bg_origin.instance_key,
+                origin_kind: bg_origin.origin_kind,
+                allocation_location: bg_origin.allocation_location,
+                origin_syntax: bg_origin.origin_syntax,
+                summary_id: bg_origin.summary_id,
+                summary_source: bg_origin.summary_source,
+                evidence: bg_origin.evidence,
+            },
+        ],
+        &project_files,
+        Some(&allowed),
+        &env,
+        &env,
+        &env,
+        &summaries,
+        Some(&cached_call_graph),
+        Some(&cached_field_index),
+    );
+    assert!(
+        matches!(
+            &cleanup_outcome.results[0].target_results[0].status,
+            TargetCleanupStatusData::Proved { .. }
+        ),
+        "expected Proved cleanup for pool_origin, got {:?}",
+        cleanup_outcome.results[0].target_results[0].status
+    );
+    assert!(
+        !matches!(
+            &cleanup_outcome.results[0].target_results[1].status,
+            TargetCleanupStatusData::Proved { .. }
+        ),
+        "bg_origin from excluded bg_0.ts must NOT be proved via cached indexes, got {:?}",
+        cleanup_outcome.results[0].target_results[1].status
+    );
 }

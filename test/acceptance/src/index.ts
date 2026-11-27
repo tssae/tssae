@@ -152,3 +152,23 @@ export type {
   ConformanceReport,
   ConformanceViolation,
 } from "./conformance/types.ts";
+export {
+  checkSoundness,
+  collectPreciseCoverage,
+  runSoundnessReconciliationSuite,
+  type BranchCoverageSoundnessCase,
+  type CallEffectsSoundnessCase,
+  type CalleesOfSoundnessCase,
+  type ExecutionCountOptions,
+  type InstanceCleanupSoundnessCase,
+  type PreciseCoverageSnapshot,
+  type SoundnessCheckInput,
+  type SoundnessCheckReport,
+  type SoundnessCompleteness,
+  type SoundnessQueryKind,
+  type SoundnessReconciliationOptions,
+  type SoundnessReconciliationResult,
+  type SoundnessTriState,
+  type SoundnessViolation,
+  type ValuePropagationSoundnessCase,
+} from "./soundness/index.ts";

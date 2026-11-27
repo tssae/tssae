@@ -283,6 +283,7 @@ enum UseRole {
         is_spread: bool,
     },
     ReturnValue,
+    YieldValue,
     UnknownChild,
 }
 
@@ -358,10 +359,21 @@ impl IrValueIndex {
                 | IrOp::Branch { .. }
                 | IrOp::SwitchDispatch { .. }
                 | IrOp::Throw { .. }
-                | IrOp::Yield { .. }
+                | IrOp::Yield { value: None, .. }
                 | IrOp::IteratorClose { .. }
                 | IrOp::JsxElement { .. }
                 | IrOp::Return { value: None } => {}
+                IrOp::Yield {
+                    value: Some(val), ..
+                } => {
+                    consumers
+                        .entry(*val)
+                        .or_default()
+                        .push(ValueConsumer::VertexUse {
+                            vertex: vertex.id,
+                            role: UseRole::YieldValue,
+                        });
+                }
                 IrOp::ReadLocal { binding } => {
                     reads_of_binding
                         .entry(*binding)
@@ -2468,6 +2480,20 @@ impl PropagationEngine<'_> {
             }
             UseRole::ReturnValue => {
                 self.handle_return(item, v, queue, visited, untainted_visited);
+            }
+            UseRole::YieldValue => {
+                let mut next_fields = item.fields.clone();
+                if !push_field_segment(
+                    queue,
+                    &mut next_fields,
+                    FieldSegment::Element(None),
+                    v_loc.or_else(|| Some(ir.scope_location.clone())),
+                ) {
+                    return;
+                }
+                let mut yielded_item = item.clone();
+                yielded_item.fields = next_fields;
+                self.handle_return(&yielded_item, v, queue, visited, untainted_visited);
             }
             UseRole::UnknownChild => {
                 let Some(out_val) = v.value else {

@@ -407,4 +407,93 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
       },
     );
   });
+
+  void it("propagates yielded values across generator yield, yield*, for-of, and destructuring without false disproved", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-vp-generator-yield",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": BASE_TSCONFIG,
+          "src/app.ts": [
+            "function sink(_tag: string, _v: unknown): void {}",
+            "function origin(): string { return 'secret'; }",
+            "",
+            "function* yieldSingle(item: string): Generator<string> {",
+            "  yield item;",
+            "}",
+            "",
+            "function* delegateSingle(item: string): Generator<string> {",
+            "  yield* yieldSingle(item);",
+            "}",
+            "",
+            "export function runGeneratorFlows(): void {",
+            "  const raw = origin();",
+            "  for (const elem of yieldSingle(raw)) {",
+            "    sink('genForOf', elem);",
+            "  }",
+            "  for (const delegated of delegateSingle(raw)) {",
+            "    sink('genDelegate', delegated);",
+            "  }",
+            "  const [destructured] = yieldSingle(raw);",
+            "  sink('genDestructure', destructured);",
+            "  sink('genObjectItself', yieldSingle(raw));",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const calls = await ctx.findSyntax({
+            files: ["src/app.ts"],
+            kinds: ["CallExpression"],
+          });
+          const originCall = calls.find((c) => c.text === "origin()");
+          assert.ok(originCall);
+
+          const tags = [
+            "genForOf",
+            "genDelegate",
+            "genDestructure",
+            "genObjectItself",
+          ] as const;
+          const targets = tags.map((tag) => {
+            const sinkCall = calls.find((c) =>
+              c.text.startsWith(`sink('${tag}'`),
+            );
+            const arg = sinkCall?.arguments?.[1];
+            assert.ok(arg, `Missing sink arg for ${tag}`);
+            return { tag, ref: arg };
+          });
+
+          const prop = await ctx.valuePropagation({
+            propagation: "value",
+            from: originCall.ref,
+            to: targets.map((t) => t.ref),
+          });
+          const byTag = new Map(
+            targets.map((t, i) => [t.tag, prop.results[i]!]),
+          );
+
+          assert.equal(byTag.get("genForOf")!.status, "proved");
+          assert.equal(byTag.get("genDelegate")!.status, "proved");
+          assert.equal(byTag.get("genDestructure")!.status, "proved");
+          assert.equal(byTag.get("genObjectItself")!.status, "disproved");
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

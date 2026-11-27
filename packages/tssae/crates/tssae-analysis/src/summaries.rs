@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::LazyLock};
 
 use rustc_hash::FxHashMap;
 use tssae_common::{
@@ -37,6 +37,13 @@ pub struct BehaviorSummaryIndex {
     resolved_package_versions: FxHashMap<String, Option<String>>,
 }
 
+static BUILTIN_STDLIB_ENTRIES: LazyLock<Vec<BehaviorSummaryEntry>> =
+    LazyLock::new(builtin_stdlib_summaries);
+
+static DEFAULT_BUILTIN_INDEX: LazyLock<BehaviorSummaryIndex> = LazyLock::new(|| {
+    BehaviorSummaryIndex::build_uncached(&SummaryConfigPayload::default(), &FxHashMap::default())
+});
+
 impl Default for BehaviorSummaryIndex {
     fn default() -> Self {
         Self::with_builtins_only()
@@ -46,11 +53,21 @@ impl Default for BehaviorSummaryIndex {
 impl BehaviorSummaryIndex {
     #[must_use]
     pub fn with_builtins_only() -> Self {
-        Self::from_config(&SummaryConfigPayload::default(), &FxHashMap::default())
+        DEFAULT_BUILTIN_INDEX.clone()
     }
 
     #[must_use]
     pub fn from_config(
+        config: &SummaryConfigPayload,
+        resolved_package_versions: &FxHashMap<String, Option<String>>,
+    ) -> Self {
+        if config.packs.is_empty() && config.enable_builtin {
+            return DEFAULT_BUILTIN_INDEX.clone();
+        }
+        Self::build_uncached(config, resolved_package_versions)
+    }
+
+    fn build_uncached(
         config: &SummaryConfigPayload,
         resolved_package_versions: &FxHashMap<String, Option<String>>,
     ) -> Self {
@@ -68,12 +85,12 @@ impl BehaviorSummaryIndex {
         }
         if config.enable_builtin {
             let builtin_idx = tier_index(SummarySource::Builtin);
-            for entry in builtin_stdlib_summaries() {
+            for entry in &*BUILTIN_STDLIB_ENTRIES {
                 tiers[builtin_idx].push(IndexedEntry {
                     source: SummarySource::Builtin,
                     pack_id: "builtin:stdlib".to_string(),
                     origin_file: None,
-                    entry,
+                    entry: entry.clone(),
                 });
             }
         }
@@ -1561,5 +1578,50 @@ mod tests {
         assert_eq!(err.source, SummarySource::Community);
         assert_eq!(err.parties[0].pack_id, "comm-a");
         assert_eq!(err.parties[1].pack_id, "comm-b");
+    }
+
+    #[test]
+    fn default_builtin_index_cache_ignores_package_versions_and_matches_builtins() {
+        for entry in &*BUILTIN_STDLIB_ENTRIES {
+            assert!(
+                entry.matcher.package.is_none(),
+                "builtin entry {:?} must not specify package",
+                entry.id
+            );
+            assert!(
+                entry.matcher.version.is_none(),
+                "builtin entry {:?} must not specify version",
+                entry.id
+            );
+        }
+
+        let mut versions = FxHashMap::default();
+        versions.insert("lodash".to_string(), Some("4.17.21".to_string()));
+        let cached = BehaviorSummaryIndex::from_config(&SummaryConfigPayload::default(), &versions);
+        let fresh = BehaviorSummaryIndex::with_builtins_only();
+
+        let array_for_each = DeclarationIdentity {
+            package_name: None,
+            package_version: None,
+            export_path: None,
+            module_path: None,
+            is_default_library: true,
+            member_paths: vec![vec![
+                "Array".to_string(),
+                "prototype".to_string(),
+                "forEach".to_string(),
+            ]],
+            is_instance_member: true,
+        };
+        let cached_match = cached
+            .resolve_calls_summary(&array_for_each, false)
+            .unwrap()
+            .unwrap();
+        let fresh_match = fresh
+            .resolve_calls_summary(&array_for_each, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached_match.entry_id, fresh_match.entry_id);
+        assert_eq!(cached_match.aspect, fresh_match.aspect);
     }
 }

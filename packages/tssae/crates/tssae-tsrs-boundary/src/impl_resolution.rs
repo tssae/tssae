@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use rustc_hash::FxHashMap;
@@ -103,10 +103,12 @@ pub fn collect_resolved_packages_for_program(
     let mut seen_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
 
     for &sf in program.get_source_files() {
+        let is_proj = crate::syntax_view::is_project_source_file(program, sf);
         if program.is_source_file_default_library(sf.path())
             || program.is_source_file_from_external_library(sf)
-            || normalize_path(sf.file_name()).contains("/node_modules/")
-            || !is_first_party_workspace_path(cwd, sf.file_name())
+            || (sf.file_name().contains("node_modules")
+                && normalize_path(sf.file_name()).contains("/node_modules/"))
+            || (!is_proj && !is_first_party_workspace_path(cwd, sf.file_name()))
         {
             continue;
         }
@@ -281,9 +283,42 @@ struct ModuleProvenance {
     export_name: Option<String>,
 }
 
+static CANONICAL_PATH_CACHE: LazyLock<Mutex<FxHashMap<String, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// Pure-memory lexical path normalization (`\\` -> `/`, collapses `//`, `.`, `..`, trims trailing `/`).
+#[must_use]
+pub fn lexical_normalize_path(p: &str) -> String {
+    normalize_path(p)
+}
+
 /// Returns `true` when `file_name` resolves inside `cwd` outside any `node_modules` directory.
 #[must_use]
 pub fn is_first_party_workspace_path(cwd: &str, file_name: &str) -> bool {
+    let norm_cwd = lexical_normalize_path(cwd);
+    let norm_file = lexical_normalize_path(file_name);
+
+    // Fast path (0 syscalls): `norm_file` lies lexically inside `norm_cwd` at a `/` boundary
+    // and the relative suffix does not enter `node_modules`.
+    if norm_cwd == "/" {
+        if let Some(suffix) = norm_file.strip_prefix('/')
+            && !suffix.is_empty()
+            && !suffix.starts_with("node_modules/")
+            && !suffix.contains("/node_modules/")
+            && suffix != "node_modules"
+        {
+            return true;
+        }
+    } else if let Some(suffix) = norm_file.strip_prefix(&norm_cwd)
+        && (suffix.is_empty()
+            || (suffix.starts_with('/')
+                && !suffix.starts_with("/node_modules/")
+                && !suffix.contains("/node_modules/")
+                && !suffix.ends_with("/node_modules")))
+    {
+        return !norm_cwd.contains("/node_modules/") && !norm_cwd.ends_with("/node_modules");
+    }
+
     let workspace_root = canonical_or_normalized(cwd);
     let candidate = canonical_or_normalized(file_name);
     candidate.starts_with(&workspace_root)
@@ -300,9 +335,18 @@ pub fn is_first_party_source_file(cwd: &str, program: &Program, sf: P<SourceFile
 }
 
 fn canonical_or_normalized(raw: &str) -> PathBuf {
-    Path::new(raw)
+    if let Ok(cache) = CANONICAL_PATH_CACHE.lock()
+        && let Some(cached) = cache.get(raw)
+    {
+        return cached.clone();
+    }
+    let resolved = Path::new(raw)
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(normalize_path(raw)))
+        .unwrap_or_else(|_| PathBuf::from(lexical_normalize_path(raw)));
+    if let Ok(mut cache) = CANONICAL_PATH_CACHE.lock() {
+        cache.insert(raw.to_string(), resolved.clone());
+    }
+    resolved
 }
 
 fn is_bare_package_specifier(spec: &str) -> bool {
@@ -1829,4 +1873,86 @@ fn collect_container_chain(member: P<Node>) -> (Vec<String>, bool) {
     }
     chain.reverse();
     (chain, in_type_literal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexical_normalize_path_handles_slashes_dots_and_trailing_separators() {
+        assert_eq!(
+            lexical_normalize_path(r"C:\repo\packages\a\..\b\.\file.ts/"),
+            "C:/repo/packages/b/file.ts"
+        );
+        assert_eq!(
+            lexical_normalize_path("/ws//src/./nested/../app.ts/"),
+            "/ws/src/app.ts"
+        );
+        assert_eq!(lexical_normalize_path("///"), "/");
+    }
+
+    #[test]
+    fn first_party_workspace_path_fast_path_handles_boundaries_and_node_modules() {
+        assert!(is_first_party_workspace_path(
+            "/virtual-ws/",
+            "/virtual-ws/src/index.ts"
+        ));
+        assert!(is_first_party_workspace_path(
+            "/virtual-ws",
+            r"\virtual-ws\src\..\lib\helper.ts"
+        ));
+        assert!(!is_first_party_workspace_path(
+            "/virtual-ws",
+            "/virtual-ws-other/src/index.ts"
+        ));
+        assert!(!is_first_party_workspace_path(
+            "/virtual-ws",
+            "/virtual-ws/node_modules/pkg/index.ts"
+        ));
+        assert!(!is_first_party_workspace_path(
+            "/virtual-ws",
+            "/virtual-ws/packages/a/node_modules/b/index.ts"
+        ));
+        assert!(is_first_party_workspace_path("/", "/src/index.ts"));
+        assert!(!is_first_party_workspace_path(
+            "/",
+            "/node_modules/pkg/index.ts"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_party_workspace_path_slow_path_resolves_workspace_symlinks_and_caches() {
+        let base = std::env::temp_dir().join(format!("tssae-impl-res-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let pkg_dir = ws.join("packages").join("local-pkg");
+        let ext_dir = base.join("external-pkg");
+        let nm_dir = ws.join("node_modules");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::create_dir_all(&nm_dir).unwrap();
+
+        let local_entry = pkg_dir.join("index.ts");
+        let ext_entry = ext_dir.join("index.ts");
+        std::fs::write(&local_entry, "export const x = 1;\n").unwrap();
+        std::fs::write(&ext_entry, "export const y = 2;\n").unwrap();
+
+        let local_link = nm_dir.join("local-pkg");
+        let ext_link = nm_dir.join("external-pkg");
+        std::os::unix::fs::symlink(&pkg_dir, &local_link).unwrap();
+        std::os::unix::fs::symlink(&ext_dir, &ext_link).unwrap();
+
+        let ws_str = ws.to_string_lossy().to_string();
+        let local_via_nm = local_link.join("index.ts").to_string_lossy().to_string();
+        let ext_via_nm = ext_link.join("index.ts").to_string_lossy().to_string();
+
+        assert!(is_first_party_workspace_path(&ws_str, &local_via_nm));
+        assert!(!is_first_party_workspace_path(&ws_str, &ext_via_nm));
+        // Second lookup hits CANONICAL_PATH_CACHE cleanly.
+        assert!(is_first_party_workspace_path(&ws_str, &local_via_nm));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

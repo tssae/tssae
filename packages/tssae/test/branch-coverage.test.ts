@@ -1469,4 +1469,186 @@ export async function forAwaitAndDoWhile(items: Record<string, number>): Promise
       }
     });
   });
+
+  void it("short-circuits left-associative && and || value chains directly without infeasible join paths", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/chains.ts": [
+            "interface Pair {",
+            "  firstPart: string;",
+            "  chordPart: string;",
+            "}",
+            "function equals(a: string, b: string): boolean {",
+            "  return a === b;",
+            "}",
+            "function eq1(a: Pair, b: Pair): boolean {",
+            "  return equals(a.firstPart, b.firstPart);",
+            "}",
+            "function eq2(a: Pair, b: Pair): boolean {",
+            "  return equals(a.chordPart, b.chordPart);",
+            "}",
+            "export function samePair(a: Pair | undefined, b: Pair | undefined): boolean {",
+            "  return !!a && !!b && eq1(a, b) && eq2(a, b);",
+            "}",
+            "function fallbackA(): string { return 'a'; }",
+            "function fallbackB(): string { return 'b'; }",
+            "export function firstTruthy(a: string, b: string, c: string): string {",
+            "  return a || b || c || fallbackA() || fallbackB();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/chains.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const calls = await ctx.findSyntax({
+            files: ["src/chains.ts"],
+            kinds: ["CallExpression"],
+          });
+          const branchGroups = await ctx.listBranches(fns.map((fn) => fn.ref));
+
+          const samePairIdx = fns.findIndex((f) =>
+            f.text.includes("function samePair("),
+          );
+          assert.ok(samePairIdx >= 0);
+          const samePairFn = fns[samePairIdx]!;
+          const samePairBranches = branchGroups[samePairIdx]!.branches;
+          const eq1Call = calls.find(
+            (c) =>
+              c.text.startsWith("eq1(") &&
+              insideSpan(c.location, samePairFn.location),
+          )!;
+          const eq2Call = calls.find(
+            (c) =>
+              c.text.startsWith("eq2(") &&
+              insideSpan(c.location, samePairFn.location),
+          )!;
+
+          const andContA = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a",
+          )!;
+          const andContAB = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a && !!b",
+          )!;
+          const andContABC = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a && !!b && eq1(a, b)",
+          )!;
+
+          for (const branch of [andContA, andContAB]) {
+            const [resEq1, resEq2] = await ctx.branchCoverage({
+              function: samePairFn.ref,
+              branches: [branch.ref],
+              targets: [eq1Call.ref, eq2Call.ref],
+            });
+            assert.equal(resEq1!.status, "proved");
+            assert.equal(resEq1!.targetReachable, true);
+            assert.equal(resEq2!.status, "proved");
+            assert.equal(resEq2!.targetReachable, true);
+          }
+
+          const [resAndABC] = await ctx.branchCoverage({
+            function: samePairFn.ref,
+            branches: [andContABC.ref],
+            targets: [eq2Call.ref],
+          });
+          assert.equal(resAndABC!.status, "proved");
+          assert.equal(resAndABC!.targetReachable, true);
+
+          const firstTruthyIdx = fns.findIndex((f) =>
+            f.text.includes("function firstTruthy("),
+          );
+          assert.ok(firstTruthyIdx >= 0);
+          const firstTruthyFn = fns[firstTruthyIdx]!;
+          const firstTruthyBranches = branchGroups[firstTruthyIdx]!.branches;
+          const fallbackACall = calls.find(
+            (c) =>
+              c.text === "fallbackA()" &&
+              insideSpan(c.location, firstTruthyFn.location),
+          )!;
+          const fallbackBCall = calls.find(
+            (c) =>
+              c.text === "fallbackB()" &&
+              insideSpan(c.location, firstTruthyFn.location),
+          )!;
+
+          const orContA = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a",
+          )!;
+          const orContAB = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b",
+          )!;
+          const orContABC = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b || c",
+          )!;
+          const orContABCD = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b || c || fallbackA()",
+          )!;
+
+          for (const branch of [orContA, orContAB, orContABC]) {
+            const [resFallbackA, resFallbackB] = await ctx.branchCoverage({
+              function: firstTruthyFn.ref,
+              branches: [branch.ref],
+              targets: [fallbackACall.ref, fallbackBCall.ref],
+            });
+            assert.equal(resFallbackA!.status, "proved");
+            assert.equal(resFallbackA!.targetReachable, true);
+            assert.equal(resFallbackB!.status, "proved");
+            assert.equal(resFallbackB!.targetReachable, true);
+          }
+
+          const [resOrABCD] = await ctx.branchCoverage({
+            function: firstTruthyFn.ref,
+            branches: [orContABCD.ref],
+            targets: [fallbackBCall.ref],
+          });
+          assert.equal(resOrABCD!.status, "proved");
+          assert.equal(resOrABCD!.targetReachable, true);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

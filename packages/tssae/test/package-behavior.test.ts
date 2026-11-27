@@ -713,4 +713,244 @@ void describe("tssae first-party implementation resolution", () => {
       },
     );
   });
+
+  void it("resolves same-scope ClassDeclaration, namespace/IIFE calls, typed object literals, and non-escaping callersOf completeness", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/event.ts": [
+            "export class Emitter {",
+            "  constructor(public readonly label: string) {}",
+            "}",
+            "",
+          ].join("\n"),
+          "src/path.ts": [
+            "export interface IPath {",
+            "  normalize(p: string): string;",
+            "}",
+            "export const posix: IPath = {",
+            "  normalize(p: string): string {",
+            "    return p.trim();",
+            "  },",
+            "};",
+            "",
+          ].join("\n"),
+          "src/dom.ts": [
+            "export const { getWindow } = (function () {",
+            "  return {",
+            "    getWindow(el: string): string {",
+            "      return el;",
+            "    },",
+            "  };",
+            "})();",
+            "",
+          ].join("\n"),
+          "src/app.ts": [
+            "import * as event from './event.js';",
+            "import * as path from './path.js';",
+            "import { posix } from './path.js';",
+            "import * as dom from './dom.js';",
+            "import { getWindow } from './dom.js';",
+            "",
+            "class WindowManager {",
+            "  static readonly INSTANCE = new WindowManager();",
+            "  constructor() {}",
+            "}",
+            "",
+            "namespace NS {",
+            "  export class Foo {",
+            "    constructor(public readonly x: number) {}",
+            "  }",
+            "  export function helper(v: number): number {",
+            "    return v + 1;",
+            "  }",
+            "}",
+            "",
+            "const ctors = { Emitter: event.Emitter };",
+            "",
+            "function localHelper(x: number): number {",
+            "  return x * 2;",
+            "}",
+            "",
+            "function escapedHelper(x: number): number {",
+            "  return x + 3;",
+            "}",
+            "",
+            "interface Disposable {",
+            "  dispose(): void;",
+            "}",
+            "",
+            "export function runAll(h: Disposable, cb: (fn: (n: number) => number) => void): void {",
+            "  const wm = new WindowManager();",
+            "  const em = new event.Emitter('a');",
+            "  const em2 = new ctors.Emitter('b');",
+            "  const nsFoo = new NS.Foo(1);",
+            "  const nsVal = NS.helper(2);",
+            "  const p1 = posix.normalize(' x ');",
+            "  const p2 = path.posix.normalize(' y ');",
+            "  const w1 = getWindow('el1');",
+            "  const w2 = dom.getWindow('el2');",
+            "  const lh = localHelper(3);",
+            "  h.dispose();",
+            "  cb(escapedHelper);",
+            "  void [wm, em, em2, nsFoo, nsVal, p1, p2, w1, w2, lh];",
+            "}",
+            "",
+            "export function invokeDynamic(cb: () => void): void {",
+            "  cb();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const newExprs = await ctx.findSyntax({
+            files: ["src/app.ts"],
+            kinds: ["NewExpression"],
+          });
+          const callExprs = await ctx.findSyntax({
+            files: ["src/app.ts"],
+            kinds: ["CallExpression"],
+          });
+          const fns = await ctx.findSyntax({
+            files: ["src/app.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+
+          const newWmStatic = newExprs.find(
+            (n) => n.text === "new WindowManager()" && n.location.line === 8,
+          )!;
+          const newWmLocal = newExprs.find(
+            (n) => n.text === "new WindowManager()" && n.location.line > 10,
+          )!;
+          const newEvent = newExprs.find((n) =>
+            n.text.startsWith("new event.Emitter("),
+          )!;
+          const newCtors = newExprs.find((n) =>
+            n.text.startsWith("new ctors.Emitter("),
+          )!;
+          const newNsFoo = newExprs.find((n) =>
+            n.text.startsWith("new NS.Foo("),
+          )!;
+
+          const nsHelperCall = callExprs.find((c) =>
+            c.text.startsWith("NS.helper("),
+          )!;
+          const posixCall = callExprs.find((c) =>
+            c.text.startsWith("posix.normalize("),
+          )!;
+          const pathPosixCall = callExprs.find((c) =>
+            c.text.startsWith("path.posix.normalize("),
+          )!;
+          const winDirectCall = callExprs.find((c) =>
+            c.text.startsWith("getWindow("),
+          )!;
+          const winNsCall = callExprs.find((c) =>
+            c.text.startsWith("dom.getWindow("),
+          )!;
+
+          const resolvedCallRows = await ctx.resolveCalls([
+            newWmStatic.ref,
+            newWmLocal.ref,
+            newEvent.ref,
+            newCtors.ref,
+            newNsFoo.ref,
+            nsHelperCall.ref,
+            posixCall.ref,
+            pathPosixCall.ref,
+            winDirectCall.ref,
+            winNsCall.ref,
+          ]);
+          const callRefs = resolvedCallRows.map((row) => {
+            assert.ok(row.call);
+            return row.call;
+          });
+
+          const callees = await ctx.calleesOf(callRefs);
+          assert.equal(callees.length, 10);
+          for (const row of callees) {
+            assert.equal(
+              row.completeness,
+              "complete",
+              row.completeness === "incomplete"
+                ? `Expected complete resolution, got gaps: ${JSON.stringify(row.gaps)}`
+                : "Expected complete resolution",
+            );
+            assert.equal(row.resolvedTargets.length, 1);
+          }
+
+          assert.equal(
+            callees[2]!.resolvedTargets[0]!.location?.file,
+            "src/event.ts",
+          );
+          assert.equal(
+            callees[3]!.resolvedTargets[0]!.location?.file,
+            "src/event.ts",
+          );
+          assert.equal(callees[5]!.resolvedTargets[0]!.name, "helper");
+          assert.equal(
+            callees[6]!.resolvedTargets[0]!.location?.file,
+            "src/path.ts",
+          );
+          assert.equal(
+            callees[7]!.resolvedTargets[0]!.location?.file,
+            "src/path.ts",
+          );
+          assert.equal(
+            callees[8]!.resolvedTargets[0]!.location?.file,
+            "src/dom.ts",
+          );
+          assert.equal(
+            callees[9]!.resolvedTargets[0]!.location?.file,
+            "src/dom.ts",
+          );
+
+          const [posixImpl] = await ctx.resolveImplementations([posixCall.ref]);
+          assert.equal(posixImpl?.status, "resolved");
+          if (posixImpl?.status === "resolved") {
+            assert.equal(posixImpl.implementation.location.file, "src/path.ts");
+          }
+
+          const localHelperFn = fns.find((f) =>
+            f.text.includes("function localHelper("),
+          )!;
+          const escapedHelperFn = fns.find((f) =>
+            f.text.includes("function escapedHelper("),
+          )!;
+          const [localDeclRow, escapedDeclRow] = await ctx.resolveDeclarations([
+            localHelperFn.ref,
+            escapedHelperFn.ref,
+          ]);
+          assert.ok(localDeclRow?.declaration);
+          assert.ok(escapedDeclRow?.declaration);
+          const [localCallers, escapedCallers] = await ctx.callersOf([
+            localDeclRow.declaration,
+            escapedDeclRow.declaration,
+          ]);
+          assert.equal(localCallers?.completeness, "complete");
+          assert.equal(localCallers?.callSites.length, 1);
+          assert.equal(escapedCallers?.completeness, "incomplete");
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

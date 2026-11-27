@@ -4721,10 +4721,99 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
         self.add_edge(gate, join, ExplicitEdgeKind::Branch(short_branch));
         self.add_edge(gate, right_entry, ExplicitEdgeKind::Branch(cont_branch));
 
-        let (left_entry, left_val) = self.lower_expr_to(left, gate);
-        self.record_value_sources(out_val, &[left_val, right_val]);
+        let (left_entry, mut collected_vals) = if branch_kind == IrBranchKind::LogicalAnd {
+            self.lower_short_circuit_chain(
+                branch_kind,
+                Kind::AmpersandAmpersandToken,
+                left,
+                gate,
+                join,
+            )
+        } else if branch_kind == IrBranchKind::LogicalOr {
+            self.lower_short_circuit_chain(branch_kind, Kind::BarBarToken, left, gate, join)
+        } else {
+            let (le, lv) = self.lower_expr_to(left, gate);
+            (le, vec![lv])
+        };
+        collected_vals.push(right_val);
+        self.record_value_sources(out_val, &collected_vals);
         self.bind_expr_maps(node, join, out_val);
         (left_entry, out_val)
+    }
+
+    fn lower_short_circuit_chain(
+        &mut self,
+        branch_kind: IrBranchKind,
+        op_kind: Kind,
+        expr_node: P<Node>,
+        on_continue: VertexId,
+        on_short_circuit: VertexId,
+    ) -> (VertexId, Vec<ValueId>) {
+        let mut parens = Vec::new();
+        let mut inner = expr_node;
+        while inner.kind() == Kind::ParenthesizedExpression {
+            parens.push(inner);
+            inner = inner.as_parenthesized_expression().expression();
+        }
+        if inner.kind() == Kind::BinaryExpression {
+            let bin = inner.as_binary_expression();
+            if bin.operator_token().kind() == op_kind {
+                let inner_left = bin.left();
+                let inner_right = bin.right();
+                let (right_entry, right_val) = self.lower_expr_to(inner_right, on_continue);
+                let expr_loc = self.loc(inner);
+                let left_loc = self.loc(inner_left);
+                let short_branch = self.push_branch(
+                    branch_kind,
+                    IrBranchDirection::ShortCircuit,
+                    inner_left,
+                    left_loc.clone(),
+                    expr_loc.clone(),
+                    None,
+                );
+                let cont_branch = self.push_branch(
+                    branch_kind,
+                    IrBranchDirection::Continue,
+                    inner_left,
+                    left_loc,
+                    expr_loc,
+                    None,
+                );
+
+                let inner_gate = self.new_vertex(None, IrOp::NopMerge, None, false);
+                self.add_edge(
+                    inner_gate,
+                    on_short_circuit,
+                    ExplicitEdgeKind::Branch(short_branch),
+                );
+                self.add_edge(
+                    inner_gate,
+                    right_entry,
+                    ExplicitEdgeKind::Branch(cont_branch),
+                );
+
+                let (left_entry, mut vals) = self.lower_short_circuit_chain(
+                    branch_kind,
+                    op_kind,
+                    inner_left,
+                    inner_gate,
+                    on_short_circuit,
+                );
+                vals.push(right_val);
+
+                let inner_val = self.alloc_value();
+                let here = self.new_vertex(Some(inner), IrOp::NopMerge, Some(inner_val), true);
+                self.add_edge(here, left_entry, ExplicitEdgeKind::Fallthrough);
+                self.record_value_sources(inner_val, &vals);
+                self.bind_expr_maps(inner, here, inner_val);
+                for paren in parens.into_iter().rev() {
+                    self.alias_expr_vertex(paren, inner, here);
+                }
+                return (here, vals);
+            }
+        }
+        let (entry, val) = self.lower_expr_to(expr_node, on_continue);
+        (entry, vec![val])
     }
 
     fn patch_assign_value(&mut self, assign_v: VertexId, rhs_val: ValueId) {
@@ -6162,7 +6251,27 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
                 post_cls = entry;
             }
         }
-        self.add_edge(cls_v, post_cls, ExplicitEdgeKind::Fallthrough);
+        let class_binding = self.binding_by_decl_node.get(&node).copied().or_else(|| {
+            (node.kind() == Kind::ClassDeclaration)
+                .then(|| node.name().and_then(|n| self.resolve_binding(n)))
+                .flatten()
+        });
+        let post_assign = class_binding.map_or(post_cls, |binding| {
+            let assign_v = self.new_vertex(
+                Some(node),
+                IrOp::AssignLocal {
+                    target: binding,
+                    op: AssignOp::Assign,
+                    value: out_val,
+                    is_init: true,
+                },
+                Some(out_val),
+                true,
+            );
+            self.add_edge(assign_v, post_cls, ExplicitEdgeKind::Fallthrough);
+            assign_v
+        });
+        self.add_edge(cls_v, post_assign, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, cls_v, out_val);
         let mut cont = cls_v;
 
@@ -6276,13 +6385,22 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
 
         let obj_val = self.alloc_value();
         let obj_v = if let Some(cls) = static_class {
-            let sid = self.intern_node(cls);
-            self.new_vertex(
-                None,
-                IrOp::ReadSymbol { ident_syntax: sid },
-                Some(obj_val),
-                false,
-            )
+            if let Some(binding) = self
+                .binding_by_decl_node
+                .get(&cls)
+                .copied()
+                .or_else(|| cls.name().and_then(|n| self.resolve_binding(n)))
+            {
+                self.new_vertex(None, IrOp::ReadLocal { binding }, Some(obj_val), false)
+            } else {
+                let sid = self.intern_node(cls);
+                self.new_vertex(
+                    None,
+                    IrOp::ReadSymbol { ident_syntax: sid },
+                    Some(obj_val),
+                    false,
+                )
+            }
         } else {
             self.new_vertex(None, IrOp::ThisRef, Some(obj_val), false)
         };

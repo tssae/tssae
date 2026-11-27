@@ -7,8 +7,9 @@ use std::{
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use tsrs_ast::{
-    Kind, ModifierFlags, Node, SourceFile, Symbol, SymbolFlags, get_combined_modifier_flags,
-    get_source_file_of_node, is_function_like_declaration,
+    Kind, ModifierFlags, Node, NodeFlags, SourceFile, Symbol, SymbolFlags,
+    get_combined_modifier_flags, get_combined_node_flags, get_source_file_of_node,
+    is_function_like_declaration,
 };
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::{P, tspath};
@@ -20,7 +21,9 @@ use tsrs_sourcemap::{
 };
 use tssae_common::{DeclarationIdentity, DiagnosticLocation, EvidenceItem, GapItem, UnknownReason};
 
-use crate::semantic_facade::{SemanticFacade, resolve_symbol_for_node};
+use crate::semantic_facade::{
+    SemanticFacade, resolve_symbol_for_node, unwrap_aliased_symbol, unwrap_sym_declarations,
+};
 use crate::syntax_view::{
     node_location_relative, node_text, normalize_path, prop_key_text, relative_to_cwd,
     unwrap_expr_wrappers,
@@ -871,6 +874,129 @@ fn is_unbodied_callable_or_signature(node: P<Node>) -> bool {
     )
 }
 
+fn extract_returned_object_literal(init: P<Node>) -> Option<P<Node>> {
+    let unwrapped = unwrap_expr_wrappers(init);
+    if unwrapped.kind() == Kind::ObjectLiteralExpression {
+        return Some(unwrapped);
+    }
+    if unwrapped.kind() != Kind::CallExpression {
+        return None;
+    }
+    let callee = unwrap_expr_wrappers(unwrapped.expression()?);
+    if !matches!(
+        callee.kind(),
+        Kind::FunctionExpression | Kind::ArrowFunction
+    ) {
+        return None;
+    }
+    let body = callee.body()?;
+    if body.kind() != Kind::Block {
+        let ret = unwrap_expr_wrappers(body);
+        return (ret.kind() == Kind::ObjectLiteralExpression).then_some(ret);
+    }
+    let mut matched: Option<P<Node>> = None;
+    let mut stack = vec![body];
+    while let Some(cur) = stack.pop() {
+        if cur.kind() == Kind::ReturnStatement {
+            let expr = cur
+                .as_return_statement()
+                .expression()
+                .map(unwrap_expr_wrappers)?;
+            if expr.kind() != Kind::ObjectLiteralExpression {
+                return None;
+            }
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(expr);
+            continue;
+        }
+        cur.for_each_child(&mut |child| {
+            if !is_function_like_declaration(Some(child))
+                && !matches!(child.kind(), Kind::ClassDeclaration | Kind::ClassExpression)
+            {
+                stack.push(child);
+            }
+            false
+        });
+    }
+    matched
+}
+
+fn resolve_object_literal_member_impl(
+    checker: &mut CheckerHandle,
+    cwd: &str,
+    program: &'static Program,
+    access_node: P<Node>,
+) -> Option<P<Node>> {
+    let access = unwrap_expr_wrappers(access_node);
+    if access.kind() != Kind::PropertyAccessExpression {
+        return None;
+    }
+    let pa = access.as_property_access_expression();
+    let prop_name = prop_key_text(pa.name()).or_else(|| node_text(pa.name()))?;
+    let recv = unwrap_expr_wrappers(pa.expression());
+    let recv_sym = checker
+        .get_symbol_at_location_exported(recv)
+        .map(|s| unwrap_aliased_symbol(checker, s))
+        .filter(|&s| s != checker.get_unknown_symbol())?;
+
+    let recv_decl = unwrap_sym_declarations(recv_sym)
+        .into_iter()
+        .find(|&d| d.kind() == Kind::VariableDeclaration)?;
+    if !get_combined_node_flags(recv_decl).intersects(NodeFlags::Const) {
+        return None;
+    }
+    let recv_sf = get_source_file_of_node(recv_decl)?;
+    if !is_first_party_source_file(cwd, program, recv_sf) || recv_sf.is_declaration_file() {
+        return None;
+    }
+
+    let init = recv_decl.initializer()?;
+    let obj_lit = extract_returned_object_literal(init)?;
+    let obj = obj_lit.as_object_literal_expression();
+    for &prop in obj.properties().nodes().iter().rev() {
+        match prop.kind() {
+            Kind::MethodDeclaration | Kind::GetAccessor | Kind::SetAccessor => {
+                if prop.name().and_then(prop_key_text).as_deref() == Some(prop_name.as_str()) {
+                    return Some(prop);
+                }
+            }
+            Kind::PropertyAssignment => {
+                let pa = prop.as_property_assignment();
+                if prop_key_text(pa.name()).as_deref() == Some(prop_name.as_str()) {
+                    let val = unwrap_expr_wrappers(pa.initializer());
+                    if is_function_like_declaration(Some(val)) {
+                        return Some(prop);
+                    }
+                    let resolved = resolve_symbol_for_node(checker, val);
+                    if let Some(decl) =
+                        pick_bodied_declaration(resolved.symbol, resolved.primary_decl)
+                        && !is_unbodied_callable_or_signature(decl)
+                    {
+                        return Some(decl);
+                    }
+                    return Some(prop);
+                }
+            }
+            Kind::ShorthandPropertyAssignment => {
+                let sp = prop.as_shorthand_property_assignment();
+                if node_text(sp.name()).as_deref() == Some(prop_name.as_str()) {
+                    let resolved = resolve_symbol_for_node(checker, prop);
+                    if let Some(decl) =
+                        pick_bodied_declaration(resolved.symbol, resolved.primary_decl)
+                        && !is_unbodied_callable_or_signature(decl)
+                    {
+                        return Some(decl);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn format_first_party_dts_gap_message(decl_name: &str, decl_file_rel: &str) -> String {
     format!(
         "Declaration '{decl_name}' in '{decl_file_rel}' belongs to a workspace package, but only its type declaration (.d.ts) was resolved. Enable TypeScript project references (tsconfig references with composite: true), compilerOptions.customConditions pointing to source exports, or compilerOptions.declarationMap (.d.ts.map) with the package project included to locate its TypeScript source."
@@ -994,8 +1120,22 @@ impl SemanticFacade<'_> {
                         .expression()
                         .and_then(|e| find_provenance_for_expr(self.checker_mut(), e, false));
                     let resolved = resolve_symbol_for_node(self.checker_mut(), node);
-                    let decl = pick_bodied_declaration(resolved.symbol, resolved.primary_decl);
-                    (Some(node), prov, decl, resolved.symbol)
+                    let mut decl = pick_bodied_declaration(resolved.symbol, resolved.primary_decl);
+                    let mut sym = resolved.symbol;
+                    if decl.is_some_and(|d| {
+                        matches!(d.kind(), Kind::MethodSignature | Kind::PropertySignature)
+                    }) && let Some(callee_expr) = node.expression()
+                        && let Some(impl_decl) = resolve_object_literal_member_impl(
+                            self.checker_mut(),
+                            &cwd,
+                            program,
+                            callee_expr,
+                        )
+                    {
+                        sym = impl_decl.symbol().or(sym);
+                        decl = Some(impl_decl);
+                    }
+                    (Some(node), prov, decl, sym)
                 } else {
                     let prov = provenance_from_import_decl_node(node, None)
                         .or_else(|| {
@@ -1015,8 +1155,17 @@ impl SemanticFacade<'_> {
                         })
                         .or_else(|| find_provenance_for_expr(self.checker_mut(), node, false));
                     let resolved = resolve_symbol_for_node(self.checker_mut(), node);
-                    let decl = pick_bodied_declaration(resolved.symbol, resolved.primary_decl);
-                    (Some(node), prov, decl, resolved.symbol)
+                    let mut decl = pick_bodied_declaration(resolved.symbol, resolved.primary_decl);
+                    let mut sym = resolved.symbol;
+                    if decl.is_some_and(|d| {
+                        matches!(d.kind(), Kind::MethodSignature | Kind::PropertySignature)
+                    }) && let Some(impl_decl) =
+                        resolve_object_literal_member_impl(self.checker_mut(), &cwd, program, node)
+                    {
+                        sym = impl_decl.symbol().or(sym);
+                        decl = Some(impl_decl);
+                    }
+                    (Some(node), prov, decl, sym)
                 }
             }
             FacadeImplementationInput::Declaration(decl, sym) => {

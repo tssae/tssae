@@ -16,8 +16,8 @@ use tssae_common::{
 use crate::{
     class_overrides::{self, MemberAccessKind},
     ir::{
-        CfgVertex, FunctionIr, ImplicitAccessorKind, IrArrayElem, IrCallArg, IrCallKind,
-        IrObjectProp, IrOp, IrPropKey, IrProvider, LiteralKind,
+        BindingMutability, CfgVertex, FunctionIr, ImplicitAccessorKind, IrArrayElem, IrCallArg,
+        IrCallKind, IrObjectProp, IrOp, IrPropKey, IrProvider, IrScopeKind, LiteralKind,
     },
     summaries::{BehaviorSummaryIndex, MatchedSummaryAspect},
     var_writes::{self, VarWriteSource},
@@ -104,6 +104,8 @@ pub struct IrCallGraph {
     pub by_decl: FxHashMap<SyntaxId, Vec<usize>>,
     pub by_symbol: FxHashMap<SymbolId, Vec<usize>>,
     pub incomplete_sites: Vec<usize>,
+    pub escaped_decls: FxHashSet<SyntaxId>,
+    pub escaped_symbols: FxHashSet<SymbolId>,
     pub conflict: Option<SummaryConflictError>,
 }
 
@@ -636,7 +638,9 @@ fn resolve_implicit_getter_call(
             );
             return;
         }
-        if let Some(local_prop) = resolve_local_object_property(ir, recv, member_name, &[])
+        let obj_ctx = ObjectLookupContext::from_collector(collector);
+        if let Some(local_prop) =
+            resolve_local_object_property(ir, recv, member_name, &[], Some(&obj_ctx))
             && !local_prop.values.is_empty()
         {
             for (prop_ir, prop_val, _) in local_prop.values {
@@ -1113,6 +1117,10 @@ fn trace_construct_value(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Dispatches across all constructor target IR operations."
+)]
 fn trace_construct_vertex_op(
     ir: &Arc<FunctionIr>,
     v: &CfgVertex,
@@ -1214,11 +1222,82 @@ fn trace_construct_vertex_op(
                 true,
             );
         }
+        IrOp::PropRead { object, key, .. } => {
+            trace_prop_read_construct(ir, v, *object, key, call_stack, depth, call_ctx, collector);
+        }
         _ => {
             collector
                 .push_dynamic_gap("Dynamic constructor target could not be statically resolved.");
         }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Resolves namespace, module, and object-literal constructor targets for PropRead."
+)]
+fn trace_prop_read_construct(
+    ir: &Arc<FunctionIr>,
+    v: &CfgVertex,
+    object: ValueId,
+    key: &IrPropKey,
+    call_stack: &[CallFrame],
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    collector: &mut TraceCollector<'_>,
+) {
+    if let Some(prop_syn) = v.syntax {
+        let decl = collector.semantic.resolve_declaration(prop_syn);
+        let mut lookup_syns = vec![prop_syn];
+        if depth == 0 {
+            lookup_syns.insert(0, collector.call_syntax);
+        }
+        if try_apply_calls_summary(
+            &lookup_syns,
+            decl.as_ref(),
+            call_ctx.as_ref(),
+            depth,
+            0,
+            collector,
+        ) {
+            return;
+        }
+    }
+    let obj_ctx = ObjectLookupContext::from_collector(collector);
+    if let Some(member_name) = prop_key_static_name(key)
+        && let Some(prop_vals) =
+            resolve_local_object_property(ir, object, member_name, call_stack, Some(&obj_ctx))
+    {
+        if !prop_vals.is_exhaustive {
+            collector.push_dynamic_gap(format!(
+                "Object literal holding constructor property '{member_name}' may have overwritten or spread properties."
+            ));
+        }
+        for (prop_ir, prop_val, prop_stack) in prop_vals.values {
+            trace_construct_value(
+                &prop_ir,
+                prop_val,
+                &prop_stack,
+                depth + 1,
+                call_ctx,
+                collector,
+            );
+        }
+        return;
+    }
+    if let Some(prop_syn) = v.syntax
+        && let Some(decl) = collector.semantic.resolve_declaration(prop_syn)
+    {
+        if decl.is_signature_only {
+            collector.push_dynamic_gap(
+                "Constructed property resolves only to a type signature without a runtime class or constructor.",
+            );
+        } else {
+            emit_constructor_from_decl(&decl, depth, collector);
+        }
+        return;
+    }
+    collector.push_dynamic_gap("Dynamic constructor property could not be statically resolved.");
 }
 
 fn emit_class_constructor_from_syntax(class_syn: SyntaxId, collector: &mut TraceCollector<'_>) {
@@ -1261,12 +1340,14 @@ fn emit_constructor_from_decl(
         emit_class_constructor_from_syntax(decl_syn, collector);
         return;
     }
-    if matches!(decl.kind.as_deref(), Some("VariableDeclaration"))
-        && !decl.is_external
-        && let Ok(decl_ir) = collector.ir_provider.enclosing_scope_ir(decl_syn)
+    if matches!(
+        decl.kind.as_deref(),
+        Some("VariableDeclaration" | "BindingElement" | "ExportAssignment")
+    ) && !decl.is_external
     {
+        let effective_decl_syn = resolve_writable_decl_syntax(decl_syn, collector);
         let writes = var_writes::collect_all_writes_for_decl(
-            decl_syn,
+            effective_decl_syn,
             decl.symbol,
             collector.semantic,
             collector.syntax,
@@ -1280,53 +1361,30 @@ fn emit_constructor_from_decl(
             }
             return;
         }
-        let _ = decl_ir;
     }
     emit_resolved_declaration(decl, Some(collector.call_syntax), false, None, 0, collector);
 }
 
-fn resolve_symbol_callee(
-    ident_syntax: SyntaxId,
+fn resolve_writable_decl_syntax(decl_syn: SyntaxId, collector: &TraceCollector<'_>) -> SyntaxId {
+    if collector.ir_provider.enclosing_scope_ir(decl_syn).is_ok() {
+        return decl_syn;
+    }
+    if let ImplementationFact::Resolved(imp) = collector
+        .semantic
+        .resolve_implementation_for_syntax(decl_syn, None)
+    {
+        return imp.declaration_syntax;
+    }
+    decl_syn
+}
+
+fn emit_decl_or_variable_writes(
+    decl: &DeclarationSummaryData,
     depth: usize,
     call_ctx: Option<ActiveCallContext<'_>>,
     args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) {
-    let Some(decl) = collector.semantic.resolve_declaration(ident_syntax) else {
-        collector
-            .push_dynamic_gap("Unresolved callee identifier cannot be mapped to a declaration.");
-        return;
-    };
-
-    if decl.is_default_library
-        && decl.name.as_deref() == Some("undefined")
-        && decl.kind.as_deref() == Some("VariableDeclaration")
-    {
-        return;
-    }
-
-    let mut lookup_syns = vec![ident_syntax];
-    if depth == 0 && call_ctx.is_some() {
-        lookup_syns.insert(0, collector.call_syntax);
-    }
-    if try_apply_calls_summary(
-        &lookup_syns,
-        Some(&decl),
-        call_ctx.as_ref(),
-        depth,
-        args_offset,
-        collector,
-    ) {
-        return;
-    }
-
-    if decl.is_signature_only {
-        collector.push_dynamic_gap(
-            "Callee resolves only to a TypeScript type or parameter signature without a runtime function.",
-        );
-        return;
-    }
-
     let Some(decl_syn) = decl.primary_syntax else {
         collector.push_dynamic_gap("Resolved callee symbol has no primary declaration node.");
         return;
@@ -1334,11 +1392,12 @@ fn resolve_symbol_callee(
 
     if matches!(
         decl.kind.as_deref(),
-        Some("VariableDeclaration" | "ExportAssignment")
+        Some("VariableDeclaration" | "BindingElement" | "ExportAssignment")
     ) && !decl.is_external
     {
+        let effective_decl_syn = resolve_writable_decl_syntax(decl_syn, collector);
         let writes = var_writes::collect_all_writes_for_decl(
-            decl_syn,
+            effective_decl_syn,
             decl.symbol,
             collector.semantic,
             collector.syntax,
@@ -1388,13 +1447,58 @@ fn resolve_symbol_callee(
     }
 
     emit_resolved_declaration(
-        &decl,
+        decl,
         Some(collector.call_syntax),
         false,
         call_ctx.as_ref(),
         args_offset,
         collector,
     );
+}
+
+fn resolve_symbol_callee(
+    ident_syntax: SyntaxId,
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
+    args_offset: usize,
+    collector: &mut TraceCollector<'_>,
+) {
+    let Some(decl) = collector.semantic.resolve_declaration(ident_syntax) else {
+        collector
+            .push_dynamic_gap("Unresolved callee identifier cannot be mapped to a declaration.");
+        return;
+    };
+
+    if decl.is_default_library
+        && decl.name.as_deref() == Some("undefined")
+        && decl.kind.as_deref() == Some("VariableDeclaration")
+    {
+        return;
+    }
+
+    let mut lookup_syns = vec![ident_syntax];
+    if depth == 0 && call_ctx.is_some() {
+        lookup_syns.insert(0, collector.call_syntax);
+    }
+    if try_apply_calls_summary(
+        &lookup_syns,
+        Some(&decl),
+        call_ctx.as_ref(),
+        depth,
+        args_offset,
+        collector,
+    ) {
+        return;
+    }
+
+    if decl.is_signature_only {
+        collector.push_dynamic_gap(
+            "Callee resolves only to a TypeScript type or parameter signature without a runtime function.",
+        );
+        return;
+    }
+
+    emit_decl_or_variable_writes(&decl, depth, call_ctx, args_offset, collector);
 }
 
 #[expect(
@@ -1437,8 +1541,11 @@ fn resolve_prop_read_callable(
         return;
     }
 
-    // 2. Local object-literal property resolution (`const obj = { run: fn }; obj.run()` or destructuring).
-    if let Some(prop_vals) = resolve_local_object_property(ir, object_val, member_name, call_stack)
+    // 2. Local or imported object-literal property resolution (`const obj = { run: fn }; obj.run()`,
+    //    `export const posix: IPath = { normalize() {} }`, or destructured IIFE exports).
+    let obj_ctx = ObjectLookupContext::from_collector(collector);
+    if let Some(prop_vals) =
+        resolve_local_object_property(ir, object_val, member_name, call_stack, Some(&obj_ctx))
     {
         if !prop_vals.is_exhaustive {
             collector.push_dynamic_gap(format!(
@@ -1483,7 +1590,8 @@ fn resolve_prop_read_callable(
         && resolve_static_member_call(
             prop_syn,
             member_name,
-            call_ctx.as_ref(),
+            depth,
+            call_ctx,
             args_offset,
             collector,
         )
@@ -1508,25 +1616,24 @@ fn resolve_prop_read_callable(
 fn resolve_static_member_call(
     prop_syn: SyntaxId,
     member_name: &str,
-    call_ctx: Option<&ActiveCallContext<'_>>,
+    depth: usize,
+    call_ctx: Option<ActiveCallContext<'_>>,
     args_offset: usize,
     collector: &mut TraceCollector<'_>,
 ) -> bool {
     if let Some(decl) = collector.semantic.resolve_declaration(prop_syn)
         && matches!(
             decl.kind.as_deref(),
-            Some("FunctionDeclaration" | "VariableDeclaration" | "ExportAssignment")
+            Some(
+                "FunctionDeclaration"
+                    | "VariableDeclaration"
+                    | "BindingElement"
+                    | "ExportAssignment"
+            )
         )
         && !decl.is_signature_only
     {
-        emit_resolved_declaration(
-            &decl,
-            Some(collector.call_syntax),
-            false,
-            call_ctx,
-            args_offset,
-            collector,
-        );
+        emit_decl_or_variable_writes(&decl, depth, call_ctx, args_offset, collector);
         return true;
     }
 
@@ -1553,7 +1660,7 @@ fn resolve_static_member_call(
                     &decl,
                     Some(collector.call_syntax),
                     node.is_external,
-                    call_ctx,
+                    call_ctx.as_ref(),
                     args_offset,
                     collector,
                 );
@@ -1797,51 +1904,151 @@ struct ObjectPropLookupResult {
     is_exhaustive: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ObjectLookupContext<'a> {
+    call_syntax: SyntaxId,
+    call_location: Option<&'a DiagnosticLocation>,
+    semantic: &'a dyn SemanticModel,
+    syntax: &'a dyn SyntaxCatalog,
+    ir_provider: &'a dyn IrProvider,
+    summary_index: &'a BehaviorSummaryIndex,
+}
+
+impl<'a> ObjectLookupContext<'a> {
+    fn from_collector(collector: &'a TraceCollector<'a>) -> Self {
+        Self {
+            call_syntax: collector.call_syntax,
+            call_location: collector.call_location.as_ref(),
+            semantic: collector.semantic,
+            syntax: collector.syntax,
+            ir_provider: collector.ir_provider,
+            summary_index: collector.summary_index,
+        }
+    }
+}
+
+struct ObjectPropSearch<'a> {
+    ctx: Option<&'a ObjectLookupContext<'a>>,
+    visited: FxHashSet<(FunctionIrId, ValueId, usize)>,
+    out: ObjectPropLookupResult,
+}
+
 fn resolve_local_object_property(
     ir: &Arc<FunctionIr>,
     object_val: ValueId,
     prop_name: &str,
     call_stack: &[CallFrame],
+    ctx: Option<&ObjectLookupContext<'_>>,
 ) -> Option<ObjectPropLookupResult> {
-    let mut visited = FxHashSet::default();
-    let mut out = ObjectPropLookupResult {
-        values: Vec::new(),
-        is_exhaustive: true,
+    let mut search = ObjectPropSearch {
+        ctx,
+        visited: FxHashSet::default(),
+        out: ObjectPropLookupResult {
+            values: Vec::new(),
+            is_exhaustive: true,
+        },
     };
-    if !collect_object_alloc_props(
-        ir,
-        object_val,
-        prop_name,
-        call_stack,
-        0,
-        &mut visited,
-        &mut out,
-    ) || out.values.is_empty()
+    if !collect_object_alloc_props(ir, object_val, prop_name, call_stack, 0, &mut search)
+        || search.out.values.is_empty()
     {
         return None;
     }
-    Some(out)
+    Some(search.out)
 }
 
+fn collect_object_props_from_decl_syntax(
+    decl_syn: SyntaxId,
+    prop_name: &str,
+    depth: usize,
+    search: &mut ObjectPropSearch<'_>,
+) -> bool {
+    let Some(ctx) = search.ctx else {
+        return false;
+    };
+    let Some(decl) = ctx.semantic.resolve_declaration(decl_syn) else {
+        return false;
+    };
+    if decl.is_external || decl.is_signature_only {
+        return false;
+    }
+    if !matches!(
+        decl.kind.as_deref(),
+        Some("VariableDeclaration" | "BindingElement" | "ExportAssignment")
+    ) {
+        return false;
+    }
+    let Some(raw_decl_syn) = decl.primary_syntax else {
+        return false;
+    };
+    let effective_decl_syn = if ctx.ir_provider.enclosing_scope_ir(raw_decl_syn).is_ok() {
+        raw_decl_syn
+    } else if let ImplementationFact::Resolved(imp) = ctx
+        .semantic
+        .resolve_implementation_for_syntax(raw_decl_syn, None)
+    {
+        imp.declaration_syntax
+    } else {
+        return false;
+    };
+    let writes = var_writes::collect_all_writes_for_decl(
+        effective_decl_syn,
+        decl.symbol,
+        ctx.semantic,
+        ctx.syntax,
+        ctx.ir_provider,
+    );
+    if writes.writes.is_empty() {
+        return false;
+    }
+    if !writes.is_exhaustive {
+        search.out.is_exhaustive = false;
+    }
+    for w in writes.writes {
+        match w.source {
+            VarWriteSource::Value(w_val) => {
+                if !collect_object_alloc_props(
+                    &w.scope_ir,
+                    w_val,
+                    prop_name,
+                    &[],
+                    depth + 1,
+                    search,
+                ) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Traces local and imported object literals, chained properties, and IIFE/factory returns uniformly."
+)]
 fn collect_object_alloc_props(
     ir: &Arc<FunctionIr>,
     val: ValueId,
     prop_name: &str,
     call_stack: &[CallFrame],
     depth: usize,
-    visited: &mut FxHashSet<(FunctionIrId, ValueId)>,
-    out: &mut ObjectPropLookupResult,
+    search: &mut ObjectPropSearch<'_>,
 ) -> bool {
-    if depth >= MAX_TRACE_DEPTH || !visited.insert((ir.id, val)) {
+    if depth >= MAX_TRACE_DEPTH
+        || !search
+            .visited
+            .insert((ir.id, val, stack_fingerprint(call_stack)))
+    {
         return false;
     }
 
     if let Some(sources) = ir.value_sources.get(&val)
         && !sources.is_empty()
     {
-        return sources.iter().all(|&s| {
-            collect_object_alloc_props(ir, s, prop_name, call_stack, depth + 1, visited, out)
-        });
+        return sources
+            .iter()
+            .all(|&s| collect_object_alloc_props(ir, s, prop_name, call_stack, depth + 1, search));
     }
 
     let producers = value_producers(ir, val);
@@ -1857,14 +2064,17 @@ fn collect_object_alloc_props(
                     match prop {
                         IrObjectProp::KeyValue { key, value } => {
                             if prop_key_static_name(key) == Some(prop_name) {
-                                out.values
-                                    .push((Arc::clone(ir), *value, call_stack.to_vec()));
+                                search.out.values.push((
+                                    Arc::clone(ir),
+                                    *value,
+                                    call_stack.to_vec(),
+                                ));
                                 matched_here = true;
                                 break;
                             }
                         }
                         IrObjectProp::Spread(_) => {
-                            out.is_exhaustive = false;
+                            search.out.is_exhaustive = false;
                         }
                     }
                 }
@@ -1881,15 +2091,33 @@ fn collect_object_alloc_props(
                     prop_name,
                     call_stack,
                     depth + 1,
-                    visited,
-                    out,
+                    search,
                 ) {
                     return false;
                 }
             }
             IrOp::ReadLocal { binding } => {
+                if let Some((frame, parent_stack)) = call_stack.split_last()
+                    && let Some(param_idx) = ir
+                        .parameters
+                        .iter()
+                        .position(|p| p.binding == Some(*binding))
+                    && let Some(IrCallArg::Positional(arg_val)) = frame.args.get(param_idx)
+                {
+                    if !collect_object_alloc_props(
+                        &frame.caller_ir,
+                        *arg_val,
+                        prop_name,
+                        parent_stack,
+                        depth + 1,
+                        search,
+                    ) {
+                        return false;
+                    }
+                    continue;
+                }
                 let b_info = ir.bindings.get(binding.0 as usize);
-                if b_info.is_some_and(|b| b.mutability != crate::ir::BindingMutability::Const) {
+                if b_info.is_some_and(|b| b.mutability != BindingMutability::Const) {
                     return false;
                 }
                 let writes: Vec<ValueId> = ir
@@ -1911,9 +2139,127 @@ fn collect_object_alloc_props(
                     prop_name,
                     call_stack,
                     depth + 1,
-                    visited,
-                    out,
+                    search,
                 ) {
+                    return false;
+                }
+            }
+            IrOp::ReadSymbol { ident_syntax } => {
+                if !collect_object_props_from_decl_syntax(*ident_syntax, prop_name, depth, search) {
+                    return false;
+                }
+            }
+            IrOp::PropRead {
+                object: inner_obj,
+                key: inner_key,
+                ..
+            } => {
+                let resolved_inner = if let Some(inner_name) = prop_key_static_name(inner_key)
+                    && let Some(inner_props) = resolve_local_object_property(
+                        ir, *inner_obj, inner_name, call_stack, search.ctx,
+                    ) {
+                    if !inner_props.is_exhaustive {
+                        search.out.is_exhaustive = false;
+                    }
+                    for (p_ir, p_val, p_stack) in inner_props.values {
+                        if !collect_object_alloc_props(
+                            &p_ir,
+                            p_val,
+                            prop_name,
+                            &p_stack,
+                            depth + 1,
+                            search,
+                        ) {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                };
+                if !resolved_inner
+                    && let Some(prop_syn) = v.syntax
+                    && collect_object_props_from_decl_syntax(prop_syn, prop_name, depth, search)
+                {
+                    continue;
+                }
+                if !resolved_inner {
+                    return false;
+                }
+            }
+            IrOp::Call {
+                callee: inner_callee,
+                args: inner_args,
+                ..
+            } => {
+                let Some(ctx) = search.ctx else {
+                    return false;
+                };
+                if call_stack.len() >= MAX_CALL_STACK_DEPTH {
+                    return false;
+                }
+                let inner_syntax = v.syntax.unwrap_or(ctx.call_syntax);
+                let mut sub_collector = TraceCollector::new(
+                    inner_syntax,
+                    ctx.call_location.cloned(),
+                    ctx.semantic,
+                    ctx.syntax,
+                    ctx.ir_provider,
+                    ctx.summary_index,
+                );
+                trace_callable_value(
+                    ir,
+                    *inner_callee,
+                    call_stack,
+                    depth + 1,
+                    None,
+                    0,
+                    &mut sub_collector,
+                );
+                if sub_collector.conflict.is_some()
+                    || !sub_collector.is_complete
+                    || sub_collector.targets.is_empty()
+                {
+                    return false;
+                }
+                let mut next_stack = call_stack.to_vec();
+                next_stack.push(CallFrame {
+                    caller_ir: Arc::clone(ir),
+                    args: inner_args.clone(),
+                });
+                let mut has_return = false;
+                for target in sub_collector.targets {
+                    let Some(scope_syn) = target.fn_scope_syntax else {
+                        return false;
+                    };
+                    let Ok(target_ir) = ctx.ir_provider.function_ir(scope_syn) else {
+                        return false;
+                    };
+                    let mut target_has_return = false;
+                    for cv in &target_ir.vertices {
+                        if let IrOp::Return {
+                            value: Some(ret_val),
+                        } = cv.op
+                        {
+                            target_has_return = true;
+                            has_return = true;
+                            if !collect_object_alloc_props(
+                                &target_ir,
+                                ret_val,
+                                prop_name,
+                                &next_stack,
+                                depth + 1,
+                                search,
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                    if !target_has_return {
+                        return false;
+                    }
+                }
+                if !has_return {
                     return false;
                 }
             }
@@ -3676,10 +4022,16 @@ pub fn build_ir_call_graph_with_summaries(
     let mut seen_call_syntaxes: FxHashSet<SyntaxId> = FxHashSet::default();
 
     for &file_id in project_files {
-        for scope_entry in ir_provider.scopes_in_file(file_id) {
-            let Ok(scope_ir) = ir_provider.function_ir(scope_entry.root_syntax) else {
-                continue;
-            };
+        let scopes = ir_provider.scopes_in_file(file_id);
+        let mut loaded_scopes = Vec::with_capacity(scopes.len());
+        for scope_entry in &scopes {
+            if let Ok(scope_ir) = ir_provider.function_ir(scope_entry.root_syntax) {
+                loaded_scopes.push(scope_ir);
+            }
+        }
+        collect_escaped_callables_in_file(&loaded_scopes, semantic, syntax, &mut graph);
+
+        for scope_ir in &loaded_scopes {
             for vertex in &scope_ir.vertices {
                 if !matches!(vertex.op, IrOp::Call { .. } | IrOp::Construct { .. }) {
                     continue;
@@ -3699,7 +4051,7 @@ pub fn build_ir_call_graph_with_summaries(
 
                 let analyzed = analyze_call_vertex_with_scope(
                     call_syn,
-                    Some((&scope_ir, vertex)),
+                    Some((scope_ir, vertex)),
                     semantic,
                     syntax,
                     ir_provider,
@@ -3744,6 +4096,357 @@ pub fn build_ir_call_graph_with_summaries(
     }
 
     graph
+}
+
+fn mark_escaped_syntax(syn: SyntaxId, semantic: &dyn SemanticModel, graph: &mut IrCallGraph) {
+    graph.escaped_decls.insert(syn);
+    if let Some(sym) = semantic.symbol_at_syntax(syn) {
+        graph.escaped_symbols.insert(sym);
+    }
+    if let Some(decl) = semantic.resolve_declaration(syn) {
+        if let Some(primary) = decl.primary_syntax {
+            graph.escaped_decls.insert(primary);
+        }
+        if let Some(callable) = decl.callable_syntax {
+            graph.escaped_decls.insert(callable);
+        }
+        if let Some(sym) = decl.symbol {
+            graph.escaped_symbols.insert(sym);
+        }
+    }
+}
+
+fn extract_export_decl_local_names(text: &str) -> Vec<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("export type") || trimmed.contains(" from ") {
+        return Vec::new();
+    }
+    let Some(open) = trimmed.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = trimmed[open + 1..].find('}') else {
+        return Vec::new();
+    };
+    let body = &trimmed[open + 1..open + 1 + close];
+    let mut names = Vec::new();
+    for part in body.split(',') {
+        let spec = part.trim();
+        if spec.is_empty() || spec.starts_with("type ") || spec.starts_with("type\t") {
+            continue;
+        }
+        let local = spec.split(" as ").next().unwrap_or(spec).trim();
+        if !local.is_empty()
+            && local
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            names.push(local);
+        }
+    }
+    names
+}
+
+fn mark_prop_key_used(key: &IrPropKey, used: &mut FxHashSet<ValueId>) {
+    if let IrPropKey::Computed { key: k, .. } = key {
+        used.insert(*k);
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Exhaustively collects all non-callee ValueId operands across every IrOp variant."
+)]
+fn collect_non_callee_used_values(scope_ir: &FunctionIr) -> FxHashSet<ValueId> {
+    let mut used = FxHashSet::default();
+    for v in &scope_ir.vertices {
+        match &v.op {
+            IrOp::Entry
+            | IrOp::Exit
+            | IrOp::NopMerge
+            | IrOp::Literal { .. }
+            | IrOp::ReadLocal { .. }
+            | IrOp::ReadSymbol { .. }
+            | IrOp::ThisRef
+            | IrOp::SuperRef
+            | IrOp::MetaProp
+            | IrOp::CatchParamBind { .. }
+            | IrOp::FunctionLiteral { .. }
+            | IrOp::ClassLiteral { .. }
+            | IrOp::ValueForward { .. } => {}
+            IrOp::TemplateString { spans } => used.extend(spans.iter().copied()),
+            IrOp::Unary { operand, .. } => {
+                used.insert(*operand);
+            }
+            IrOp::Binary { left, right, .. } => {
+                used.insert(*left);
+                used.insert(*right);
+            }
+            IrOp::AssignLocal { value, .. } | IrOp::AssignSymbol { value, .. } => {
+                used.insert(*value);
+            }
+            IrOp::PropWrite {
+                object, key, value, ..
+            } => {
+                used.insert(*object);
+                mark_prop_key_used(key, &mut used);
+                used.insert(*value);
+            }
+            IrOp::PropRead { object, key, .. } => {
+                used.insert(*object);
+                mark_prop_key_used(key, &mut used);
+            }
+            IrOp::ObjectRest { source, .. }
+            | IrOp::Branch { condition: source }
+            | IrOp::SwitchDispatch {
+                discriminant: source,
+            }
+            | IrOp::Throw { exception: source }
+            | IrOp::Await { promise: source }
+            | IrOp::IteratorInit {
+                iterable: source, ..
+            }
+            | IrOp::IteratorNext {
+                iterator: source, ..
+            }
+            | IrOp::IteratorRest {
+                iterator: source, ..
+            }
+            | IrOp::IteratorClose {
+                iterator: source, ..
+            } => {
+                used.insert(*source);
+            }
+            IrOp::Call { receiver, args, .. } => {
+                if let Some(recv) = receiver {
+                    used.insert(*recv);
+                }
+                for arg in args {
+                    match arg {
+                        IrCallArg::Positional(a) | IrCallArg::Spread(a) => {
+                            used.insert(*a);
+                        }
+                    }
+                }
+            }
+            IrOp::Construct { args, .. } => {
+                for arg in args {
+                    match arg {
+                        IrCallArg::Positional(a) | IrCallArg::Spread(a) => {
+                            used.insert(*a);
+                        }
+                    }
+                }
+            }
+            IrOp::ObjectAlloc { props, .. } => {
+                for prop in props {
+                    match prop {
+                        IrObjectProp::KeyValue { key, value } => {
+                            mark_prop_key_used(key, &mut used);
+                            used.insert(*value);
+                        }
+                        IrObjectProp::Spread(s) => {
+                            used.insert(*s);
+                        }
+                    }
+                }
+            }
+            IrOp::ArrayAlloc { elems, .. } => {
+                for elem in elems {
+                    if let IrArrayElem::Value(val) | IrArrayElem::Spread(val) = elem {
+                        used.insert(*val);
+                    }
+                }
+            }
+            IrOp::JsxElement {
+                tag_expr,
+                props,
+                children,
+                ..
+            } => {
+                if let Some(tag) = tag_expr {
+                    used.insert(*tag);
+                }
+                for prop in props {
+                    match prop {
+                        IrObjectProp::KeyValue { key, value } => {
+                            mark_prop_key_used(key, &mut used);
+                            used.insert(*value);
+                        }
+                        IrObjectProp::Spread(s) => {
+                            used.insert(*s);
+                        }
+                    }
+                }
+                used.extend(children.iter().copied());
+            }
+            IrOp::Return { value } | IrOp::Yield { value, .. } => {
+                if let Some(val) = value {
+                    used.insert(*val);
+                }
+            }
+            IrOp::Unknown {
+                evaluated_children, ..
+            } => used.extend(evaluated_children.iter().copied()),
+        }
+    }
+
+    // Propagate non-callee usage backwards through `value_sources` and `ValueForward` wrappers.
+    loop {
+        let mut changed = false;
+        for (&merged, sources) in &scope_ir.value_sources {
+            if used.contains(&merged) {
+                for &src in sources {
+                    if used.insert(src) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for v in &scope_ir.vertices {
+            if let IrOp::ValueForward { source, .. } = v.op
+                && v.value.is_some_and(|val| used.contains(&val))
+                && used.insert(source)
+            {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    used
+}
+
+fn collect_escaped_callables_in_file(
+    scopes: &[Arc<FunctionIr>],
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    graph: &mut IrCallGraph,
+) {
+    let mut exported_names: FxHashSet<String> = FxHashSet::default();
+
+    for scope_ir in scopes {
+        if scope_ir.decl_semantics.is_exported || scope_ir.decl_semantics.is_default_export {
+            mark_escaped_syntax(scope_ir.root_syntax, semantic, graph);
+        }
+
+        if scope_ir.scope_kind == IrScopeKind::ModuleTopLevel {
+            for v in &scope_ir.vertices {
+                if let Some(syn) = v.syntax
+                    && syntax.syntax_kind(syn).as_deref() == Some("ExportDeclaration")
+                    && let Some(text) = syntax.syntax_text(syn)
+                {
+                    for name in extract_export_decl_local_names(&text) {
+                        exported_names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+
+        let non_callee_used = collect_non_callee_used_values(scope_ir);
+        for v in &scope_ir.vertices {
+            let Some(val) = v.value else {
+                continue;
+            };
+            if !non_callee_used.contains(&val) {
+                continue;
+            }
+            match &v.op {
+                IrOp::FunctionLiteral { syntax: fn_syn, .. }
+                | IrOp::ClassLiteral { syntax: fn_syn } => {
+                    mark_escaped_syntax(*fn_syn, semantic, graph);
+                }
+                IrOp::ReadLocal { binding } => {
+                    if let Some(b) = scope_ir.bindings.get(binding.0 as usize) {
+                        graph.escaped_decls.insert(b.syntax);
+                        if let Some(sym) = b.symbol {
+                            graph.escaped_symbols.insert(sym);
+                        }
+                        mark_escaped_syntax(b.syntax, semantic, graph);
+                    }
+                }
+                IrOp::ReadSymbol { ident_syntax } => {
+                    mark_escaped_syntax(*ident_syntax, semantic, graph);
+                }
+                IrOp::PropRead { .. } => {
+                    if let Some(prop_syn) = v.syntax {
+                        mark_escaped_syntax(prop_syn, semantic, graph);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !exported_names.is_empty() {
+        for scope_ir in scopes {
+            if scope_ir.scope_kind == IrScopeKind::ModuleTopLevel {
+                for b in &scope_ir.bindings {
+                    if exported_names.contains(&b.name) {
+                        graph.escaped_decls.insert(b.syntax);
+                        if let Some(sym) = b.symbol {
+                            graph.escaped_symbols.insert(sym);
+                        }
+                        mark_escaped_syntax(b.syntax, semantic, graph);
+                    }
+                }
+            } else if let Some(decl) = semantic.resolve_declaration(scope_ir.root_syntax)
+                && decl
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| exported_names.contains(n))
+            {
+                mark_escaped_syntax(scope_ir.root_syntax, semantic, graph);
+            }
+        }
+    }
+}
+
+fn target_may_escape_as_value(
+    target_decl_syntax: SyntaxId,
+    target_symbol: Option<SymbolId>,
+    target_summary: Option<&DeclarationSummaryData>,
+    graph: &IrCallGraph,
+) -> bool {
+    if graph.escaped_decls.contains(&target_decl_syntax) {
+        return true;
+    }
+    if let Some(sym) = target_symbol
+        && graph.escaped_symbols.contains(&sym)
+    {
+        return true;
+    }
+    if let Some(summary) = target_summary {
+        if summary.is_external {
+            return true;
+        }
+        if matches!(
+            summary.kind.as_deref(),
+            Some("ExportAssignment" | "ExportSpecifier")
+        ) {
+            return true;
+        }
+        if summary
+            .primary_syntax
+            .is_some_and(|s| graph.escaped_decls.contains(&s))
+        {
+            return true;
+        }
+        if summary
+            .callable_syntax
+            .is_some_and(|s| graph.escaped_decls.contains(&s))
+        {
+            return true;
+        }
+        if summary
+            .symbol
+            .is_some_and(|s| graph.escaped_symbols.contains(&s))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolves all call sites inside `allowed_files` that target `target_decl_syntax` (or `target_symbol`),
@@ -3833,11 +4536,16 @@ pub fn find_callers_on_ir<S: BuildHasher>(
         let could_invoke_target = if matched_indices.contains(&idx) {
             true
         } else if site.is_untyped_dynamic_incomplete {
-            // An unresolved callback/dynamic call within scope could potentially call `target_decl`.
-            true
+            // An unresolved callback/dynamic call within scope can only call targets that escape as values.
+            target_may_escape_as_value(
+                target_decl_syntax,
+                target_symbol,
+                target_summary.as_ref(),
+                graph,
+            )
         } else if let Some(open_member) = &site.open_member_name {
             // Open polymorphic member call can target a method/accessor of the same member name.
-            !target_is_method || target_name == Some(open_member.as_str())
+            target_is_method && target_name == Some(open_member.as_str())
         } else {
             false
         };

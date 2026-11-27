@@ -35,6 +35,7 @@ import {
   buildDrizzleTableColumns,
   buildDrizzleZodSchema,
   buildQueryRowProjection,
+  dedupeGaps,
   type DrizzleColumnInfo,
   type DrizzleTableColumnsOptions,
   type DrizzleTableColumnsResult,
@@ -145,12 +146,17 @@ type TableIndex = {
 };
 
 type CachedDrizzleSnapshot = {
+  expandedFilesPromise?: Promise<readonly string[]>;
   tableIndexPromise?: Promise<TableIndex>;
   projectionsPromise?: Promise<readonly QueryRowProjectionResult[]>;
   drizzleZodPromises: Map<boolean, Promise<readonly DrizzleZodSchemaResult[]>>;
 };
 
 const snapshotCache = new WeakMap<ProjectSummary, CachedDrizzleSnapshot>();
+const schemaLevelGapsCache = new WeakMap<
+  DrizzleZodSchemaResult,
+  readonly Gap[]
+>();
 
 function getSnapshotCache(project: ProjectSummary): CachedDrizzleSnapshot {
   let cached = snapshotCache.get(project);
@@ -159,6 +165,62 @@ function getSnapshotCache(project: ProjectSummary): CachedDrizzleSnapshot {
     snapshotCache.set(project, cached);
   }
   return cached;
+}
+
+async function computeExpandedWorkspaceFiles(
+  ctx: ProjectContext,
+): Promise<readonly string[]> {
+  const seen = new Set<string>(ctx.project.sourceFiles);
+  let frontier = [...ctx.project.sourceFiles];
+
+  while (frontier.length > 0) {
+    const importSpecs = await ctx.findSyntax({
+      files: frontier,
+      kinds: ["ImportSpecifier"],
+    });
+    if (importSpecs.length === 0) {
+      break;
+    }
+    const decls = await ctx.resolveDeclarations(
+      importSpecs.map((spec) => spec.ref),
+      { select: { location: true } },
+    );
+    const nextFrontier: string[] = [];
+    for (const decl of decls) {
+      const file = decl.location?.file;
+      if (file !== undefined && isSourceFile(file) && !seen.has(file)) {
+        seen.add(file);
+        nextFrontier.push(file);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return [...seen];
+}
+
+function getExpandedWorkspaceFiles(
+  ctx: ProjectContext,
+): Promise<readonly string[]> {
+  const cache = getSnapshotCache(ctx.project);
+  cache.expandedFilesPromise ??= computeExpandedWorkspaceFiles(ctx);
+  return cache.expandedFilesPromise;
+}
+
+async function withExpandedWorkspaceFiles(
+  ctx: ProjectContext,
+): Promise<ProjectContext> {
+  const expandedFiles = await getExpandedWorkspaceFiles(ctx);
+  if (expandedFiles.length <= ctx.project.sourceFiles.length) {
+    return ctx;
+  }
+  return {
+    ...ctx,
+    findSyntax: (options) =>
+      options.files === undefined && options.range === undefined
+        ? ctx.findSyntax({ ...options, files: expandedFiles })
+        : ctx.findSyntax(options),
+  };
 }
 
 function spanKey(loc: DiagnosticLocation): string {
@@ -578,20 +640,21 @@ async function parseDrizzleTableFromCall(
 }
 
 async function computeTableIndex(ctx: ProjectContext): Promise<TableIndex> {
-  const astStore = new AstRangeStore(ctx);
+  const searchCtx = await withExpandedWorkspaceFiles(ctx);
+  const astStore = new AstRangeStore(searchCtx);
   const [tableCalls, creatorCalls, importSpecs, varDecls] = await Promise.all([
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["CallExpression"],
       calleeNames: [...TABLE_BUILDER_METHODS],
     }),
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["CallExpression"],
       calleeNames: [...TABLE_CREATOR_FACTORIES],
     }),
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["ImportSpecifier"],
     }),
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["VariableDeclaration"],
     }),
   ]);
@@ -1421,20 +1484,21 @@ function walkChainFromOuter(
 async function computeProjections(
   ctx: ProjectContext,
 ): Promise<readonly QueryRowProjectionResult[]> {
-  const tableIndex = await getTableIndex(ctx);
-  const astStore = new AstRangeStore(ctx);
-  const relationMap = await computeRelationMap(ctx, astStore, tableIndex);
+  const searchCtx = await withExpandedWorkspaceFiles(ctx);
+  const tableIndex = await getTableIndex(searchCtx);
+  const astStore = new AstRangeStore(searchCtx);
+  const relationMap = await computeRelationMap(searchCtx, astStore, tableIndex);
 
   const [selectCalls, returningCalls, relQueryCalls] = await Promise.all([
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["CallExpression"],
       calleeNames: ["select", "selectDistinct", "selectDistinctOn"],
     }),
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["CallExpression"],
       calleeNames: ["returning"],
     }),
-    ctx.findSyntax({
+    searchCtx.findSyntax({
       kinds: ["CallExpression"],
       calleeNames: ["findFirst", "findMany"],
     }),
@@ -1445,7 +1509,7 @@ async function computeProjections(
     return [];
   }
 
-  const decls = await ctx.resolveDeclarations(
+  const decls = await searchCtx.resolveDeclarations(
     allStarts.map((c) => c.ref),
     { select: { packageName: true, location: true } },
   );
@@ -2151,13 +2215,14 @@ async function evaluateDrizzleZodCallNode(
       at: callNode.location,
     },
   ];
-  const gaps: Gap[] = [];
+  const schemaLevelGaps: Gap[] = [];
+  const perFieldGaps: Gap[] = [];
   let hasDynamicFields = false;
 
   const fields: Record<string, DrizzleZodFieldInfo> = {};
   if (table !== undefined) {
     evidence.push(...table.evidence);
-    gaps.push(...table.gaps);
+    schemaLevelGaps.push(...table.gaps);
     if (table.hasDynamicColumns) {
       hasDynamicFields = true;
     }
@@ -2172,7 +2237,7 @@ async function evaluateDrizzleZodCallNode(
     }
   } else {
     hasDynamicFields = true;
-    gaps.push({
+    schemaLevelGaps.push({
       kind: "unresolved-drizzle-table",
       message: `Could not resolve Drizzle table in createSelectSchema(${tableArg?.text.trim() ?? ""})`,
       at: tableArg?.location ?? callNode.location,
@@ -2182,7 +2247,7 @@ async function evaluateDrizzleZodCallNode(
   if (refineArg !== undefined) {
     if (refineArg.kind !== "ObjectLiteralExpression") {
       hasDynamicFields = true;
-      gaps.push({
+      schemaLevelGaps.push({
         kind: "dynamic-schema-shape",
         message: `Dynamic refinement argument in createSelectSchema()`,
         at: refineArg.location,
@@ -2200,7 +2265,7 @@ async function evaluateDrizzleZodCallNode(
           );
           if (colName === undefined) {
             hasDynamicFields = true;
-            gaps.push({
+            schemaLevelGaps.push({
               kind: "dynamic-schema-field",
               message: "Computed field key in createSelectSchema refinement",
               at: prop.location,
@@ -2216,7 +2281,7 @@ async function evaluateDrizzleZodCallNode(
           refinedEntries.push({ colName, prop, initNode });
         } else if (prop.kind === "SpreadAssignment") {
           hasDynamicFields = true;
-          gaps.push({
+          schemaLevelGaps.push({
             kind: "dynamic-schema-spread",
             message: `Dynamic spread in createSelectSchema refinement: ${prop.text.trim()}`,
             at: prop.location,
@@ -2230,6 +2295,7 @@ async function evaluateDrizzleZodCallNode(
           modifiers = await extractZodFieldModifiers(
             ctx,
             refinedEntries.map((e) => e.initNode.ref),
+            { recordGaps: false },
           );
         }
 
@@ -2243,7 +2309,7 @@ async function evaluateDrizzleZodCallNode(
               message: `Refined field "${colName}" requires @tssae/zod refinement resolution`,
               at: prop.location,
             };
-            gaps.push(gap);
+            perFieldGaps.push(gap);
             fields[colName] = {
               name: colName,
               resolved: false,
@@ -2267,7 +2333,7 @@ async function evaluateDrizzleZodCallNode(
                 : (mod.nullable ?? false);
             const fieldEv = [...(baseCol?.evidence ?? []), ...mod.evidence];
             evidence.push(...mod.evidence);
-            gaps.push(...mod.gaps);
+            schemaLevelGaps.push(...mod.gaps);
             if (mod.gaps.length > 0) {
               hasDynamicFields = true;
             }
@@ -2291,7 +2357,7 @@ async function evaluateDrizzleZodCallNode(
                       at: prop.location,
                     },
                   ];
-            gaps.push(...fieldGaps);
+            perFieldGaps.push(...fieldGaps);
             fields[colName] = {
               name: colName,
               resolved: false,
@@ -2306,7 +2372,7 @@ async function evaluateDrizzleZodCallNode(
     }
   }
 
-  return buildDrizzleZodSchema({
+  const result = buildDrizzleZodSchema({
     target: callNode.ref,
     at: callNode.location,
     ...(schemaName !== undefined ? { schemaName } : {}),
@@ -2314,20 +2380,23 @@ async function evaluateDrizzleZodCallNode(
     fields,
     hasDynamicFields,
     evidence,
-    gaps,
+    gaps: [...schemaLevelGaps, ...perFieldGaps],
   });
+  schemaLevelGapsCache.set(result, dedupeGaps(schemaLevelGaps));
+  return result;
 }
 
 async function computeDrizzleZodSchemas(
   ctx: ProjectContext,
   refineFields: boolean,
 ): Promise<readonly DrizzleZodSchemaResult[]> {
-  const tableIndex = await getTableIndex(ctx);
-  const astStore = new AstRangeStore(ctx);
+  const searchCtx = await withExpandedWorkspaceFiles(ctx);
+  const tableIndex = await getTableIndex(searchCtx);
+  const astStore = new AstRangeStore(searchCtx);
 
   const [allCalls, varDecls] = await Promise.all([
-    ctx.findSyntax({ kinds: ["CallExpression"] }),
-    ctx.findSyntax({ kinds: ["VariableDeclaration"] }),
+    searchCtx.findSyntax({ kinds: ["CallExpression"] }),
+    searchCtx.findSyntax({ kinds: ["VariableDeclaration"] }),
   ]);
   if (allCalls.length === 0) {
     return [];
@@ -2450,6 +2519,19 @@ async function resolveOnDemandDrizzleZodCall(
   return pending;
 }
 
+function getOrComputeDrizzleZodSchemas(
+  ctx: ProjectContext,
+  refineFields: boolean,
+): Promise<readonly DrizzleZodSchemaResult[]> {
+  const cache = getSnapshotCache(ctx.project);
+  let pending = cache.drizzleZodPromises.get(refineFields);
+  if (pending === undefined) {
+    pending = computeDrizzleZodSchemas(ctx, refineFields);
+    cache.drizzleZodPromises.set(refineFields, pending);
+  }
+  return pending;
+}
+
 /**
  * Extracts schemas created by verified `drizzle-zod` calls (`createSelectSchema`,
  * `createSchemaFactory().createSelectSchema`), resolving underlying Drizzle tables
@@ -2461,13 +2543,7 @@ export async function extractDrizzleZodSchemas(
 ): Promise<readonly DrizzleZodSchemaResult[]> {
   ctx.recordGaps([]);
   const refineFields = options?.refineFields ?? true;
-  const cache = getSnapshotCache(ctx.project);
-  let pending = cache.drizzleZodPromises.get(refineFields);
-  if (pending === undefined) {
-    pending = computeDrizzleZodSchemas(ctx, refineFields);
-    cache.drizzleZodPromises.set(refineFields, pending);
-  }
-  const all = await pending;
+  const all = await getOrComputeDrizzleZodSchemas(ctx, refineFields);
   let results: readonly DrizzleZodSchemaResult[];
   if (options?.targets !== undefined) {
     const byHandle = new Map(all.map((item) => [item.target.handleId, item]));
@@ -2498,6 +2574,7 @@ function toExternalSchemaResolution(
 ): ExternalSchemaResolution {
   const fields: Record<string, ValidatorFieldInfo> = {};
   const unresolvedFields: Record<string, readonly Gap[]> = {};
+  const perFieldGapSet = new Set<Gap>();
   for (const [name, info] of Object.entries(schema.fields)) {
     if (info.resolved && info.requirement !== undefined) {
       fields[name] = {
@@ -2508,14 +2585,20 @@ function toExternalSchemaResolution(
       };
     } else if (info.gaps !== undefined && info.gaps.length > 0) {
       unresolvedFields[name] = info.gaps;
+      for (const gap of info.gaps) {
+        perFieldGapSet.add(gap);
+      }
     }
   }
+  const schemaLevelGaps =
+    schemaLevelGapsCache.get(schema) ??
+    schema.gaps.filter((gap) => !perFieldGapSet.has(gap));
   return {
     fields,
     hasDynamicFields: schema.hasDynamicFields,
     ...(Object.keys(unresolvedFields).length > 0 ? { unresolvedFields } : {}),
     evidence: schema.evidence,
-    gaps: schema.gaps,
+    gaps: schemaLevelGaps,
   };
 }
 
@@ -2526,7 +2609,7 @@ function toExternalSchemaResolution(
 export const drizzleZodSchemaResolver: ExternalSchemaResolver = {
   id: "drizzle-zod",
   resolveSchemaCall: async (ctx, callSyntax) => {
-    const schemas = await extractDrizzleZodSchemas(ctx, { refineFields: true });
+    const schemas = await getOrComputeDrizzleZodSchemas(ctx, true);
     const match =
       schemas.find((s) => s.target.handleId === callSyntax.handleId) ??
       (await resolveOnDemandDrizzleZodCall(ctx, callSyntax, true));

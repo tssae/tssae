@@ -2485,8 +2485,12 @@ export async function extractZodFields(
 export async function extractZodFieldModifiers(
   ctx: ProjectContext,
   targets: readonly SyntaxRef[],
+  options?: { readonly recordGaps?: boolean },
 ): Promise<readonly ValidatorFieldModifierResult[]> {
-  ctx.recordGaps([]);
+  const shouldRecordGaps = options?.recordGaps !== false;
+  if (shouldRecordGaps) {
+    ctx.recordGaps([]);
+  }
   if (targets.length === 0) {
     return [];
   }
@@ -2612,7 +2616,9 @@ export async function extractZodFieldModifiers(
     }
   }
 
-  recordResultGaps(ctx, results);
+  if (shouldRecordGaps) {
+    recordResultGaps(ctx, results);
+  }
   return results;
 }
 

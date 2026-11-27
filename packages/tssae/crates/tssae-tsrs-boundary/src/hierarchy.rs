@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use tsrs_ast::{
     Kind, ModifierFlags, Node, SourceFile, Symbol, SymbolFlags, get_combined_modifier_flags,
@@ -7,8 +9,8 @@ use tsrs_checker::{Type, TypeFlags};
 use tsrs_compiler::{CheckerHandle, Program};
 use tsrs_core::P;
 use tssae_common::{
-    ClassMemberFact, ClassOrInterfaceKind, MemberTargetHierarchy, SymbolId, SyntaxId,
-    TypeHierarchyNode,
+    ClassMemberFact, ClassOrInterfaceKind, DiagnosticLocation, MemberTargetHierarchy, SymbolId,
+    SyntaxId, TypeHierarchyNode,
 };
 
 use crate::{
@@ -21,8 +23,9 @@ use crate::{
 };
 
 /// Indexed class/interface inheritance graph collected lazily across the program's source files.
-pub(crate) struct ProgramHierarchyIndex {
+pub struct ProgramHierarchyIndex {
     nodes_by_symbol: FxHashMap<P<Symbol>, TypeHierarchyNodeRaw>,
+    children_by_base: FxHashMap<P<Symbol>, Vec<P<Symbol>>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +52,7 @@ struct RawMemberFact {
     member_node: P<Node>,
     symbol: Option<P<Symbol>>,
     kind: String,
+    location: Option<DiagnosticLocation>,
     has_body: bool,
     is_abstract: bool,
     is_static: bool,
@@ -84,23 +88,29 @@ impl ProgramHierarchyIndex {
         // plus any source files referenced directly via `program.get_source_files()`.
         let mut source_files: Vec<P<SourceFile>> = Vec::new();
         for &sf in program.get_source_files() {
-            if seen_sfs.insert(sf) {
-                source_files.push(sf);
+            if !program.is_source_file_default_library(sf.path()) && seen_sfs.insert(sf) {
+                let text = sf.text();
+                if text.contains("class") || text.contains("interface") {
+                    source_files.push(sf);
+                }
             }
         }
         for &wp in workspace_programs {
             for &sf in wp.get_source_files() {
-                if !wp.is_source_file_default_library(sf.path()) && seen_sfs.insert(sf) {
-                    source_files.push(sf);
+                if !wp.is_source_file_default_library(sf.path())
+                    && !program.is_source_file_default_library(sf.path())
+                    && seen_sfs.insert(sf)
+                {
+                    let text = sf.text();
+                    if text.contains("class") || text.contains("interface") {
+                        source_files.push(sf);
+                    }
                 }
             }
         }
 
         // Gather module-level exported symbols (`export { X }`, `export default X`, etc.).
         for &sf in &source_files {
-            if program.is_source_file_default_library(sf.path()) {
-                continue;
-            }
             if let Some(sf_sym) = checker.get_symbol_at_location_exported(sf.as_node()) {
                 let exports = checker.get_exports_of_module_exported(sf_sym);
                 for exp in exports {
@@ -115,12 +125,10 @@ impl ProgramHierarchyIndex {
 
         // Index every ClassDeclaration, ClassExpression, and InterfaceDeclaration in the snapshot.
         for &sf in &source_files {
-            if program.is_source_file_default_library(sf.path()) {
-                continue;
-            }
             let is_external_file = !is_project_source_file(program, sf)
                 && !is_first_party_workspace_path(cwd, sf.file_name());
             index_types_in_node(
+                cwd,
                 sf.as_node(),
                 is_external_file,
                 checker,
@@ -129,7 +137,17 @@ impl ProgramHierarchyIndex {
             );
         }
 
-        Self { nodes_by_symbol }
+        let mut children_by_base: FxHashMap<P<Symbol>, Vec<P<Symbol>>> = FxHashMap::default();
+        for (&sym, raw) in &nodes_by_symbol {
+            for &base_sym in &raw.base_symbols {
+                children_by_base.entry(base_sym).or_default().push(sym);
+            }
+        }
+
+        Self {
+            nodes_by_symbol,
+            children_by_base,
+        }
     }
 
     pub(crate) fn build_hierarchy_for_receiver(
@@ -239,13 +257,11 @@ impl ProgramHierarchyIndex {
             }
         }
 
-        for (&sym, raw) in &self.nodes_by_symbol {
-            all_nodes.entry(sym).or_insert_with(|| raw.clone());
-        }
+        self.collect_connected_hierarchy(env, root_syms, &mut all_nodes);
 
         let mut candidate_classes = Vec::with_capacity(all_nodes.len());
         for raw in all_nodes.into_values() {
-            if let Some(converted) = convert_raw_hierarchy_node(env.cwd, raw, interner) {
+            if let Some(converted) = convert_raw_hierarchy_node(raw, interner) {
                 candidate_classes.push(converted);
             }
         }
@@ -262,10 +278,58 @@ impl ProgramHierarchyIndex {
             candidate_classes,
         }
     }
+
+    fn collect_connected_hierarchy(
+        &self,
+        env: &mut HierarchyQueryEnv<'_>,
+        root_syms: &[P<Symbol>],
+        all_nodes: &mut FxHashMap<P<Symbol>, TypeHierarchyNodeRaw>,
+    ) {
+        // a) BFS downward through `children_by_base` for all reachable descendants.
+        let mut down_queue: VecDeque<P<Symbol>> = VecDeque::new();
+        let mut visited_down: FxHashSet<P<Symbol>> = FxHashSet::default();
+        for &sym in root_syms {
+            if visited_down.insert(sym) {
+                down_queue.push_back(sym);
+            }
+        }
+        while let Some(cur) = down_queue.pop_front() {
+            if let Some(children) = self.children_by_base.get(&cur) {
+                for &child in children {
+                    if visited_down.insert(child) {
+                        if let Some(raw) = self.nodes_by_symbol.get(&child) {
+                            all_nodes.entry(child).or_insert_with(|| raw.clone());
+                        }
+                        down_queue.push_back(child);
+                    }
+                }
+            }
+        }
+
+        // b) BFS upward from all nodes currently in `all_nodes` through `base_symbols`
+        //    to include all reachable ancestors (synthesizing external nodes when needed).
+        let mut up_queue: VecDeque<P<Symbol>> = all_nodes.keys().copied().collect();
+        let mut visited_up: FxHashSet<P<Symbol>> = all_nodes.keys().copied().collect();
+        while let Some(cur) = up_queue.pop_front() {
+            let bases: Vec<P<Symbol>> = all_nodes
+                .get(&cur)
+                .map_or_default(|raw| raw.base_symbols.clone());
+            for base_sym in bases {
+                if visited_up.insert(base_sym) {
+                    let node_raw = self.nodes_by_symbol.get(&base_sym).cloned().or_else(|| {
+                        synthesize_external_node(env.cwd, env.program, env.checker, base_sym)
+                    });
+                    if let Some(raw) = node_raw {
+                        all_nodes.insert(base_sym, raw);
+                        up_queue.push_back(base_sym);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn convert_raw_hierarchy_node(
-    cwd: &str,
     raw: TypeHierarchyNodeRaw,
     interner: &mut impl HierarchyInterner,
 ) -> Option<TypeHierarchyNode> {
@@ -287,7 +351,7 @@ fn convert_raw_hierarchy_node(
             member_syntax,
             symbol: m.symbol.map(|s| interner.intern_symbol(s)),
             kind: m.kind,
-            location: node_location_relative(cwd, m.member_node),
+            location: m.location,
             has_body: m.has_body,
             is_abstract: m.is_abstract,
             is_static: m.is_static,
@@ -333,6 +397,7 @@ fn collect_export_assignments(
 }
 
 fn index_types_in_node(
+    cwd: &str,
     node: P<Node>,
     is_external_file: bool,
     checker: &mut CheckerHandle,
@@ -343,18 +408,19 @@ fn index_types_in_node(
         node.kind(),
         Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
     ) && let Some(raw) =
-        extract_hierarchy_node_raw(node, is_external_file, checker, exported_symbols)
+        extract_hierarchy_node_raw(cwd, node, is_external_file, checker, exported_symbols)
     {
         out.entry(raw.symbol).or_insert(raw);
     }
 
     node.for_each_child(&mut |child| {
-        index_types_in_node(child, is_external_file, checker, exported_symbols, out);
+        index_types_in_node(cwd, child, is_external_file, checker, exported_symbols, out);
         false
     });
 }
 
 fn extract_hierarchy_node_raw(
+    cwd: &str,
     node: P<Node>,
     is_external_file: bool,
     checker: &mut CheckerHandle,
@@ -440,7 +506,7 @@ fn extract_hierarchy_node_raw(
             }
             continue;
         }
-        if let Some(fact) = extract_member_fact(member, checker) {
+        if let Some(fact) = extract_member_fact(cwd, member, checker) {
             // If an overloaded method has both signature and implementation body, prefer bodied entry.
             if let Some(existing) = members.iter_mut().find(|m| {
                 m.name == fact.name && m.kind == fact.kind && m.is_static == fact.is_static
@@ -468,7 +534,11 @@ fn extract_hierarchy_node_raw(
     })
 }
 
-fn extract_member_fact(member: P<Node>, checker: &mut CheckerHandle) -> Option<RawMemberFact> {
+fn extract_member_fact(
+    cwd: &str,
+    member: P<Node>,
+    checker: &mut CheckerHandle,
+) -> Option<RawMemberFact> {
     let mk = member.kind();
     if !matches!(
         mk,
@@ -515,6 +585,7 @@ fn extract_member_fact(member: P<Node>, checker: &mut CheckerHandle) -> Option<R
         member_node: member,
         symbol: sym,
         kind: format!("{mk:?}"),
+        location: node_location_relative(cwd, member),
         has_body,
         is_abstract,
         is_static,
@@ -563,7 +634,7 @@ fn synthesize_external_node(
     let is_external = program.is_source_file_default_library(sf.path())
         || !is_first_party_workspace_path(cwd, sf.file_name());
     let empty_exports = FxHashSet::default();
-    let mut raw = extract_hierarchy_node_raw(decl, is_external, checker, &empty_exports)?;
+    let mut raw = extract_hierarchy_node_raw(cwd, decl, is_external, checker, &empty_exports)?;
     raw.is_external = is_external;
     raw.is_exported = true;
     Some(raw)

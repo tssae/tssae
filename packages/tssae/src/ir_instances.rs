@@ -8,7 +8,7 @@ use tsrs_core::P;
 use tssae_analysis::{
     call_resolution::IrCallGraph,
     instance_identity::{
-        InstanceOriginKind, InstanceResolutionOutcome, InstanceTargetSpec,
+        InstanceOriginKind, InstanceResolutionOutcome, InstanceTargetSpec, IrFieldWriteIndex,
         ResolveInstancesBatchOutcome, ResolvedInstanceOrigin, resolve_instances_on_ir,
     },
 };
@@ -268,6 +268,13 @@ fn alloc_origin_payloads(
     payloads
 }
 
+type InstanceBatchMaterialized = (
+    Vec<(String, MaterializedOutcome)>,
+    Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
+    Option<tssae_common::SummaryConflictError>,
+);
+
 #[expect(
     clippy::too_many_lines,
     reason = "Orchestrates target interning, IR resolution, call-graph caching, summary metrics, and handle allocation."
@@ -288,6 +295,7 @@ pub fn run_resolve_instances(
 
     let workspace_programs = snapshot.workspace_programs();
     let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
+    let cached_field_index = snapshot.ir_field_write_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
@@ -300,12 +308,14 @@ pub fn run_resolve_instances(
         set
     });
 
-    let (materialized, newly_built_graph, conflict_opt): (
-        Vec<(String, MaterializedOutcome)>,
-        Option<IrCallGraph>,
-        Option<tssae_common::SummaryConflictError>,
-    ) = {
-        let env = SnapshotIrEnv::from_snapshot(snapshot, program, &workspace_programs, checker);
+    let (materialized, newly_built_graph, newly_built_field_index, conflict_opt): InstanceBatchMaterialized = {
+        let env = SnapshotIrEnv::from_snapshot(
+            snapshot,
+            project_id,
+            program,
+            &workspace_programs,
+            checker,
+        );
         if let Some(g) = cached_graph.as_deref()
             && let Some(conflict) = &g.conflict
         {
@@ -338,17 +348,21 @@ pub fn run_resolve_instances(
             })
             .collect();
 
-        let (batch_outcome, built_graph): (ResolveInstancesBatchOutcome, Option<IrCallGraph>) =
-            resolve_instances_on_ir(
-                &specs,
-                &env.project_files,
-                allowed_files.as_ref(),
-                &env,
-                &env,
-                &env,
-                &summary_index,
-                cached_graph.as_deref(),
-            );
+        let (batch_outcome, built_graph, built_field_index): (
+            ResolveInstancesBatchOutcome,
+            Option<IrCallGraph>,
+            Option<IrFieldWriteIndex>,
+        ) = resolve_instances_on_ir(
+            &specs,
+            env.project_files(),
+            allowed_files.as_ref(),
+            &env,
+            &env,
+            &env,
+            &summary_index,
+            cached_graph.as_deref(),
+            cached_field_index.as_deref(),
+        );
 
         let stats = env.summary_stats.get();
         observer.record_summary_lookup_stats(&stats);
@@ -388,7 +402,12 @@ pub fn run_resolve_instances(
             .collect();
 
         drop(env);
-        (mapped, built_graph, batch_outcome.conflict)
+        (
+            mapped,
+            built_graph,
+            built_field_index,
+            batch_outcome.conflict,
+        )
     };
 
     if let Some(g) = newly_built_graph {
@@ -396,9 +415,18 @@ pub fn run_resolve_instances(
         if let Some(conflict) = &g_arc.conflict {
             return Err(conflict_rpc_err(conflict));
         }
+        if allowed_files.is_none() {
+            snapshot
+                .ir_call_graph_cache
+                .insert(project_id.to_string(), g_arc);
+        }
+    }
+    if let Some(fi) = newly_built_field_index
+        && allowed_files.is_none()
+    {
         snapshot
-            .ir_call_graph_cache
-            .insert(project_id.to_string(), g_arc);
+            .ir_field_write_cache
+            .insert(project_id.to_string(), Arc::new(fi));
     }
 
     if let Some(conflict) = conflict_opt {

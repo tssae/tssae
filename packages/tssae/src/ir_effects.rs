@@ -650,26 +650,27 @@ pub fn run_call_effects(
     }
 
     let workspace_programs = snapshot.workspace_programs();
+    let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
+    let cached_field_index = snapshot.ir_field_write_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
 
     let (materialized, conflict_opt): CallEffectsBatchMaterialized = {
-        let mut env = SnapshotIrEnv::from_snapshot(
+        let env = SnapshotIrEnv::from_snapshot(
             snapshot,
             project_id,
             program,
             &workspace_programs,
             checker,
         );
-        let target_files = env.project_files().to_vec();
-        let cached_graph = env.ensure_call_graph(&summary_index, &target_files, true);
-        if let Some(conflict) = &cached_graph.conflict {
+        if let Some(g) = cached_graph.as_deref()
+            && let Some(conflict) = &g.conflict
+        {
             let stats = env.summary_stats.get();
             observer.record_summary_lookup_stats(&stats);
             let err = conflict_rpc_err(conflict);
             drop(env);
             return Err(err);
         }
-        let cached_field_index = env.ensure_field_write_index(&target_files, true);
 
         let specs: Vec<CallEffectsTargetSpec> = target_inputs
             .iter()
@@ -711,8 +712,8 @@ pub fn run_call_effects(
             &env,
             &env,
             &summary_index,
-            Some(cached_graph.as_ref()),
-            Some(cached_field_index.as_ref()),
+            cached_graph.as_deref(),
+            cached_field_index.as_deref(),
         );
         let stats = env.summary_stats.get();
         observer.record_summary_lookup_stats(&stats);

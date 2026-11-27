@@ -126,13 +126,13 @@ fn build_project_file_catalog(
     let mut project_files = Vec::new();
     let mut seen_rel = FxHashSet::default();
 
+    let mut reg = file_ids.write().ok();
     let mut register_sf = |sf: P<SourceFile>, is_proj: bool| {
         let rel = normalize_path(&relative_to_cwd(cwd, sf.file_name()));
-        let Ok(mut reg) = file_ids.write() else {
+        let Some(ref mut reg) = reg else {
             return;
         };
         let fid = reg.intern(&rel);
-        drop(reg);
         sf_by_file_id.entry(fid).or_insert(sf);
         rel_paths_by_file_id
             .entry(fid)
@@ -154,6 +154,7 @@ fn build_project_file_catalog(
             }
         }
     }
+    drop(reg);
     project_files.sort_by(|a, b| {
         rel_paths_by_file_id
             .get(a)

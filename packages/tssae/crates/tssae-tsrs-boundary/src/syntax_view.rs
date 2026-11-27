@@ -427,6 +427,11 @@ impl FileIdRegistry {
     }
 
     #[must_use]
+    pub fn get(&self, rel_file: &str) -> Option<FileId> {
+        self.path_to_id.get(rel_file).copied()
+    }
+
+    #[must_use]
     pub fn path(&self, file_id: FileId) -> Option<&str> {
         self.paths
             .get(usize::try_from(file_id.0).ok()?)
@@ -515,6 +520,9 @@ impl FileSyntaxIndex {
             &mut local_to_node,
             &mut scope_catalog,
         );
+        node_to_local.shrink_to_fit();
+        local_to_node.shrink_to_fit();
+        scope_catalog.shrink_to_fit();
 
         Self {
             file_id,
@@ -629,6 +637,11 @@ impl SyntaxCatalogBridge {
     #[must_use]
     pub fn get_node(&self, syntax: SyntaxId) -> Option<P<Node>> {
         self.nodes.get(&syntax).copied()
+    }
+
+    #[must_use]
+    pub fn get_node_id(&self, node: P<Node>) -> Option<SyntaxId> {
+        self.node_to_id.get(&node).copied()
     }
 }
 

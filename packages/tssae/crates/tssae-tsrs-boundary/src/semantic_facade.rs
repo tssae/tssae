@@ -23,7 +23,9 @@ use tssae_common::{
 };
 
 use crate::{
-    hierarchy::{HierarchyInterner, HierarchyQueryEnv, ProgramHierarchyIndex},
+    hierarchy::{
+        HierarchyInterner, HierarchyQueryEnv, HierarchyQueryOptions, ProgramHierarchyIndex,
+    },
     impl_resolution::{
         FacadeImplementationInput, FacadeImplementationOutcome, FirstPartyResolutionSource,
         SourceMapCache,
@@ -910,6 +912,9 @@ pub struct SemanticModelBridge<'a> {
     type_ids: RefCell<FxHashMap<P<Type>, TypeId>>,
     signatures: RefCell<FxHashMap<SignatureId, P<Signature>>>,
     signature_ids: RefCell<FxHashMap<P<Signature>, SignatureId>>,
+    decl_summary_cache: RefCell<FxHashMap<SyntaxId, Option<DeclarationSummaryData>>>,
+    symbol_at_syntax_cache: RefCell<FxHashMap<SyntaxId, Option<SymbolId>>>,
+    impl_cache: RefCell<FxHashMap<(SyntaxId, bool), ImplementationFact>>,
 }
 
 impl<'a> SemanticModelBridge<'a> {
@@ -932,6 +937,9 @@ impl<'a> SemanticModelBridge<'a> {
             type_ids: RefCell::new(FxHashMap::default()),
             signatures: RefCell::new(FxHashMap::default()),
             signature_ids: RefCell::new(FxHashMap::default()),
+            decl_summary_cache: RefCell::new(FxHashMap::default()),
+            symbol_at_syntax_cache: RefCell::new(FxHashMap::default()),
+            impl_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -979,6 +987,9 @@ impl<'a> SemanticModelBridge<'a> {
             type_ids: RefCell::new(FxHashMap::default()),
             signatures: RefCell::new(FxHashMap::default()),
             signature_ids: RefCell::new(FxHashMap::default()),
+            decl_summary_cache: RefCell::new(FxHashMap::default()),
+            symbol_at_syntax_cache: RefCell::new(FxHashMap::default()),
+            impl_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -1074,6 +1085,27 @@ impl<'a> SemanticModelBridge<'a> {
             }
         }
         Some(file_id)
+    }
+
+    pub fn intern_syntax_if_indexed(&self, node: P<Node>) -> Option<SyntaxId> {
+        if let Some((index, _)) = self.file_index
+            && let Some(sid) = index.syntax_id_for_node(node)
+        {
+            return Some(sid);
+        }
+        if let (Some(file_ids), Some(indices_cell)) = (&self.file_ids, &self.file_indices)
+            && let Some(sf) = get_source_file_of_node(node)
+        {
+            let rel_file = relative_to_cwd(self.cwd, sf.file_name());
+            let fid = file_ids.read().ok().and_then(|reg| reg.get(&rel_file))?;
+            if let Some(idx) = indices_cell.borrow().get(&fid)
+                && idx.source_file_addr == std::ptr::from_ref(&*sf) as usize
+            {
+                return idx.syntax_id_for_node(node);
+            }
+            return None;
+        }
+        self.syntax.borrow().get_node_id(node)
     }
 
     pub fn intern_syntax(&self, node: P<Node>) -> Option<SyntaxId> {
@@ -1432,16 +1464,133 @@ impl SyntaxCatalog for SemanticModelBridge<'_> {
     }
 }
 
+impl SemanticModelBridge<'_> {
+    fn try_resolve_current_project_bodied_impl(
+        &self,
+        target_node: P<Node>,
+        decl_syntax: SyntaxId,
+        sym: Option<P<Symbol>>,
+    ) -> Option<ImplementationFact> {
+        let decl_sf = get_source_file_of_node(target_node)?;
+        if !is_project_source_file(self.program, decl_sf)
+            || decl_sf.is_declaration_file()
+            || self.program.is_source_file_from_external_library(decl_sf)
+            || self
+                .program
+                .is_source_from_project_reference(decl_sf.path())
+        {
+            return None;
+        }
+        let callable =
+            extract_callable_from_decl_node(target_node).filter(|f| f.body().is_some())?;
+        let file = relative_to_cwd(self.cwd, decl_sf.file_name());
+        let location =
+            node_location_relative(self.cwd, target_node).unwrap_or_else(|| DiagnosticLocation {
+                file: file.clone(),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                start: 0,
+                end: 0,
+            });
+        let declaration_symbol = sym.map(|s| self.intern_symbol(s));
+        let fn_syntax = self.intern_syntax(callable);
+        let export_name = target_node
+            .name()
+            .and_then(node_text)
+            .or_else(|| sym.map(|s| s.name().to_string()));
+        Some(ImplementationFact::Resolved(ResolvedImplementationFact {
+            file,
+            location,
+            declaration_syntax: decl_syntax,
+            declaration_symbol,
+            fn_syntax,
+            export_name,
+            package_name: None,
+            resolution_source: ImplementationSourceKind::CurrentProject,
+            declaration_file: None,
+        }))
+    }
+
+    fn convert_facade_impl_outcome(
+        &self,
+        outcome: FacadeImplementationOutcome,
+    ) -> ImplementationFact {
+        match outcome {
+            FacadeImplementationOutcome::Resolved(target) => {
+                let Some(declaration_syntax) = self.intern_syntax(target.declaration_node) else {
+                    return ImplementationFact::External {
+                        package_name: target.package_name,
+                        declaration_file: target.declaration_file,
+                        evidence: Vec::new(),
+                    };
+                };
+                let declaration_symbol = target.declaration_symbol.map(|s| self.intern_symbol(s));
+                let fn_syntax = target.fn_node.and_then(|n| self.intern_syntax(n));
+                let resolution_source = match target.resolution_source {
+                    FirstPartyResolutionSource::CurrentProject => {
+                        ImplementationSourceKind::CurrentProject
+                    }
+                    FirstPartyResolutionSource::ProjectReference => {
+                        ImplementationSourceKind::ProjectReference
+                    }
+                    FirstPartyResolutionSource::CustomConditions => {
+                        ImplementationSourceKind::CustomConditions
+                    }
+                    FirstPartyResolutionSource::DeclarationMap => {
+                        ImplementationSourceKind::DeclarationMap
+                    }
+                };
+                ImplementationFact::Resolved(ResolvedImplementationFact {
+                    file: target.file,
+                    location: target.location,
+                    declaration_syntax,
+                    declaration_symbol,
+                    fn_syntax,
+                    export_name: target.export_name,
+                    package_name: target.package_name,
+                    resolution_source,
+                    declaration_file: target.declaration_file,
+                })
+            }
+            FacadeImplementationOutcome::External {
+                package_name,
+                declaration_file,
+                evidence,
+            } => ImplementationFact::External {
+                package_name,
+                declaration_file,
+                evidence,
+            },
+            FacadeImplementationOutcome::Inconclusive {
+                declaration_file,
+                gaps,
+                evidence,
+            } => ImplementationFact::Inconclusive {
+                declaration_file,
+                gaps,
+                evidence,
+            },
+        }
+    }
+}
+
 impl SemanticModel for SemanticModelBridge<'_> {
     fn symbol_at_syntax(&self, syntax: SyntaxId) -> Option<SymbolId> {
-        let node = self.node_for_syntax(syntax)?;
-        let sym = {
+        if let Some(cached) = self.symbol_at_syntax_cache.borrow().get(&syntax) {
+            return *cached;
+        }
+        let result = self.node_for_syntax(syntax).and_then(|node| {
             let mut checker = self.checker.borrow_mut();
             let resolved = resolve_symbol_for_node(&mut checker, node).symbol;
             drop(checker);
-            resolved?
-        };
-        Some(self.intern_symbol(sym))
+            resolved.map(|sym| self.intern_symbol(sym))
+        });
+        self.symbol_at_syntax_cache
+            .borrow_mut()
+            .insert(syntax, result);
+        result
     }
 
     fn type_at_syntax(&self, syntax: SyntaxId) -> Option<TypeSummaryData> {
@@ -1473,15 +1622,23 @@ impl SemanticModel for SemanticModelBridge<'_> {
     }
 
     fn resolve_declaration(&self, syntax: SyntaxId) -> Option<DeclarationSummaryData> {
-        let node = self.node_for_syntax(syntax)?;
-        let resolved = {
-            let mut checker = self.checker.borrow_mut();
-            let resolved = resolve_symbol_for_node(&mut checker, node);
-            drop(checker);
-            resolved
-        };
-        resolved.primary_decl.as_ref()?;
-        Some(self.summarize_decl(resolved.primary_decl, resolved.symbol))
+        if let Some(cached) = self.decl_summary_cache.borrow().get(&syntax) {
+            return cached.clone();
+        }
+        let result = self.node_for_syntax(syntax).and_then(|node| {
+            let resolved = {
+                let mut checker = self.checker.borrow_mut();
+                let resolved = resolve_symbol_for_node(&mut checker, node);
+                drop(checker);
+                resolved
+            };
+            resolved.primary_decl.as_ref()?;
+            Some(self.summarize_decl(resolved.primary_decl, resolved.symbol))
+        });
+        self.decl_summary_cache
+            .borrow_mut()
+            .insert(syntax, result.clone());
+        result
     }
 
     fn resolve_declaration_by_symbol(&self, symbol: SymbolId) -> Option<DeclarationSummaryData> {
@@ -1528,13 +1685,16 @@ impl SemanticModel for SemanticModelBridge<'_> {
     fn member_target_hierarchy(
         &self,
         receiver_syntax: SyntaxId,
-        _member_name: Option<&str>,
+        member_name: Option<&str>,
         static_receiver: bool,
     ) -> Option<MemberTargetHierarchy> {
         struct BridgeInterner<'a, 'b>(&'a SemanticModelBridge<'b>);
         impl HierarchyInterner for BridgeInterner<'_, '_> {
             fn intern_syntax(&mut self, node: P<Node>) -> Option<SyntaxId> {
                 self.0.intern_syntax(node)
+            }
+            fn intern_syntax_if_indexed(&mut self, node: P<Node>) -> Option<SyntaxId> {
+                self.0.intern_syntax_if_indexed(node)
             }
             fn intern_symbol(&mut self, sym: P<Symbol>) -> SymbolId {
                 self.0.intern_symbol(sym)
@@ -1549,7 +1709,13 @@ impl SemanticModel for SemanticModelBridge<'_> {
             checker: &mut checker,
         };
         let mut interner = BridgeInterner(self);
-        index.build_hierarchy_for_receiver(&mut env, recv_node, static_receiver, &mut interner)
+        index.build_hierarchy_for_receiver(
+            &mut env,
+            recv_node,
+            member_name,
+            static_receiver,
+            &mut interner,
+        )
     }
 
     fn class_hierarchy_for_symbol(&self, class_symbol: SymbolId) -> Option<MemberTargetHierarchy> {
@@ -1557,6 +1723,9 @@ impl SemanticModel for SemanticModelBridge<'_> {
         impl HierarchyInterner for BridgeInterner<'_, '_> {
             fn intern_syntax(&mut self, node: P<Node>) -> Option<SyntaxId> {
                 self.0.intern_syntax(node)
+            }
+            fn intern_syntax_if_indexed(&mut self, node: P<Node>) -> Option<SyntaxId> {
+                self.0.intern_syntax_if_indexed(node)
             }
             fn intern_symbol(&mut self, sym: P<Symbol>) -> SymbolId {
                 self.0.intern_symbol(sym)
@@ -1571,7 +1740,17 @@ impl SemanticModel for SemanticModelBridge<'_> {
             checker: &mut checker,
         };
         let mut interner = BridgeInterner(self);
-        Some(index.hierarchy_from_symbols(&mut env, &[sym], false, false, &mut interner))
+        Some(index.hierarchy_from_symbols(
+            &mut env,
+            &[sym],
+            HierarchyQueryOptions {
+                member_name: None,
+                expand_hierarchy: true,
+                is_union_or_intersection: false,
+                has_unresolved_type: false,
+            },
+            &mut interner,
+        ))
     }
 
     fn resolve_class_constructor(&self, class_syntax: SyntaxId) -> Option<DeclarationSummaryData> {
@@ -1654,6 +1833,11 @@ impl SemanticModel for SemanticModelBridge<'_> {
         decl_or_node_syntax: SyntaxId,
         call_site_syntax: Option<SyntaxId>,
     ) -> ImplementationFact {
+        let same_as_call = call_site_syntax == Some(decl_or_node_syntax);
+        let cache_key = (decl_or_node_syntax, same_as_call);
+        if let Some(cached) = self.impl_cache.borrow().get(&cache_key) {
+            return cached.clone();
+        }
         let fallback_node = self.node_for_syntax(decl_or_node_syntax);
         let call_node = call_site_syntax.and_then(|s| self.node_for_syntax(s));
         let Some(target_node) = fallback_node else {
@@ -1674,6 +1858,12 @@ impl SemanticModel for SemanticModelBridge<'_> {
         {
             FacadeImplementationInput::Node(cn)
         } else {
+            if let Some(fact) =
+                self.try_resolve_current_project_bodied_impl(target_node, decl_or_node_syntax, sym)
+            {
+                self.impl_cache.borrow_mut().insert(cache_key, fact.clone());
+                return fact;
+            }
             FacadeImplementationInput::Declaration(target_node, sym)
         };
 
@@ -1688,62 +1878,9 @@ impl SemanticModel for SemanticModelBridge<'_> {
             facade.resolve_implementation(input, self.workspace_programs, sm_cache)
         };
 
-        match outcome {
-            FacadeImplementationOutcome::Resolved(target) => {
-                let Some(declaration_syntax) = self.intern_syntax(target.declaration_node) else {
-                    return ImplementationFact::External {
-                        package_name: target.package_name,
-                        declaration_file: target.declaration_file,
-                        evidence: Vec::new(),
-                    };
-                };
-                let declaration_symbol = target.declaration_symbol.map(|s| self.intern_symbol(s));
-                let fn_syntax = target.fn_node.and_then(|n| self.intern_syntax(n));
-                let resolution_source = match target.resolution_source {
-                    FirstPartyResolutionSource::CurrentProject => {
-                        ImplementationSourceKind::CurrentProject
-                    }
-                    FirstPartyResolutionSource::ProjectReference => {
-                        ImplementationSourceKind::ProjectReference
-                    }
-                    FirstPartyResolutionSource::CustomConditions => {
-                        ImplementationSourceKind::CustomConditions
-                    }
-                    FirstPartyResolutionSource::DeclarationMap => {
-                        ImplementationSourceKind::DeclarationMap
-                    }
-                };
-                ImplementationFact::Resolved(ResolvedImplementationFact {
-                    file: target.file,
-                    location: target.location,
-                    declaration_syntax,
-                    declaration_symbol,
-                    fn_syntax,
-                    export_name: target.export_name,
-                    package_name: target.package_name,
-                    resolution_source,
-                    declaration_file: target.declaration_file,
-                })
-            }
-            FacadeImplementationOutcome::External {
-                package_name,
-                declaration_file,
-                evidence,
-            } => ImplementationFact::External {
-                package_name,
-                declaration_file,
-                evidence,
-            },
-            FacadeImplementationOutcome::Inconclusive {
-                declaration_file,
-                gaps,
-                evidence,
-            } => ImplementationFact::Inconclusive {
-                declaration_file,
-                gaps,
-                evidence,
-            },
-        }
+        let fact = self.convert_facade_impl_outcome(outcome);
+        self.impl_cache.borrow_mut().insert(cache_key, fact.clone());
+        fact
     }
 
     fn check_call_missing_package_gap(&self, call_syntax: SyntaxId) -> Option<GapItem> {

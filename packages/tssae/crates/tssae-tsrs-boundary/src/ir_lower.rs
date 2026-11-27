@@ -778,6 +778,15 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
 
         let root_syntax = self.intern_node(self.root_node);
         let file = root_syntax.file_id();
+        self.parameters.shrink_to_fit();
+        self.bindings.shrink_to_fit();
+        self.captured_bindings.shrink_to_fit();
+        self.vertices.shrink_to_fit();
+        self.syntax_to_vertex.shrink_to_fit();
+        self.expr_to_vertex.shrink_to_fit();
+        self.expr_to_value.shrink_to_fit();
+        self.value_sources.shrink_to_fit();
+        self.branches.shrink_to_fit();
         let ir = FunctionIr {
             id: FunctionIrId {
                 file,

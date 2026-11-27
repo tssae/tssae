@@ -78,7 +78,16 @@ pub(crate) struct HierarchyQueryEnv<'a> {
 
 pub(crate) trait HierarchyInterner {
     fn intern_syntax(&mut self, node: P<Node>) -> Option<SyntaxId>;
+    fn intern_syntax_if_indexed(&mut self, node: P<Node>) -> Option<SyntaxId>;
     fn intern_symbol(&mut self, sym: P<Symbol>) -> SymbolId;
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HierarchyQueryOptions<'a> {
+    pub(crate) member_name: Option<&'a str>,
+    pub(crate) expand_hierarchy: bool,
+    pub(crate) is_union_or_intersection: bool,
+    pub(crate) has_unresolved_type: bool,
 }
 
 impl ProgramHierarchyIndex {
@@ -128,6 +137,7 @@ impl ProgramHierarchyIndex {
             let is_external_file = !is_project_source_file(program, sf)
                 && !is_first_party_workspace_path(cwd, sf.file_name());
             collect_heritage_subtypes_in_node(
+                sf.text(),
                 sf.as_node(),
                 is_external_file,
                 checker,
@@ -147,6 +157,7 @@ impl ProgramHierarchyIndex {
         &self,
         env: &mut HierarchyQueryEnv<'_>,
         receiver_node: P<Node>,
+        member_name: Option<&str>,
         static_receiver: bool,
         interner: &mut impl HierarchyInterner,
     ) -> Option<MemberTargetHierarchy> {
@@ -161,7 +172,17 @@ impl ProgramHierarchyIndex {
                 .get_symbol_at_location_exported(expr)
                 .map(|s| unwrap_aliased_symbol(env.checker, s))
                 .filter(|&s| s != env.checker.get_unknown_symbol())?;
-            return Some(self.hierarchy_from_symbols(env, &[sym], false, false, interner));
+            return Some(self.hierarchy_from_symbols(
+                env,
+                &[sym],
+                HierarchyQueryOptions {
+                    member_name,
+                    expand_hierarchy: false,
+                    is_union_or_intersection: false,
+                    has_unresolved_type: false,
+                },
+                interner,
+            ));
         }
 
         let ty = env.checker.get_type_at_location(receiver_node);
@@ -187,8 +208,12 @@ impl ProgramHierarchyIndex {
         Some(self.hierarchy_from_symbols(
             env,
             &syms,
-            is_union_or_intersection,
-            has_unresolved,
+            HierarchyQueryOptions {
+                member_name,
+                expand_hierarchy: true,
+                is_union_or_intersection,
+                has_unresolved_type: has_unresolved,
+            },
             interner,
         ))
     }
@@ -197,10 +222,15 @@ impl ProgramHierarchyIndex {
         &self,
         env: &mut HierarchyQueryEnv<'_>,
         root_syms: &[P<Symbol>],
-        is_union_or_intersection: bool,
-        has_unresolved_type: bool,
+        options: HierarchyQueryOptions<'_>,
         interner: &mut impl HierarchyInterner,
     ) -> MemberTargetHierarchy {
+        let HierarchyQueryOptions {
+            member_name,
+            expand_hierarchy,
+            is_union_or_intersection,
+            has_unresolved_type,
+        } = options;
         if root_syms.is_empty() {
             return MemberTargetHierarchy {
                 receiver_kind: ClassOrInterfaceKind::OtherType,
@@ -245,11 +275,13 @@ impl ProgramHierarchyIndex {
             }
         }
 
-        self.collect_connected_hierarchy(env, root_syms, &mut all_nodes);
+        if expand_hierarchy {
+            self.collect_connected_hierarchy(env, root_syms, &mut all_nodes);
+        }
 
         let mut candidate_classes = Vec::with_capacity(all_nodes.len());
         for raw in all_nodes.into_values() {
-            if let Some(converted) = convert_raw_hierarchy_node(raw, interner) {
+            if let Some(converted) = convert_raw_hierarchy_node(raw, member_name, interner) {
                 candidate_classes.push(converted);
             }
         }
@@ -459,18 +491,14 @@ impl ProgramHierarchyIndex {
 
 fn convert_raw_hierarchy_node(
     raw: TypeHierarchyNodeRaw,
+    member_name: Option<&str>,
     interner: &mut impl HierarchyInterner,
 ) -> Option<TypeHierarchyNode> {
-    let syntax = interner.intern_syntax(raw.node)?;
-    let symbol = interner.intern_symbol(raw.symbol);
-    let base_symbols = raw
-        .base_symbols
-        .into_iter()
-        .map(|s| interner.intern_symbol(s))
-        .collect();
-    let constructor_syntax = raw.constructor_node.and_then(|n| interner.intern_syntax(n));
-    let mut members = Vec::with_capacity(raw.members.len());
+    let mut members = Vec::new();
     for m in raw.members {
+        if member_name.is_some_and(|target| m.name != target) {
+            continue;
+        }
         let Some(member_syntax) = interner.intern_syntax(m.member_node) else {
             continue;
         };
@@ -490,6 +518,24 @@ fn convert_raw_hierarchy_node(
             callable_syntax: m.callable_node.and_then(|n| interner.intern_syntax(n)),
         });
     }
+    let syntax = if member_name.is_some() && members.is_empty() {
+        interner
+            .intern_syntax_if_indexed(raw.node)
+            .unwrap_or(SyntaxId(u64::MAX))
+    } else {
+        interner.intern_syntax(raw.node)?
+    };
+    let symbol = interner.intern_symbol(raw.symbol);
+    let base_symbols = raw
+        .base_symbols
+        .into_iter()
+        .map(|s| interner.intern_symbol(s))
+        .collect();
+    let constructor_syntax = if member_name.is_some() {
+        None
+    } else {
+        raw.constructor_node.and_then(|n| interner.intern_syntax(n))
+    };
 
     Some(TypeHierarchyNode {
         syntax,
@@ -547,12 +593,22 @@ fn resolve_type_decl_symbol(node: P<Node>, checker: &mut CheckerHandle) -> Optio
 }
 
 fn collect_heritage_subtypes_in_node(
+    sf_text: &str,
     node: P<Node>,
     is_external_file: bool,
     checker: &mut CheckerHandle,
     children_by_base: &mut FxHashMap<P<Symbol>, Vec<P<Symbol>>>,
     known_decl_nodes: &mut FxHashMap<P<Symbol>, Vec<(P<Node>, bool)>>,
 ) {
+    if (is_function_like_declaration(Some(node)) || node.kind() == Kind::Block)
+        && let (Some(s), Some(e)) = (node.pos().source_offset(), node.end().source_offset())
+        && let Some(slice) = sf_text.get(s as usize..e as usize)
+        && !slice.contains("class")
+        && !slice.contains("interface")
+    {
+        return;
+    }
+
     if matches!(
         node.kind(),
         Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
@@ -573,6 +629,7 @@ fn collect_heritage_subtypes_in_node(
 
     node.for_each_child(&mut |child| {
         collect_heritage_subtypes_in_node(
+            sf_text,
             child,
             is_external_file,
             checker,
@@ -589,16 +646,17 @@ fn extract_base_symbols(
     checker: &mut CheckerHandle,
 ) -> Vec<P<Symbol>> {
     let mut base_symbols = Vec::new();
-    let declared_ty = checker.get_declared_type_of_symbol_exported(sym);
-    for &base_ty in checker.get_base_types_exported(declared_ty) {
-        if let Some(base_sym) = base_ty.symbol() {
-            let unwrapped = unwrap_aliased_symbol(checker, base_sym);
-            if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
-                base_symbols.push(unwrapped);
+    if !collect_heritage_base_symbols(node, checker, &mut base_symbols) {
+        let declared_ty = checker.get_declared_type_of_symbol_exported(sym);
+        for &base_ty in checker.get_base_types_exported(declared_ty) {
+            if let Some(base_sym) = base_ty.symbol() {
+                let unwrapped = unwrap_aliased_symbol(checker, base_sym);
+                if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
+                    base_symbols.push(unwrapped);
+                }
             }
         }
     }
-    collect_heritage_base_symbols(node, checker, &mut base_symbols);
     base_symbols
 }
 
@@ -618,7 +676,7 @@ fn extract_base_symbols_for_decls(
         }
     }
     for &(decl, _) in decls {
-        collect_heritage_base_symbols(decl, checker, &mut base_symbols);
+        let _ = collect_heritage_base_symbols(decl, checker, &mut base_symbols);
     }
     base_symbols
 }
@@ -627,10 +685,11 @@ fn collect_heritage_base_symbols(
     node: P<Node>,
     checker: &mut CheckerHandle,
     base_symbols: &mut Vec<P<Symbol>>,
-) {
+) -> bool {
     let Some(clauses) = heritage_clauses_of(node) else {
-        return;
+        return true;
     };
+    let mut all_resolved = true;
     for &clause in clauses.nodes() {
         if clause.kind() != Kind::HeritageClause {
             continue;
@@ -645,9 +704,12 @@ fn collect_heritage_base_symbols(
                 if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
                     base_symbols.push(unwrapped);
                 }
+            } else {
+                all_resolved = false;
             }
         }
     }
+    all_resolved
 }
 
 fn extract_members_for_decls(

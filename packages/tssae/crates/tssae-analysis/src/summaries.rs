@@ -1,13 +1,13 @@
 use std::{cmp::Ordering, sync::LazyLock};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_common::{
     BehaviorSummaryEntry, CallAspectSummary, CallbackCardinality, CallbackTiming,
-    DeclarationIdentity, EffectAspectSummary, ForwardCallMode, ForwardCallReceiver,
-    ForwardCallSpec, ForwardCallTarget, InstanceAspectSummary, InstanceOutcome, InvokeCallbackSpec,
-    ResourceOpSpec, SummaryAspectKind, SummaryCompleteness, SummaryConfigPayload,
-    SummaryConflictError, SummaryConflictParty, SummaryNamedValueRef, SummarySlotRef,
-    SummarySource, SummaryTaggedValueRef, SummaryTargetMatcher, SummaryThisArg,
+    DeclarationIdentity, DeclarationSummaryData, EffectAspectSummary, ForwardCallMode,
+    ForwardCallReceiver, ForwardCallSpec, ForwardCallTarget, InstanceAspectSummary,
+    InstanceOutcome, InvokeCallbackSpec, ResourceOpSpec, SummaryAspectKind, SummaryCompleteness,
+    SummaryConfigPayload, SummaryConflictError, SummaryConflictParty, SummaryNamedValueRef,
+    SummarySlotRef, SummarySource, SummaryTaggedValueRef, SummaryTargetMatcher, SummaryThisArg,
     SummaryThisUndefined, SummaryValueRef, ValueAspectSummary, ValueFlowSpec,
 };
 
@@ -30,11 +30,36 @@ pub struct MatchedSummaryAspect<T> {
     pub aspect: T,
 }
 
+#[derive(Clone, Debug, Default)]
+struct LeafMatcherPrefilter {
+    leaf_names: FxHashSet<String>,
+    has_empty_member_path: bool,
+    has_package_matcher: bool,
+    has_module_matcher: bool,
+}
+
+impl LeafMatcherPrefilter {
+    fn record(&mut self, matcher: &SummaryTargetMatcher) {
+        if matcher.package.is_some() {
+            self.has_package_matcher = true;
+        }
+        if matcher.module.is_some() {
+            self.has_module_matcher = true;
+        }
+        if let Some(leaf) = matcher.member_path.last() {
+            self.leaf_names.insert(leaf.clone());
+        } else {
+            self.has_empty_member_path = true;
+        }
+    }
+}
+
 /// Snapshot-scoped behavior summary registry supporting 4-tier priority, semver matching, and conflict detection.
 #[derive(Clone, Debug)]
 pub struct BehaviorSummaryIndex {
     tiers: [Vec<IndexedEntry>; 4],
     resolved_package_versions: FxHashMap<String, Option<String>>,
+    calls_prefilter: LeafMatcherPrefilter,
 }
 
 static BUILTIN_STDLIB_ENTRIES: LazyLock<Vec<BehaviorSummaryEntry>> =
@@ -94,9 +119,61 @@ impl BehaviorSummaryIndex {
                 });
             }
         }
+        let mut calls_prefilter = LeafMatcherPrefilter::default();
+        for tier in &tiers {
+            for item in tier {
+                if item.entry.calls.is_some() {
+                    calls_prefilter.record(&item.entry.matcher);
+                }
+            }
+        }
         Self {
             tiers,
             resolved_package_versions: resolved_package_versions.clone(),
+            calls_prefilter,
+        }
+    }
+
+    #[must_use]
+    pub fn may_match_calls_leaf(&self, name: &str) -> bool {
+        self.calls_prefilter.has_empty_member_path || self.calls_prefilter.leaf_names.contains(name)
+    }
+
+    #[must_use]
+    pub fn may_match_calls_decl(
+        &self,
+        decl: Option<&DeclarationSummaryData>,
+        fallback_name: Option<&str>,
+    ) -> bool {
+        if self.calls_prefilter.has_empty_member_path {
+            return true;
+        }
+        if let Some(d) = decl {
+            if d.is_external && !d.is_default_library && self.calls_prefilter.has_package_matcher {
+                return true;
+            }
+            if !d.is_external && !d.is_default_library && self.calls_prefilter.has_module_matcher {
+                return true;
+            }
+            if d.name
+                .as_deref()
+                .is_some_and(|n| self.calls_prefilter.leaf_names.contains(n))
+            {
+                return true;
+            }
+            if matches!(
+                d.kind.as_deref(),
+                Some("ClassDeclaration" | "ClassExpression" | "Constructor" | "ConstructSignature")
+            ) && self.calls_prefilter.leaf_names.contains("constructor")
+            {
+                return true;
+            }
+            if fallback_name.is_some_and(|n| self.calls_prefilter.leaf_names.contains(n)) {
+                return true;
+            }
+            false
+        } else {
+            fallback_name.is_none_or(|n| self.calls_prefilter.leaf_names.contains(n))
         }
     }
 

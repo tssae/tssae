@@ -584,7 +584,7 @@ fn parse_tsrs_snapshot_id(response: Response) -> Result<u64, ProjectOpenError> {
     let Response::Json(json_text) = response else {
         return Err(ProjectOpenError::new(
             "PROJECT_LOAD_ERROR",
-            "Unexpected binary response from tsrs session.".to_string(),
+            "Unexpected binary response from compiler session.".to_string(),
         ));
     };
     let parsed: TsrsSnapshotResponse = serde_json::from_str(&json_text)

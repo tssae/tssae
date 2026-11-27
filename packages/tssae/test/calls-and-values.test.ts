@@ -1417,4 +1417,224 @@ void describe("tssae call graph and value propagation", () => {
       },
     );
   });
+
+  void it("resolves calls, instances, and effects inside explicit/implicit class instance and static field initializers", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-class-field-initializers",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/index.ts": [
+            "class Emitter<T> {",
+            "  public disposed = false;",
+            "  dispose(): void {",
+            "    this.disposed = true;",
+            "  }",
+            "}",
+            "class Disposable {",
+            "  protected _register<T>(value: T): T {",
+            "    return value;",
+            "  }",
+            "}",
+            "function createDefault(): ExplicitCtor {",
+            "  return new ExplicitCtor();",
+            "}",
+            "class ExplicitCtor extends Disposable {",
+            "  static INSTANCE = createDefault();",
+            "  private readonly _onDidX = this._register(new Emitter<number>());",
+            "  constructor() {",
+            "    super();",
+            "  }",
+            "  get emitter(): Emitter<number> {",
+            "    return this._onDidX;",
+            "  }",
+            "}",
+            "class ImplicitCtor extends Disposable {",
+            "  private readonly _onDidY = this._register(new Emitter<string>());",
+            "  get emitter(): Emitter<string> {",
+            "    return this._onDidY;",
+            "  }",
+            "}",
+            "export function useBoth(): [Emitter<number>, Emitter<string>] {",
+            "  return [ExplicitCtor.INSTANCE.emitter, new ImplicitCtor().emitter];",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const candidates = await ctx.findSyntax({
+            files: ["src/index.ts"],
+            kinds: [
+              "CallExpression",
+              "NewExpression",
+              "PropertyDeclaration",
+              "Constructor",
+              "ClassDeclaration",
+              "FunctionDeclaration",
+            ],
+          });
+
+          const explicitRegCall = candidates.find(
+            (s) =>
+              s.kind === "CallExpression" &&
+              s.text === "this._register(new Emitter<number>())",
+          );
+          const implicitRegCall = candidates.find(
+            (s) =>
+              s.kind === "CallExpression" &&
+              s.text === "this._register(new Emitter<string>())",
+          );
+          const explicitNewEmitter = candidates.find(
+            (s) =>
+              s.kind === "NewExpression" && s.text === "new Emitter<number>()",
+          );
+          const implicitNewEmitter = candidates.find(
+            (s) =>
+              s.kind === "NewExpression" && s.text === "new Emitter<string>()",
+          );
+          const staticCreateDefault = candidates.find(
+            (s) => s.kind === "CallExpression" && s.text === "createDefault()",
+          );
+          const explicitFieldInit = candidates.find(
+            (s) =>
+              s.kind === "PropertyDeclaration" &&
+              s.text.includes("_onDidX = this._register"),
+          );
+          const implicitFieldInit = candidates.find(
+            (s) =>
+              s.kind === "PropertyDeclaration" &&
+              s.text.includes("_onDidY = this._register"),
+          );
+          const explicitCtorNode = candidates.find(
+            (s) => s.kind === "Constructor",
+          );
+          const implicitCtorClass = candidates.find(
+            (s) =>
+              s.kind === "ClassDeclaration" &&
+              s.text.includes("class ImplicitCtor"),
+          );
+          const newImplicitCtor = candidates.find(
+            (s) =>
+              s.kind === "NewExpression" && s.text === "new ImplicitCtor()",
+          );
+          const createDefaultFn = candidates.find(
+            (s) =>
+              s.kind === "FunctionDeclaration" &&
+              s.text.includes("function createDefault"),
+          );
+          assert.ok(
+            explicitRegCall &&
+              implicitRegCall &&
+              explicitNewEmitter &&
+              implicitNewEmitter &&
+              staticCreateDefault &&
+              explicitFieldInit &&
+              implicitFieldInit &&
+              explicitCtorNode &&
+              implicitCtorClass &&
+              newImplicitCtor &&
+              createDefaultFn,
+          );
+
+          const resolvedCalls = await ctx.resolveCalls([
+            explicitRegCall.ref,
+            implicitRegCall.ref,
+            explicitNewEmitter.ref,
+            implicitNewEmitter.ref,
+            staticCreateDefault.ref,
+          ]);
+          for (const rc of resolvedCalls) {
+            assert.ok(
+              rc.call,
+              "expected call handle for field initializer call",
+            );
+          }
+
+          const callees = await ctx.calleesOf(
+            resolvedCalls.map((rc) => rc.call!),
+          );
+          for (const row of callees) {
+            assert.equal(row.completeness, "complete");
+          }
+          assert.equal(callees[0]?.resolvedTargets[0]?.name, "_register");
+          assert.equal(callees[1]?.resolvedTargets[0]?.name, "_register");
+          assert.equal(callees[2]?.resolvedTargets[0]?.name, "Emitter");
+          assert.equal(callees[3]?.resolvedTargets[0]?.name, "Emitter");
+          assert.equal(callees[4]?.resolvedTargets[0]?.name, "createDefault");
+
+          const registerDecl = callees[0]!.targets[0]!;
+          const createDefaultDecl = callees[4]!.targets[0]!;
+          const [registerCallers, createDefaultCallers] = await ctx.callersOf([
+            registerDecl,
+            createDefaultDecl,
+          ]);
+          assert.equal(registerCallers?.completeness, "complete");
+          assert.equal(registerCallers?.callSites.length, 2);
+          assert.equal(createDefaultCallers?.completeness, "complete");
+          assert.equal(createDefaultCallers?.callSites.length, 1);
+
+          const instances = await ctx.resolveInstances([
+            explicitFieldInit.initializer!,
+            implicitFieldInit.initializer!,
+          ]);
+          assert.equal(instances[0]?.status, "proved");
+          assert.equal(instances[1]?.status, "proved");
+
+          const effects = await ctx.callEffects({
+            targets: [
+              explicitCtorNode.ref,
+              implicitCtorClass.ref,
+              newImplicitCtor.ref,
+              createDefaultFn.ref,
+              staticCreateDefault.ref,
+            ],
+            includeReads: true,
+            includeWrites: true,
+          });
+          for (const eff of effects) {
+            assert.equal(eff.completeness, "complete");
+          }
+          assert.ok(
+            effects[0]!.fieldWrites.some((w) => w.propertyName === "_onDidX"),
+          );
+          assert.ok(
+            effects[1]!.fieldWrites.some((w) => w.propertyName === "_onDidY"),
+          );
+          assert.ok(
+            effects[2]!.fieldWrites.some((w) => w.propertyName === "_onDidY"),
+          );
+          assert.ok(
+            effects[3]!.fieldWrites.some((w) => w.propertyName === "_onDidX"),
+          );
+          assert.ok(
+            effects[4]!.fieldWrites.some((w) => w.propertyName === "_onDidX"),
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

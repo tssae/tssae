@@ -22,8 +22,7 @@ use tssae_common::{
     SyntaxScopeInfo, TypeId, TypeSummaryData, UnknownReason, WriteSyntaxInfo,
 };
 use tssae_tsrs_boundary::{
-    FirstPartyResolutionSource, SemanticModelBridge, is_class_scope_node, normalize_path,
-    resolve_enclosing_cfg_owner,
+    FirstPartyResolutionSource, SemanticModelBridge, normalize_path, resolve_enclosing_cfg_owner,
 };
 
 use crate::ir_impls::ResolvedImplTargetPayload;
@@ -383,11 +382,6 @@ impl IrProvider for SnapshotIrEnv<'_> {
                 None,
             )
         })?;
-        if is_class_scope_node(scope_node) {
-            return self
-                .semantic
-                .lower_scope_to_ir(scope_node, scope_syntax.local_id().0);
-        }
         let entry = self
             .ensure_file_ir_entry(scope_syntax.file_id())
             .ok_or_else(|| {

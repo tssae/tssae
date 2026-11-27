@@ -2,7 +2,10 @@ use std::{collections::BTreeSet, path::Path};
 
 use rustc_hash::FxHashMap;
 use serde::Serialize;
-use tsrs_ast::{Kind, Node, SourceFile, get_source_file_of_node, is_function_like_declaration};
+use tsrs_ast::{
+    Kind, ModifierFlags, Node, SourceFile, get_combined_modifier_flags, get_source_file_of_node,
+    is_function_like_declaration,
+};
 use tsrs_compiler::Program;
 use tsrs_core::P;
 use tsrs_scanner::{
@@ -461,7 +464,9 @@ impl FileSyntaxIndex {
                 slot.insert(local);
                 local_to_node.push(node);
 
-                if let Some(kind) = classify_catalog_scope_kind(node.kind()) {
+                if let Some(kind) = classify_catalog_scope_kind(node.kind()).or_else(|| {
+                    class_has_default_constructor_scope(node).then_some(IrScopeKind::Constructor)
+                }) {
                     let local_scope = u32::try_from(scope_catalog.len()).unwrap_or(u32::MAX);
                     let root_syntax = SyntaxId::from_parts(file_id, local);
                     let span_start = if node.pos().source_offset().is_some() {
@@ -543,6 +548,24 @@ impl FileSyntaxIndex {
             .get(usize::try_from(syntax.local_id().0).ok()?)
             .copied()
     }
+}
+
+fn class_has_default_constructor_scope(node: P<Node>) -> bool {
+    if !matches!(node.kind(), Kind::ClassDeclaration | Kind::ClassExpression) {
+        return false;
+    }
+    let members = node.members();
+    let has_bodied_ctor = members
+        .iter()
+        .any(|&m| m.kind() == Kind::Constructor && m.body().is_some());
+    if has_bodied_ctor {
+        return false;
+    }
+    members.iter().any(|&m| {
+        m.kind() == Kind::PropertyDeclaration
+            && !get_combined_modifier_flags(m).intersects(ModifierFlags::Static)
+            && m.as_property_declaration().initializer().is_some()
+    })
 }
 
 const fn classify_catalog_scope_kind(kind: Kind) -> Option<IrScopeKind> {

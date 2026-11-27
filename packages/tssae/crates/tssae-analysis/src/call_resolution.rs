@@ -268,6 +268,28 @@ pub fn resolve_call_targets_with_summaries(
     analyzed.outcome
 }
 
+/// Resolves all reachable callee declarations for an already-lowered `(caller_ir, call_vertex)` pair.
+#[must_use]
+pub fn resolve_call_targets_in_scope(
+    call_syntax: SyntaxId,
+    caller_ir: &Arc<FunctionIr>,
+    call_vertex: &CfgVertex,
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
+) -> CallTargetsOutcome {
+    analyze_call_vertex_with_scope(
+        call_syntax,
+        Some((caller_ir, call_vertex)),
+        semantic,
+        syntax,
+        ir_provider,
+        summary_index,
+    )
+    .outcome
+}
+
 struct AnalyzedCallSite {
     outcome: CallTargetsOutcome,
     caller_decl_syntax: Option<SyntaxId>,
@@ -276,10 +298,6 @@ struct AnalyzedCallSite {
     is_untyped_dynamic_incomplete: bool,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Dispatches across Call/Construct IR variants and constructs CallTargetsOutcome."
-)]
 fn analyze_call_vertex(
     call_syntax: SyntaxId,
     semantic: &dyn SemanticModel,
@@ -287,7 +305,31 @@ fn analyze_call_vertex(
     ir_provider: &dyn IrProvider,
     summary_index: &BehaviorSummaryIndex,
 ) -> AnalyzedCallSite {
-    let call_loc = syntax.syntax_location(call_syntax);
+    analyze_call_vertex_with_scope(
+        call_syntax,
+        None,
+        semantic,
+        syntax,
+        ir_provider,
+        summary_index,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Dispatches across Call/Construct IR variants and constructs CallTargetsOutcome."
+)]
+fn analyze_call_vertex_with_scope(
+    call_syntax: SyntaxId,
+    known_scope: Option<(&Arc<FunctionIr>, &CfgVertex)>,
+    semantic: &dyn SemanticModel,
+    syntax: &dyn SyntaxCatalog,
+    ir_provider: &dyn IrProvider,
+    summary_index: &BehaviorSummaryIndex,
+) -> AnalyzedCallSite {
+    let call_loc = known_scope
+        .and_then(|(_, v)| v.location.clone())
+        .or_else(|| syntax.syntax_location(call_syntax));
     let mut collector = TraceCollector::new(
         call_syntax,
         call_loc.clone(),
@@ -301,33 +343,46 @@ fn analyze_call_vertex(
         collector.push_gap(missing_pkg_gap);
     }
 
-    let Ok(ir) = ir_provider.enclosing_scope_ir(call_syntax) else {
-        collector.push_gap(GapItem::from_reason(
-            UnknownReason::UnresolvedDeclaration,
-            "Could not lower enclosing scope IR for call site.".to_string(),
-            call_loc,
-        ));
-        return AnalyzedCallSite {
-            outcome: CallTargetsOutcome {
-                targets: Vec::new(),
-                gaps: collector.gaps,
-                is_complete: false,
-                evidence: collector.evidence,
-                conflict: None,
-            },
-            caller_decl_syntax: None,
-            caller_symbol: None,
-            open_member_name: None,
-            is_untyped_dynamic_incomplete: true,
+    let owned_ir;
+    let ir: &Arc<FunctionIr> = if let Some((scope_ir, _)) = known_scope {
+        scope_ir
+    } else {
+        let Ok(resolved_ir) = ir_provider.enclosing_scope_ir(call_syntax) else {
+            collector.push_gap(GapItem::from_reason(
+                UnknownReason::UnresolvedDeclaration,
+                "Enclosing function or module body could not be analyzed for this call site."
+                    .to_string(),
+                call_loc,
+            ));
+            return AnalyzedCallSite {
+                outcome: CallTargetsOutcome {
+                    targets: Vec::new(),
+                    gaps: collector.gaps,
+                    is_complete: false,
+                    evidence: collector.evidence,
+                    conflict: None,
+                },
+                caller_decl_syntax: None,
+                caller_symbol: None,
+                open_member_name: None,
+                is_untyped_dynamic_incomplete: true,
+            };
         };
+        owned_ir = resolved_ir;
+        &owned_ir
     };
 
     let caller_decl_syntax =
         (ir.scope_kind != crate::ir::IrScopeKind::ModuleTopLevel).then_some(ir.root_syntax);
     let caller_symbol = caller_decl_syntax.and_then(|syn| semantic.symbol_at_syntax(syn));
 
-    let Some(call_vertex) = find_call_vertex(&ir, call_syntax) else {
-        collector.push_dynamic_gap("Call expression was not represented as a call vertex in IR.");
+    let call_vertex = if let Some((_, v)) = known_scope {
+        v
+    } else if let Some(v) = find_call_vertex(ir, call_syntax) {
+        v
+    } else {
+        collector
+            .push_dynamic_gap("Call expression could not be resolved as an analyzable call site.");
         return AnalyzedCallSite {
             outcome: CallTargetsOutcome {
                 targets: Vec::new(),
@@ -351,9 +406,9 @@ fn analyze_call_vertex(
             receiver,
             args,
         } => {
-            arg_syntaxes = collect_arg_syntaxes(&ir, args, syntax);
+            arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
             let call_ctx = ActiveCallContext {
-                caller_ir: &ir,
+                caller_ir: ir,
                 receiver: *receiver,
                 args,
                 call_stack: &[],
@@ -361,16 +416,16 @@ fn analyze_call_vertex(
             };
             match call_kind {
                 IrCallKind::Explicit | IrCallKind::TaggedTemplate | IrCallKind::DecoratorApply => {
-                    trace_callable_value(&ir, *callee, &[], 0, Some(call_ctx), 0, &mut collector);
+                    trace_callable_value(ir, *callee, &[], 0, Some(call_ctx), 0, &mut collector);
                 }
                 IrCallKind::SuperCall => {
                     resolve_super_constructor_call(call_syntax, &mut collector);
                 }
                 IrCallKind::ImplicitGetter => {
-                    resolve_implicit_getter_call(&ir, *callee, *receiver, &mut collector);
+                    resolve_implicit_getter_call(ir, *callee, *receiver, &mut collector);
                 }
                 IrCallKind::ImplicitSetter => {
-                    resolve_implicit_setter_call(&ir, call_vertex, *receiver, &mut collector);
+                    resolve_implicit_setter_call(ir, call_vertex, *receiver, &mut collector);
                 }
                 IrCallKind::ImplicitDispose { is_async } => {
                     let member_name = if *is_async {
@@ -380,7 +435,7 @@ fn analyze_call_vertex(
                     };
                     let recv_val = receiver.unwrap_or(*callee);
                     resolve_member_call(
-                        &ir,
+                        ir,
                         recv_val,
                         member_name,
                         false,
@@ -399,15 +454,15 @@ fn analyze_call_vertex(
             }
         }
         IrOp::Construct { callee, args, .. } => {
-            arg_syntaxes = collect_arg_syntaxes(&ir, args, syntax);
+            arg_syntaxes = collect_arg_syntaxes(ir, args, syntax);
             let call_ctx = ActiveCallContext {
-                caller_ir: &ir,
+                caller_ir: ir,
                 receiver: None,
                 args,
                 call_stack: &[],
                 is_construct: true,
             };
-            trace_construct_value(&ir, *callee, &[], 0, Some(call_ctx), &mut collector);
+            trace_construct_value(ir, *callee, &[], 0, Some(call_ctx), &mut collector);
         }
         _ => {}
     }
@@ -415,7 +470,7 @@ fn analyze_call_vertex(
     if let Some(loc) = &call_loc {
         collector.evidence.push(EvidenceItem::simple(
             "source",
-            "Analyzed call site on IR.".to_string(),
+            "Analyzed call site.".to_string(),
             Some(loc.clone()),
         ));
     }
@@ -2342,7 +2397,7 @@ fn trace_target_return_values(
     let Ok(target_ir) = collector.ir_provider.function_ir(scope_syn) else {
         collector.push_gap(GapItem::from_reason(
             UnknownReason::MissingFunctionBody,
-            "Called factory IR could not be lowered.".to_string(),
+            "Called factory implementation could not be analyzed.".to_string(),
             collector.call_location.clone(),
         ));
         return;
@@ -3642,8 +3697,14 @@ pub fn build_ir_call_graph_with_summaries(
                     continue;
                 };
 
-                let analyzed =
-                    analyze_call_vertex(call_syn, semantic, syntax, ir_provider, summary_index);
+                let analyzed = analyze_call_vertex_with_scope(
+                    call_syn,
+                    Some((&scope_ir, vertex)),
+                    semantic,
+                    syntax,
+                    ir_provider,
+                    summary_index,
+                );
                 if let Some(conflict) = analyzed.outcome.conflict {
                     graph.conflict = Some(conflict);
                     return graph;
@@ -4240,6 +4301,7 @@ mod tests {
                 has_body: true,
                 is_abstract: false,
                 is_static: false,
+                is_private: false,
                 is_private_ecma: false,
                 is_override: false,
                 initializer_syntax: None,

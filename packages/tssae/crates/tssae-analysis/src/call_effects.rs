@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_common::{
     BranchId, CallbackTiming, DiagnosticLocation, EvidenceItem, FileId, ForwardCallTarget,
     FunctionIrId, GapItem, SemanticModel, SummaryConflictError, SummaryThisArg, SymbolId,
@@ -9,7 +9,7 @@ use tssae_common::{
 
 use crate::{
     branch_coverage::{StackArena, StackId},
-    call_resolution::{IrCallGraph, resolve_call_targets_with_summaries},
+    call_resolution::{IrCallGraph, resolve_call_targets_in_scope},
     instance_identity::{
         IrCallFrame, IrFieldWriteIndex, IrInstanceResolver, ReceiverBinding, VisitKey,
         find_call_vertex_by_syntax, find_value_producer_vertex, static_prop_key,
@@ -150,7 +150,13 @@ struct ResolvedCalleeTarget {
     decl_override: Option<DeclTargetRef>,
 }
 
-type VisitedEffectScopes = FxHashSet<(FunctionIrId, Vec<SyntaxId>, Option<(u32, u32)>)>;
+type VisitScopeKey = (
+    FunctionIrId,
+    Option<SyntaxId>,
+    Vec<SyntaxId>,
+    Option<(u32, u32)>,
+);
+type VisitedEffectScopes = FxHashMap<VisitScopeKey, usize>;
 
 #[derive(Default)]
 struct CollectedEffects {
@@ -160,13 +166,16 @@ struct CollectedEffects {
     calls: Vec<SyntaxId>,
     gaps: Vec<GapItem>,
     evidence: Vec<EvidenceItem>,
+    seen_reads: FxHashSet<(SyntaxId, String, Option<SyntaxId>)>,
+    seen_writes: FxHashSet<(SyntaxId, String, Option<&'static str>, Option<SyntaxId>)>,
+    seen_calls: FxHashSet<SyntaxId>,
 }
 
 /// Evaluates `callEffects` on IR for all `targets`.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Accepts IR environment, project files, summary index, and optional cached call graph."
+    reason = "Accepts IR environment, project files, summary index, and optional cached call graph and field write index."
 )]
 pub fn analyze_call_effects_on_ir(
     targets: &[CallEffectsTargetSpec],
@@ -177,7 +186,12 @@ pub fn analyze_call_effects_on_ir(
     ir_provider: &dyn IrProvider,
     summary_index: &BehaviorSummaryIndex,
     cached_call_graph: Option<&IrCallGraph>,
-) -> CallEffectsBatchOutcome {
+    cached_field_index: Option<&IrFieldWriteIndex>,
+) -> (
+    CallEffectsBatchOutcome,
+    Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
+) {
     let mut owned_graph = None;
     let mut owned_field_index = None;
     let mut analyzer = CallEffectsAnalyzer {
@@ -189,6 +203,7 @@ pub fn analyze_call_effects_on_ir(
         summary_index,
         cached_call_graph,
         owned_graph: &mut owned_graph,
+        cached_field_index,
         owned_field_index: &mut owned_field_index,
         conflict: None,
     };
@@ -201,10 +216,12 @@ pub fn analyze_call_effects_on_ir(
         results.push(analyzer.analyze_target(*target));
     }
 
-    CallEffectsBatchOutcome {
+    let outcome = CallEffectsBatchOutcome {
         results,
         conflict: analyzer.conflict.take(),
-    }
+    };
+    drop(analyzer);
+    (outcome, owned_graph, owned_field_index)
 }
 
 struct CallEffectsAnalyzer<'a> {
@@ -216,6 +233,7 @@ struct CallEffectsAnalyzer<'a> {
     summary_index: &'a BehaviorSummaryIndex,
     cached_call_graph: Option<&'a IrCallGraph>,
     owned_graph: &'a mut Option<IrCallGraph>,
+    cached_field_index: Option<&'a IrFieldWriteIndex>,
     owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     conflict: Option<SummaryConflictError>,
 }
@@ -241,7 +259,7 @@ impl CallEffectsAnalyzer<'_> {
                     GapItem::from_reason(
                         UnknownReason::MissingFunctionBody,
                         format!(
-                            "Target '{}' is an external declaration without source IR.",
+                            "Target '{}' is an external declaration without an analyzable source implementation.",
                             decl.name.as_deref().unwrap_or("<external>")
                         ),
                         self.syntax.syntax_location(target.syntax).or(decl.location),
@@ -255,7 +273,7 @@ impl CallEffectsAnalyzer<'_> {
             &mut out.gaps,
             GapItem::from_reason(
                 UnknownReason::MissingFunctionBody,
-                "Target cannot be resolved to analyzable IR.".to_string(),
+                "Target cannot be resolved to an analyzable implementation.".to_string(),
                 self.syntax.syntax_location(target.syntax),
             ),
         );
@@ -359,11 +377,44 @@ impl CallEffectsAnalyzer<'_> {
             return;
         }
 
-        let stack_key: Vec<SyntaxId> = call_stack.iter().map(|f| f.call_syntax).collect();
+        let mut relevant_context: Vec<SyntaxId> = Vec::new();
+        if self.options.follow_callbacks {
+            let param_indices = invoked_param_indices(ir);
+            if !param_indices.is_empty()
+                && let Some(frame) = call_stack.iter().rfind(|f| f.callee_ir.id == ir.id)
+            {
+                for idx in param_indices {
+                    let arg_syn = frame
+                        .args
+                        .get(idx)
+                        .and_then(|arg| {
+                            resolve_value_syntax(
+                                &frame.caller_ir,
+                                arg_value_id(*arg),
+                                None,
+                                self.syntax,
+                            )
+                        })
+                        .unwrap_or(SyntaxId(u64::MAX));
+                    relevant_context.push(arg_syn);
+                }
+            }
+            if let Some(last) = call_stack.last()
+                && !last.ir_frame.closure_env.is_empty()
+            {
+                for env_frame in last.ir_frame.closure_env.iter().take(4) {
+                    relevant_context.push(env_frame.call_syntax);
+                }
+            }
+        }
         let span_key = span_filter.map(|(_, s, e)| (*s, *e));
-        if !visited.insert((ir.id, stack_key, span_key)) {
+        let key = (ir.id, via_call, relevant_context, span_key);
+        if let Some(&prev_depth) = visited.get(&key)
+            && depth >= prev_depth
+        {
             return;
         }
+        visited.insert(key, depth);
 
         let reachable = compute_explicit_reachable(ir);
         let callee_reads = collect_direct_call_callee_prop_reads(ir);
@@ -413,6 +464,9 @@ impl CallEffectsAnalyzer<'_> {
                             .location
                             .clone()
                             .or_else(|| self.syntax.syntax_location(syn))
+                        && out
+                            .seen_reads
+                            .insert((syn, prop_name.to_string(), via_call))
                     {
                         let receiver_syntax =
                             resolve_value_syntax(ir, *object, Some(vertex.id), self.syntax)
@@ -462,45 +516,53 @@ impl CallEffectsAnalyzer<'_> {
                         let op_str = write_parts
                             .and_then(|p| p.logical_assign_op)
                             .unwrap_or_else(|| assign_op_str(*op));
-                        let receiver_syntax =
-                            resolve_value_syntax(ir, *object, Some(vertex.id), self.syntax)
-                                .unwrap_or(syn);
-                        let value_syntax =
-                            if matches!(op, AssignOp::Increment | AssignOp::Decrement) {
-                                None
-                            } else {
-                                resolve_value_syntax(ir, *value, Some(vertex.id), self.syntax)
-                            };
-                        let value_text = value_syntax.and_then(|vs| self.syntax.syntax_text(vs));
-                        let verb = if matches!(op, AssignOp::Increment | AssignOp::Decrement) {
-                            "Updated"
-                        } else {
-                            "Wrote"
-                        };
-                        let mut ev = chain_evidence.to_vec();
-                        push_unique_evidence(
-                            &mut ev,
-                            EvidenceItem::simple(
-                                "source",
-                                format!("{verb} field '.{prop_name}' using '{op_str}'"),
-                                Some(loc.clone()),
-                            ),
-                        );
-                        out.writes.push(self.build_field_effect(
-                            ir,
-                            vertex.id,
-                            "write",
+                        if out.seen_writes.insert((
+                            syn,
                             prop_name.to_string(),
                             Some(op_str),
-                            syn,
-                            target_syntax,
-                            receiver_syntax,
-                            value_syntax,
-                            value_text,
-                            loc,
                             via_call,
-                            ev,
-                        ));
+                        )) {
+                            let receiver_syntax =
+                                resolve_value_syntax(ir, *object, Some(vertex.id), self.syntax)
+                                    .unwrap_or(syn);
+                            let value_syntax =
+                                if matches!(op, AssignOp::Increment | AssignOp::Decrement) {
+                                    None
+                                } else {
+                                    resolve_value_syntax(ir, *value, Some(vertex.id), self.syntax)
+                                };
+                            let value_text =
+                                value_syntax.and_then(|vs| self.syntax.syntax_text(vs));
+                            let verb = if matches!(op, AssignOp::Increment | AssignOp::Decrement) {
+                                "Updated"
+                            } else {
+                                "Wrote"
+                            };
+                            let mut ev = chain_evidence.to_vec();
+                            push_unique_evidence(
+                                &mut ev,
+                                EvidenceItem::simple(
+                                    "source",
+                                    format!("{verb} field '.{prop_name}' using '{op_str}'"),
+                                    Some(loc.clone()),
+                                ),
+                            );
+                            out.writes.push(self.build_field_effect(
+                                ir,
+                                vertex.id,
+                                "write",
+                                prop_name.to_string(),
+                                Some(op_str),
+                                syn,
+                                target_syntax,
+                                receiver_syntax,
+                                value_syntax,
+                                value_text,
+                                loc,
+                                via_call,
+                                ev,
+                            ));
+                        }
                     }
                 }
                 IrOp::Call {
@@ -629,7 +691,8 @@ impl CallEffectsAnalyzer<'_> {
         if matches!(
             call_kind,
             IrCallKind::Explicit | IrCallKind::TaggedTemplate | IrCallKind::SuperCall
-        ) {
+        ) && out.seen_calls.insert(call_syntax)
+        {
             out.calls.push(call_syntax);
         }
 
@@ -844,8 +907,10 @@ impl CallEffectsAnalyzer<'_> {
         let Some(call_syntax) = call_vertex.syntax else {
             return;
         };
-        let resolution = resolve_call_targets_with_summaries(
+        let resolution = resolve_call_targets_in_scope(
             call_syntax,
+            caller_ir,
+            call_vertex,
             self.semantic,
             self.syntax,
             self.ir_provider,
@@ -1005,8 +1070,10 @@ impl CallEffectsAnalyzer<'_> {
         }
 
         // 2. Fall back to Ticket 08's `call_resolution`.
-        let resolution = resolve_call_targets_with_summaries(
+        let resolution = resolve_call_targets_in_scope(
             call_syntax,
+            caller_ir,
+            call_vertex,
             self.semantic,
             self.syntax,
             self.ir_provider,
@@ -1031,6 +1098,9 @@ impl CallEffectsAnalyzer<'_> {
                 });
             }
         }
+        if targets.is_empty() && trace_gaps.iter().any(|g| g.kind == "dynamic-callee") {
+            return (targets, trace_gaps);
+        }
         (targets, resolution.gaps)
     }
 
@@ -1054,8 +1124,9 @@ impl CallEffectsAnalyzer<'_> {
             self.summary_index,
             self.cached_call_graph,
             self.owned_graph,
-            None,
+            self.cached_field_index,
             self.owned_field_index,
+            false,
         );
         let mut active: Vec<VisitKey> = Vec::new();
         let trace = resolver.trace_value(scope_ir, val, vertex_hint, &ir_stack, 0, &mut active);
@@ -1425,6 +1496,25 @@ fn finalize_outcome(mut out: CollectedEffects) -> CallEffectsOutcome {
             gaps: out.gaps,
         }
     }
+}
+
+fn invoked_param_indices(ir: &FunctionIr) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for v in &ir.vertices {
+        if let IrOp::Call { callee, .. } = v.op
+            && let Some(p) = find_value_producer_vertex(ir, callee, Some(v.id))
+            && let IrOp::ReadLocal { binding } = p.op
+            && let Some(idx) = ir
+                .parameters
+                .iter()
+                .position(|param| param.binding == Some(binding))
+        {
+            indices.push(idx);
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 const fn arg_value_id(arg: IrCallArg) -> ValueId {
@@ -2025,7 +2115,7 @@ mod tests {
         });
         env.irs.insert(fn_syn, ir);
 
-        let batch = analyze_call_effects_on_ir(
+        let (batch, _, _) = analyze_call_effects_on_ir(
             &[CallEffectsTargetSpec {
                 syntax: fn_syn,
                 symbol: None,
@@ -2036,6 +2126,7 @@ mod tests {
             &env,
             &env,
             &BehaviorSummaryIndex::default(),
+            None,
             None,
         );
         assert!(batch.conflict.is_none());

@@ -56,6 +56,7 @@ struct RawMemberFact {
     has_body: bool,
     is_abstract: bool,
     is_static: bool,
+    is_private: bool,
     is_private_ecma: bool,
     is_override: bool,
     initializer_node: Option<P<Node>>,
@@ -355,6 +356,7 @@ fn convert_raw_hierarchy_node(
             has_body: m.has_body,
             is_abstract: m.is_abstract,
             is_static: m.is_static,
+            is_private: m.is_private,
             is_private_ecma: m.is_private_ecma,
             is_override: m.is_override,
             initializer_syntax: m.initializer_node.and_then(|n| interner.intern_syntax(n)),
@@ -558,6 +560,7 @@ fn extract_member_fact(
     let is_abstract = mod_flags.intersects(ModifierFlags::Abstract);
     let is_override = mod_flags.intersects(ModifierFlags::Override);
     let is_private_ecma = name_node.kind() == Kind::PrivateIdentifier;
+    let is_private = is_private_ecma || mod_flags.intersects(ModifierFlags::Private);
 
     let sym = checker
         .get_symbol_at_location_exported(member)
@@ -589,6 +592,7 @@ fn extract_member_fact(
         has_body,
         is_abstract,
         is_static,
+        is_private,
         is_private_ecma,
         is_override,
         initializer_node,

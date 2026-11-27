@@ -1095,7 +1095,7 @@ impl PropagationEngine<'_> {
             if let Some(loc) = self.syntax.syntax_location(from_spec.syntax) {
                 let _ = self.record_gap(GapItem::from_reason(
                     UnknownReason::NoEnclosingFunction,
-                    "Origin syntax has no enclosing IR scope.".to_string(),
+                    "Origin syntax has no enclosing function or module scope.".to_string(),
                     Some(loc),
                 ));
             }

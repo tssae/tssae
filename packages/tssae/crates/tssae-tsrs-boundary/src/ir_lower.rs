@@ -61,17 +61,37 @@ pub fn is_class_scope_node(node: P<Node>) -> bool {
     matches!(node.kind(), Kind::ClassDeclaration | Kind::ClassExpression)
 }
 
-/// Resolves the closest enclosing IR owner for `node`: function, class static block, or source file.
+/// Resolves the closest enclosing analyzable scope owner for `node`: function, class static block,
+/// class constructor/default-constructor for instance field initializers, or source file.
 #[must_use]
 pub fn resolve_enclosing_cfg_owner(node: P<Node>) -> Option<P<Node>> {
-    if let Some(fn_node) = resolve_enclosing_function(node) {
-        return Some(fn_node);
-    }
+    let mut prev = node;
     let mut cur = node.parent();
     while let Some(p) = cur {
-        if p.kind() == Kind::ClassStaticBlockDeclaration {
+        if is_function_like_declaration(Some(p)) {
+            if !p.decorators().contains(&prev) && p.name() != Some(prev) {
+                return Some(p);
+            }
+        } else if p.kind() == Kind::ClassStaticBlockDeclaration {
             return Some(p);
+        } else if p.kind() == Kind::PropertyDeclaration {
+            let prop = p.as_property_declaration();
+            if prop.initializer() == Some(prev)
+                && let Some(cls) = p.parent()
+                && is_class_scope_node(cls)
+            {
+                let sem = extract_decl_semantics(p);
+                if !sem.is_static {
+                    let explicit_ctor = cls
+                        .members()
+                        .iter()
+                        .copied()
+                        .find(|m| m.kind() == Kind::Constructor && m.body().is_some());
+                    return Some(explicit_ctor.unwrap_or(cls));
+                }
+            }
         }
+        prev = p;
         cur = p.parent();
     }
     get_source_file_of_node(node).map(|sf| sf.as_node())
@@ -157,7 +177,7 @@ pub fn lower_scope_to_ir_with_index(
     {
         return Err(GapItem::from_reason(
             UnknownReason::InvalidCfgScope,
-            "CFG scope node must be a function, block, static block, or statement.".to_string(),
+            "Analysis scope must be a function, block, static block, or statement.".to_string(),
             Some(scope_location),
         ));
     }
@@ -192,7 +212,7 @@ pub fn lower_scope_to_ir_with_index(
     if let Err(msg) = scope_ir.ir.validate_invariants() {
         return Err(GapItem::from_reason(
             UnknownReason::UnmodeledConstruct,
-            format!("IR CFG invariant violation: {msg}"),
+            format!("Scope analysis validation failed: {msg}"),
             Some(scope_ir.ir.scope_location.clone()),
         ));
     }
@@ -336,7 +356,7 @@ pub fn lower_class_to_ir(
     ) {
         return Err(GapItem::from_reason(
             UnknownReason::InvalidCfgScope,
-            "Class IR lowering requires a ClassDeclaration or ClassExpression.".to_string(),
+            "Class scope analysis requires a class declaration or class expression.".to_string(),
             Some(loc),
         ));
     }
@@ -475,7 +495,7 @@ pub fn lower_class_static_init_to_ir(
     if let Err(msg) = scope_ir.ir.validate_invariants() {
         return Err(GapItem::from_reason(
             UnknownReason::UnmodeledConstruct,
-            format!("IR CFG invariant violation: {msg}"),
+            format!("Scope analysis validation failed: {msg}"),
             Some(scope_ir.ir.scope_location.clone()),
         ));
     }
@@ -561,7 +581,7 @@ pub fn lower_class_default_constructor_to_ir(
     if let Err(msg) = scope_ir.ir.validate_invariants() {
         return Err(GapItem::from_reason(
             UnknownReason::UnmodeledConstruct,
-            format!("IR CFG invariant violation: {msg}"),
+            format!("Scope analysis validation failed: {msg}"),
             Some(scope_ir.ir.scope_location.clone()),
         ));
     }
@@ -6128,7 +6148,21 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             Some(out_val),
             true,
         );
-        self.add_edge(cls_v, next, ExplicitEdgeKind::Fallthrough);
+        let mut post_cls = next;
+        for &member in node.members().iter().rev() {
+            if member.kind() == Kind::PropertyDeclaration
+                && extract_decl_semantics(member).is_static
+            {
+                post_cls = self.lower_class_field_write(member, Some(node), post_cls);
+            } else if let Some(name_node) = member.name()
+                && name_node.kind() == Kind::ComputedPropertyName
+                && let Some(key_expr) = name_node.expression()
+            {
+                let (entry, _) = self.lower_expr_to(key_expr, post_cls);
+                post_cls = entry;
+            }
+        }
+        self.add_edge(cls_v, post_cls, ExplicitEdgeKind::Fallthrough);
         self.bind_expr_maps(node, cls_v, out_val);
         let mut cont = cls_v;
 

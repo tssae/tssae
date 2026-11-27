@@ -2338,6 +2338,7 @@ impl CleanupAnalyzer<'_> {
             self.owned_graph,
             self.cached_field_index,
             &mut self.owned_field_index,
+            true,
         );
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);
@@ -2368,6 +2369,7 @@ impl CleanupAnalyzer<'_> {
             self.owned_graph,
             self.cached_field_index,
             &mut self.owned_field_index,
+            true,
         );
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);

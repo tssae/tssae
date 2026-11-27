@@ -2,8 +2,11 @@
   "extends": "./tsconfig.node.json",
   "compilerOptions": {
     "customConditions": [],
+    "lib": ["es2024"],
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "skipLibCheck": true,
+    "types": []
   },
   "include": ["src/**/*.ts"]
 }

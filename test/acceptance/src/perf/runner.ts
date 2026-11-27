@@ -224,7 +224,11 @@ export async function runPerfAbBenchmark(
     log(
       "[perf] Installing baseline and candidate packages into isolated hosts...",
     );
-    hostA = await prepareAcceptanceHost({ bundle: baselineBundle });
+    // Historical baseline commits (prior to Node 24 compat) may declare engines.node: "^26.13.1".
+    hostA = await prepareAcceptanceHost({
+      bundle: baselineBundle,
+      engineStrict: false,
+    });
     hostB = await prepareAcceptanceHost({ bundle: candidateBundle });
 
     const schedule = buildPairedSamplingSchedule(rounds);

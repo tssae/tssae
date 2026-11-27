@@ -39,6 +39,12 @@
       "outputs": [],
       "tags": ["quality:light"]
     },
+    "test:dist": {
+      "dependsOn": ["^build", "build", "@tssae/test-hosts#typecheck"],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "tags": ["quality:heavy"]
+    },
     "typecheck": {
       "dependsOn": [
         "@tssae/tooling-config#typecheck",

@@ -79,6 +79,8 @@ const consumerTs = `import assert from "node:assert/strict";
 
 import { openProject, type EngineCallIoMetrics } from "tssae";
 
+assert.equal(process.versions.node, "24.0.0");
+
 const metrics: EngineCallIoMetrics[] = [];
 const session = await openProject({
   cwd: process.cwd(),
@@ -147,6 +149,7 @@ try {
 
   console.log(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       runTaskTargets: runTaskRes.resolvedTargets.map((t) => t.name).toSorted(),
       mapCbTargets: mapCbRes.resolvedTargets.map((t) => t.name),
       summaryInputs,
@@ -216,10 +219,12 @@ void test("tarball consumer compiles defineSummaries and executes local and buil
         `Consumer run failed:\nstdout:\n${runResult.stdout}\nstderr:\n${runResult.stderr}`,
       );
       const parsed = JSON.parse(runResult.stdout.trim()) as {
+        readonly nodeVersion: string;
         readonly runTaskTargets: readonly string[];
         readonly mapCbTargets: readonly string[];
         readonly summaryInputs: readonly string[];
       };
+      assert.equal(parsed.nodeVersion, "24.0.0");
       assert.deepEqual(parsed.runTaskTargets, ["fnA", "runTask"]);
       assert.deepEqual(parsed.mapCbTargets, ["fnA", "fnB"]);
       assert.ok(parsed.summaryInputs.includes("tssae.summaries.ts"));

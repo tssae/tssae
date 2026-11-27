@@ -32,18 +32,26 @@
     "lint": "cargo clippy --locked --workspace --all-targets -- -D warnings && oxlint --quiet --format=unix --ignore-pattern node_modules --ignore-pattern target .",
     "lint:fix": "oxlint --format=unix --ignore-pattern node_modules --ignore-pattern target . --fix",
     "test": "node --conditions=source scripts/run-cargo-tests.ts && node --conditions=source --test --test-reporter=spec 'test/**/*.test.ts'",
+    "test:dist": "node --test --test-reporter=spec 'test/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
   },
   "devDependencies": {
     "@tssae/test-hosts": "workspace:*",
     "@tssae/tooling-config": "workspace:*",
-    "@types/node": "catalog:",
+    "@types/node": "catalog:node-24",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "tsrs": "catalog:",
     "typescript-7": "catalog:"
   },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "24.0.0",
+      "onFail": "download"
+    }
+  },
   "engines": {
-    "node": "^26.13.1"
+    "node": ">=24.0.0"
   }
 }

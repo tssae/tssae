@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import os, { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -8,14 +9,14 @@ import { promisify } from "node:util";
 
 import { packWorkspaceArtifacts } from "../artifacts.ts";
 import {
-  prepareAcceptanceHost,
-  type PreparedAcceptanceHost,
-} from "../host-lifecycle.ts";
-import {
   prepareBaselineArtifact,
   readRepoHeadState,
   resolveRepoRoot,
-} from "./baseline.ts";
+} from "../baseline.ts";
+import {
+  prepareAcceptanceHost,
+  type PreparedAcceptanceHost,
+} from "../host-lifecycle.ts";
 import { materializeCorpus } from "./corpus.ts";
 import { SCENARIO_LABELS } from "./report.ts";
 import {
@@ -91,7 +92,7 @@ function resolveWorkerScriptPath(): string {
 }
 
 function resolveInstalledTssaeEntry(host: PreparedAcceptanceHost): string {
-  return resolve(host.hostDir, "node_modules", "tssae", "dist", "index.js");
+  return createRequire(join(host.hostDir, "package.json")).resolve("tssae");
 }
 
 async function runWorkerSubprocess(options: {

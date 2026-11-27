@@ -7,8 +7,8 @@ import { describe, it } from "node:test";
 
 import {
   buildPairedSamplingSchedule,
+  resolveBaselineCacheDir,
   resolveBaselineRevision,
-  resolvePerfCacheDir,
 } from "@tssae/acceptance";
 
 void describe("baseline resolution and paired ABBA sampling schedule", () => {
@@ -56,8 +56,8 @@ void describe("baseline resolution and paired ABBA sampling schedule", () => {
     }
   });
 
-  void it("resolves external perf cache directory outside repository", () => {
-    const cacheDir = resolvePerfCacheDir("/tmp/custom-perf-cache");
+  void it("resolves external baseline cache directory outside repository", () => {
+    const cacheDir = resolveBaselineCacheDir("/tmp/custom-perf-cache");
     assert.equal(cacheDir, "/tmp/custom-perf-cache");
     const subDir = join(cacheDir, "baselines");
     mkdirSync(subDir, { recursive: true });

@@ -1,4 +1,26 @@
 export {
+  prepareBaselineArtifact,
+  readRepoHeadState,
+  resolveBaselineCacheDir,
+  resolveBaselineRevision,
+  resolveRepoRoot,
+  type BaselineArtifact,
+  type PrepareBaselineArtifactOptions,
+  type RepoHeadState,
+  type ResolvedRevision,
+} from "./baseline.ts";
+export {
+  collectMatchingCorpusFiles,
+  materializeExternalCorpus,
+  resolveCorpusCacheDir,
+  resolveCorpusCheckoutDirName,
+  type CorpusFileMatchRule,
+  type CorpusSourceOrigin,
+  type ExternalCorpusSpec,
+  type MaterializedExternalCorpus,
+  type MaterializeExternalCorpusOptions,
+} from "./corpus.ts";
+export {
   CORE_TSSAE_PACKAGES,
   packWorkspaceArtifacts,
   type PackedArtifact,
@@ -39,14 +61,6 @@ export {
   type HostResolutionAudit,
   type VerifyHostResolutionOptions,
 } from "./verify.ts";
-export {
-  prepareBaselineArtifact,
-  readRepoHeadState,
-  resolveBaselineRevision,
-  resolvePerfCacheDir,
-  resolveRepoRoot,
-  type ResolvedRevision,
-} from "./perf/baseline.ts";
 export { runPerfCli } from "./perf/cli.ts";
 export {
   DEFAULT_SCENARIOS,
@@ -57,7 +71,6 @@ export {
 export {
   CORPUS_PROFILES,
   materializeCorpus,
-  resolveCorpusCacheDir,
   type MaterializeCorpusOptions,
 } from "./perf/corpus.ts";
 export {
@@ -85,7 +98,6 @@ export {
 } from "./perf/stats.ts";
 export type {
   AttributionReport,
-  BaselineArtifact,
   CorpusProfileId,
   CorpusProfileSpec,
   EngineStepAttribution,
@@ -103,3 +115,98 @@ export type {
   ScenarioStats,
   WorkerRunSample,
 } from "./perf/types.ts";
+export { collectQueryDigest } from "./semantic-diff/digest.ts";
+export {
+  diffDigests,
+  formatSemanticDiffReport,
+  type DiffDigestsOptions,
+} from "./semantic-diff/diff.ts";
+export {
+  loadSemanticDiffWaivers,
+  resolveDefaultWaiversPath,
+} from "./semantic-diff/waivers.ts";
+export {
+  runSemanticDiffCli,
+  type SemanticDiffCliIo,
+} from "./semantic-diff/cli.ts";
+export {
+  formatSemanticDiffCliUsage,
+  parseSemanticDiffCliArgs,
+  type SemanticDiffCliOptions,
+} from "./semantic-diff/cli-args.ts";
+export {
+  runSemanticDiffGate,
+  type RunSemanticDiffOptions,
+  type SemanticDiffGateRunResult,
+} from "./semantic-diff/runner.ts";
+export type {
+  CollectQueryDigestOptions,
+  DigestSample,
+  NormalizedLocation,
+  QueryChannelCounts,
+  QueryDigest,
+  RegressionFinding,
+  SemanticDiffResult,
+  SemanticDiffWaiver,
+  SemanticOutcomeChannel,
+  SemanticOutcomeStatus,
+  SemanticQueryName,
+  StatusTransitionCount,
+  UnknownCountDelta,
+} from "./semantic-diff/types.ts";
+export {
+  runConformanceCli,
+  type RunConformanceCliHost,
+} from "./conformance/cli.ts";
+export {
+  formatConformanceCliUsage,
+  parseConformanceCliArgs,
+  type ConformanceCliOptions,
+} from "./conformance/cli-args.ts";
+export {
+  CONFORMANCE_CORPORA,
+  DEFAULT_CONFORMANCE_CORPORA,
+} from "./conformance/corpora.ts";
+export {
+  formatConformanceConsoleReport,
+  formatConformanceMarkdownReport,
+  writeConformanceReportFiles,
+} from "./conformance/report.ts";
+export {
+  DEFAULT_CONFORMANCE_BATCH_SIZE,
+  DEFAULT_CONFORMANCE_BATCH_TIMEOUT_MS,
+  DEFAULT_CONFORMANCE_CONCURRENCY,
+  runConformanceSweep,
+  type RunConformanceSweepOptions,
+} from "./conformance/runner.ts";
+export type {
+  ConformanceBatchWorkerConfig,
+  ConformanceBatchWorkerResult,
+  ConformanceCorpusId,
+  ConformanceCorpusResult,
+  ConformanceCorpusSpecMap,
+  ConformanceFailureKind,
+  ConformanceFailureRecord,
+  ConformanceReport,
+  ConformanceViolation,
+} from "./conformance/types.ts";
+export {
+  checkSoundness,
+  collectPreciseCoverage,
+  runSoundnessReconciliationSuite,
+  type BranchCoverageSoundnessCase,
+  type CallEffectsSoundnessCase,
+  type CalleesOfSoundnessCase,
+  type ExecutionCountOptions,
+  type InstanceCleanupSoundnessCase,
+  type PreciseCoverageSnapshot,
+  type SoundnessCheckInput,
+  type SoundnessCheckReport,
+  type SoundnessCompleteness,
+  type SoundnessQueryKind,
+  type SoundnessReconciliationOptions,
+  type SoundnessReconciliationResult,
+  type SoundnessTriState,
+  type SoundnessViolation,
+  type ValuePropagationSoundnessCase,
+} from "./soundness/index.ts";

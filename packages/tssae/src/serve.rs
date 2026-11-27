@@ -18,11 +18,12 @@ use tssae_analysis::{
 };
 use tssae_common::{BranchId, EvidenceItem, FileId, GapItem, SummaryConfigPayload, UnknownReason};
 use tssae_tsrs_boundary::{
-    BoundaryChecker, BoundaryNode, BoundaryProgram, BoundaryProjectFileCatalog, BoundaryProjectId,
-    BoundarySession, BoundarySignature, BoundarySnapshotData, BoundarySymbol, BoundaryType,
-    FileIdRegistry, FileSyntaxIndex, ProgramHierarchyIndex, ProjectSummary, ResolvedPackageInfo,
-    SourceMapCache, SymbolRegistry, UpdateSnapshotInput, lower_scope_to_ir_boundary,
-    normalize_path, open_projects_snapshot, release_compiler_snapshot, update_projects_snapshot,
+    BoundaryCfgScope, BoundaryChecker, BoundaryNode, BoundaryProgram, BoundaryProjectFileCatalog,
+    BoundaryProjectId, BoundarySession, BoundarySignature, BoundarySnapshotData, BoundarySymbol,
+    BoundaryType, FileIdRegistry, FileSyntaxIndex, ProgramHierarchyIndex, ProjectSummary,
+    ResolvedPackageInfo, SourceMapCache, SymbolRegistry, UpdateSnapshotInput,
+    lower_cfg_scope_to_ir_boundary, normalize_path, open_projects_snapshot,
+    release_compiler_snapshot, update_projects_snapshot,
 };
 
 use crate::comments::{ScannedComment, scan_snapshot_comments};
@@ -265,7 +266,7 @@ impl BranchCoverageItem {
 
 #[derive(Clone, Copy)]
 pub struct BranchHandle {
-    pub function_node: BoundaryNode,
+    pub scope: BoundaryCfgScope,
     pub edge_index: usize,
 }
 
@@ -309,7 +310,7 @@ pub enum HandleInternKey {
     },
     Branch {
         project_id: String,
-        function_node: BoundaryNode,
+        scope: BoundaryCfgScope,
         edge_index: usize,
     },
 }
@@ -479,7 +480,7 @@ impl SnapshotState {
             project_id,
             HandleInternKey::Branch {
                 project_id: project_id.to_string(),
-                function_node: branch.function_node,
+                scope: branch.scope,
                 edge_index: branch.edge_index,
             },
             HandlePayload::Branch(branch),
@@ -608,9 +609,10 @@ impl SnapshotState {
         &mut self,
         program: BoundaryProgram,
         checker: &mut BoundaryChecker<'_>,
-        scope_node: BoundaryNode,
+        scope: BoundaryCfgScope,
         observer: &mut ObserveCollector,
     ) -> Result<(Arc<FunctionIr>, Arc<FileSyntaxIndex>), GapItem> {
+        let scope_node = scope.anchor_node();
         let Some(sf) = scope_node.source_file() else {
             return Err(GapItem::from_reason(
                 UnknownReason::MissingSourceFile,
@@ -648,19 +650,24 @@ impl SnapshotState {
 
         let mut lowering_duration_ms = 0.0;
         let cwd = &self.cwd;
-        let (result, is_hit) = file_entry.get_or_init_scope(local_syntax, |local_scope| {
+        let lower_fn = |local_scope: u32| {
             let started = Instant::now();
-            let lowered = lower_scope_to_ir_boundary(
+            let lowered = lower_cfg_scope_to_ir_boundary(
                 cwd,
                 program,
                 checker,
-                scope_node,
+                scope,
                 local_scope,
                 Some(&file_index),
             );
             lowering_duration_ms = elapsed_ms(started);
             lowered
-        });
+        };
+        let (result, is_hit) = if scope.uses_statement_ir_cache() {
+            file_entry.get_or_init_statement_scope(local_syntax, lower_fn)
+        } else {
+            file_entry.get_or_init_scope(local_syntax, lower_fn)
+        };
 
         if is_hit {
             observer.record_ir_cache_hit();
@@ -1105,7 +1112,7 @@ pub fn run_list_branches(
     let mut fn_nodes = Vec::with_capacity(targets.len());
     for handle_id in targets {
         let node = snapshot.get_syntax_node(project_id, handle_id)?;
-        let Some(scope_node) = node.normalize_cfg_scope() else {
+        let Some(scope) = node.normalize_cfg_scope_target() else {
             return Err(RpcErr::new(
                 "INVALID_REFERENCE_KIND",
                 format!(
@@ -1113,25 +1120,26 @@ pub fn run_list_branches(
                 ),
             ));
         };
-        fn_nodes.push((handle_id.clone(), scope_node));
+        fn_nodes.push((handle_id.clone(), scope));
     }
 
     let mut items = Vec::with_capacity(fn_nodes.len());
-    for (target_id, scope_node) in fn_nodes {
-        match snapshot.get_or_build_ir(program, checker, scope_node, observer) {
+    for (target_id, scope) in fn_nodes {
+        let anchor_node = scope.anchor_node();
+        match snapshot.get_or_build_ir(program, checker, scope, observer) {
             Ok((ir, file_index)) => {
                 let mut branch_items = Vec::with_capacity(ir.branches.len());
                 for branch in &ir.branches {
                     let branch_ref = snapshot.alloc_branch(
                         project_id,
                         BranchHandle {
-                            function_node: scope_node,
+                            scope,
                             edge_index: usize::try_from(branch.id.0).unwrap_or(0),
                         },
                     );
                     let cond_node = file_index
                         .boundary_node_for_syntax_id(branch.condition_syntax)
-                        .unwrap_or(scope_node);
+                        .unwrap_or(anchor_node);
                     let condition = snapshot.alloc_syntax(project_id, cond_node);
                     branch_items.push(BranchEdgeItem {
                         branch_ref,
@@ -1176,7 +1184,7 @@ fn resolve_explicit_scope(
     project_id: &str,
     function_handle: Option<&str>,
     scope_handle: Option<&str>,
-) -> Result<Option<BoundaryNode>, RpcErr> {
+) -> Result<Option<BoundaryCfgScope>, RpcErr> {
     if function_handle.is_some() && scope_handle.is_some() {
         return Err(RpcErr::new(
             "INVALID_CONFIG",
@@ -1191,11 +1199,11 @@ fn resolve_explicit_scope(
                 format!("Program reference {fn_id} is not a function-like syntax node."),
             ));
         };
-        return Ok(Some(fn_node));
+        return Ok(Some(BoundaryCfgScope::Node(fn_node)));
     }
     if let Some(scope_id) = scope_handle {
         let node = snapshot.get_syntax_node(project_id, scope_id)?;
-        let Some(scope_node) = node.normalize_cfg_scope() else {
+        let Some(scope) = node.normalize_cfg_scope_target() else {
             return Err(RpcErr::new(
                 "INVALID_REFERENCE_KIND",
                 format!(
@@ -1203,7 +1211,7 @@ fn resolve_explicit_scope(
                 ),
             ));
         };
-        return Ok(Some(scope_node));
+        return Ok(Some(scope));
     }
     Ok(None)
 }
@@ -1284,8 +1292,8 @@ pub fn run_branch_coverage(
 
     let mut items = Vec::with_capacity(resolved_targets.len());
     for (target_id, target_node, target_loc) in resolved_targets {
-        let scope_fn = explicit_scope.or_else(|| target_node.resolve_enclosing_function());
-        let Some(scope_node) = scope_fn else {
+        let scope_fn = explicit_scope.or_else(|| target_node.resolve_enclosing_branch_scope());
+        let Some(scope) = scope_fn else {
             let gap = GapItem::from_reason(
                 UnknownReason::NoEnclosingFunction,
                 "Target is not inside a function body.".to_string(),
@@ -1310,34 +1318,34 @@ pub fn run_branch_coverage(
             continue;
         };
 
-        let (ir, file_index) =
-            match snapshot.get_or_build_ir(req.program, checker, scope_node, observer) {
-                Ok(pair) => pair,
-                Err(gap) => {
-                    let evidence = vec![EvidenceItem::simple(
-                        "note",
-                        gap.message.clone(),
-                        gap.at.clone(),
-                    )];
-                    items.push(BranchCoverageItem::Inconclusive {
-                        target: target_id,
-                        target_reachable: false,
-                        implicit_exceptions: ImplicitExceptionCoverageOutcome::Inconclusive {
-                            may_throw_sites: Vec::new(),
-                            gaps: vec![gap.clone()],
-                            evidence: evidence.clone(),
-                        },
-                        gaps: vec![gap],
-                        evidence,
-                    });
-                    continue;
-                }
-            };
+        let (ir, file_index) = match snapshot.get_or_build_ir(req.program, checker, scope, observer)
+        {
+            Ok(pair) => pair,
+            Err(gap) => {
+                let evidence = vec![EvidenceItem::simple(
+                    "note",
+                    gap.message.clone(),
+                    gap.at.clone(),
+                )];
+                items.push(BranchCoverageItem::Inconclusive {
+                    target: target_id,
+                    target_reachable: false,
+                    implicit_exceptions: ImplicitExceptionCoverageOutcome::Inconclusive {
+                        may_throw_sites: Vec::new(),
+                        gaps: vec![gap.clone()],
+                        evidence: evidence.clone(),
+                    },
+                    gaps: vec![gap],
+                    evidence,
+                });
+                continue;
+            }
+        };
 
         let mut selected_branches = Vec::new();
         let mut extra_gaps = Vec::new();
         for branch in &resolved_branches {
-            if branch.function_node == scope_node {
+            if branch.scope == scope {
                 let bid = BranchId(u32::try_from(branch.edge_index).unwrap_or(u32::MAX));
                 selected_branches.push(bid);
             } else if explicit_scope.is_some() {

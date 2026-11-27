@@ -16,12 +16,15 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false",
+    "conformance": "node --conditions=source scripts/conformance.ts",
     "format:check": "oxfmt --list-different .",
     "format:write": "oxfmt --write .",
     "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules .",
     "lint:fix": "oxlint --format=unix . --fix",
     "perf": "node --conditions=source scripts/perf.ts",
     "perf:gate": "node --conditions=source scripts/perf.ts --profile medium",
+    "semantic-diff": "node --conditions=source scripts/semantic-diff.ts",
+    "semantic-diff:gate": "node --conditions=source scripts/semantic-diff.ts --profile medium",
     "test": "node --conditions=source --test --test-reporter=spec 'test/unit/**/*.test.ts'",
     "test:e2e": "node --test --test-reporter=spec 'test/e2e/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"

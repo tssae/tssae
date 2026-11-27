@@ -753,6 +753,7 @@ pub struct FileIrEntry {
     scope_by_local_syntax: FxHashMap<LocalSyntaxId, usize>,
     lowered_scopes: Box<[OnceLock<CachedScopeOutcome>]>,
     extra_scopes: RwLock<FxHashMap<LocalSyntaxId, CachedScopeOutcome>>,
+    statement_scopes: RwLock<FxHashMap<LocalSyntaxId, CachedScopeOutcome>>,
 }
 
 impl FileIrEntry {
@@ -779,6 +780,7 @@ impl FileIrEntry {
             scope_by_local_syntax,
             lowered_scopes,
             extra_scopes: RwLock::new(FxHashMap::default()),
+            statement_scopes: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -794,9 +796,11 @@ impl FileIrEntry {
             .filter(|slot| slot.get().is_some())
             .count()
             + self.extra_scopes.read().map_or(0, |guard| guard.len())
+            + self.statement_scopes.read().map_or(0, |guard| guard.len())
     }
 
-    /// Returns the cached IR for `local`, lazily invoking `lower` only on cache miss.
+    /// Returns the cached callable, static-init, default-constructor, or module IR for `local`,
+    /// lazily invoking `lower` only on cache miss.
     ///
     /// Returns `(result, is_cache_hit)`.
     pub fn get_or_init_scope(
@@ -827,6 +831,32 @@ impl FileIrEntry {
         let scope_id = 0x8000_0000_u32 | local.0;
         let built = lower(scope_id);
         if let Ok(mut guard) = self.extra_scopes.write() {
+            if let Some(existing) = guard.get(&local) {
+                return (existing.clone(), true);
+            }
+            guard.insert(local, built.clone());
+        }
+        (built, false)
+    }
+
+    /// Returns the cached statement or local-block IR (`IrScopeKind::LocalBlock`) for `local`
+    /// without colliding with cataloged or extra callable/default-constructor scopes sharing the
+    /// same AST node (such as a `ClassDeclaration` without an explicit `constructor`).
+    ///
+    /// Returns `(result, is_cache_hit)`.
+    pub fn get_or_init_statement_scope(
+        &self,
+        local: LocalSyntaxId,
+        lower: impl FnOnce(u32) -> Result<Arc<FunctionIr>, GapItem>,
+    ) -> (Result<Arc<FunctionIr>, GapItem>, bool) {
+        if let Ok(guard) = self.statement_scopes.read()
+            && let Some(existing) = guard.get(&local)
+        {
+            return (existing.clone(), true);
+        }
+        let scope_id = 0x4000_0000_u32 | local.0;
+        let built = lower(scope_id);
+        if let Ok(mut guard) = self.statement_scopes.write() {
             if let Some(existing) = guard.get(&local) {
                 return (existing.clone(), true);
             }
@@ -926,4 +956,99 @@ impl SnapshotIrCache {
 #[must_use]
 pub const fn scope_ir_id(file: FileId, local_scope: u32) -> FunctionIrId {
     FunctionIrId { file, local_scope }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_ir(file: FileId, local_scope: u32, kind: IrScopeKind) -> Arc<FunctionIr> {
+        Arc::new(FunctionIr {
+            id: scope_ir_id(file, local_scope),
+            root_syntax: SyntaxId::from_parts(file, LocalSyntaxId(1)),
+            scope_kind: kind,
+            scope_location: DiagnosticLocation {
+                file: "test.ts".to_string(),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 10,
+                start: 0,
+                end: 9,
+            },
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: Vec::new(),
+            bindings: Vec::new(),
+            captured_bindings: Vec::new(),
+            vertices: vec![CfgVertex {
+                id: VertexId(0),
+                syntax: None,
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: None,
+                value: None,
+                op: IrOp::Exit,
+                explicit_edges: Vec::new(),
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            }],
+            entry: VertexId(0),
+            normal_exit: VertexId(0),
+            exceptional_exit: VertexId(0),
+            exit: VertexId(0),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 0,
+        })
+    }
+
+    #[test]
+    fn separates_statement_scope_cache_from_catalog_and_extra_scopes() {
+        let file = FileId(3);
+        let catalog_local = LocalSyntaxId(7);
+        let extra_local = LocalSyntaxId(19);
+        let entry = FileIrEntry::new(
+            file,
+            "test.ts".to_string(),
+            0x1234,
+            vec![ScopeCatalogEntry {
+                id: scope_ir_id(file, 0),
+                local_syntax: catalog_local,
+                root_syntax: SyntaxId::from_parts(file, catalog_local),
+                kind: IrScopeKind::Constructor,
+                span_start: 0,
+                span_end: 10,
+            }],
+        );
+
+        let (stmt_res, stmt_hit) = entry.get_or_init_statement_scope(catalog_local, |sid| {
+            Ok(dummy_ir(file, sid, IrScopeKind::LocalBlock))
+        });
+        assert!(!stmt_hit);
+        let stmt_ir = stmt_res.unwrap();
+        assert_eq!(stmt_ir.scope_kind, IrScopeKind::LocalBlock);
+
+        let (ctor_res, ctor_hit) = entry.get_or_init_scope(catalog_local, |sid| {
+            Ok(dummy_ir(file, sid, IrScopeKind::Constructor))
+        });
+        assert!(!ctor_hit);
+        let ctor_ir = ctor_res.unwrap();
+        assert_eq!(ctor_ir.scope_kind, IrScopeKind::Constructor);
+        assert_ne!(stmt_ir.id, ctor_ir.id);
+
+        let (extra_ctor, _) = entry.get_or_init_scope(extra_local, |sid| {
+            Ok(dummy_ir(file, sid, IrScopeKind::Constructor))
+        });
+        let (extra_stmt, _) = entry.get_or_init_statement_scope(extra_local, |sid| {
+            Ok(dummy_ir(file, sid, IrScopeKind::LocalBlock))
+        });
+        assert_ne!(extra_ctor.unwrap().id, extra_stmt.unwrap().id);
+        assert_eq!(entry.lowered_scope_count(), 4);
+    }
 }

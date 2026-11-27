@@ -8,8 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tssae_common::{
     DeclarationIdentity, DiagnosticLocation, EvidenceItem, FileId, FunctionIrId, GapItem,
     LocalBindingId, SemanticModel, SummaryCompleteness, SummaryConflictError, SummaryNamedValueRef,
-    SummarySource, SummaryTaggedValueRef, SummaryValueRef, SymbolId, SyntaxCatalog, SyntaxId,
-    UnknownReason, ValueAspectSummary, ValueId, VertexId,
+    SummarySource, SummaryTaggedValueRef, SummaryTargetMatcher, SummaryValueRef, SymbolId,
+    SyntaxCatalog, SyntaxId, UnknownReason, ValueAspectSummary, ValueId, VertexId,
 };
 
 use crate::{
@@ -64,6 +64,18 @@ fn push_field_segment(
     }
     fields.field_path.push(seg);
     true
+}
+
+fn push_promise_segment(
+    queue: &mut DualQueue,
+    fields: &mut ValueFieldState,
+    loc: Option<DiagnosticLocation>,
+) -> bool {
+    // ECMAScript Promise resolution recursively flattens nested Promises (`Promise<Promise<T>> === Promise<T>`).
+    if matches!(fields.field_path.last(), Some(FieldSegment::Promise)) {
+        return true;
+    }
+    push_field_segment(queue, fields, FieldSegment::Promise, loc)
 }
 
 /// Endpoint handle and optional canonical symbol passed into [`trace_value_propagation`].
@@ -123,6 +135,28 @@ pub struct ValuePropagationOutcome {
 enum FieldSegment {
     Prop(String),
     Element(Option<usize>),
+    Promise,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromiseSummaryKind {
+    SingleValue,
+    AllArray,
+    AllSettledArray,
+}
+
+fn classify_promise_summary(matcher: &SummaryTargetMatcher) -> Option<PromiseSummaryKind> {
+    if matcher.package.is_some() || matcher.module.is_some() {
+        return None;
+    }
+    match matcher.member_path.first().map(String::as_str) {
+        Some("Promise" | "PromiseLike") => match matcher.member_path.get(1).map(String::as_str) {
+            Some("all") => Some(PromiseSummaryKind::AllArray),
+            Some("allSettled") => Some(PromiseSummaryKind::AllSettledArray),
+            _ => Some(PromiseSummaryKind::SingleValue),
+        },
+        _ => None,
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Default, Debug)]
@@ -171,6 +205,7 @@ enum CallFrameData {
         summary_source: SummarySource,
         summary_pack_id: String,
         values_aspect: ValueAspectSummary,
+        promise_summary: Option<PromiseSummaryKind>,
     },
 }
 
@@ -283,6 +318,7 @@ enum UseRole {
         is_spread: bool,
     },
     ReturnValue,
+    YieldValue,
     UnknownChild,
 }
 
@@ -358,10 +394,21 @@ impl IrValueIndex {
                 | IrOp::Branch { .. }
                 | IrOp::SwitchDispatch { .. }
                 | IrOp::Throw { .. }
-                | IrOp::Yield { .. }
+                | IrOp::Yield { value: None, .. }
                 | IrOp::IteratorClose { .. }
                 | IrOp::JsxElement { .. }
                 | IrOp::Return { value: None } => {}
+                IrOp::Yield {
+                    value: Some(val), ..
+                } => {
+                    consumers
+                        .entry(*val)
+                        .or_default()
+                        .push(ValueConsumer::VertexUse {
+                            vertex: vertex.id,
+                            role: UseRole::YieldValue,
+                        });
+                }
                 IrOp::ReadLocal { binding } => {
                     reads_of_binding
                         .entry(*binding)
@@ -690,7 +737,18 @@ fn compute_iterator_steps(
                                 if ir.branches.get(bid.0 as usize).is_some_and(|b| b.kind == IrBranchKind::Loop))
                         })
                     });
-                    if has_loop_branch {
+                    let is_delegate_yield = v.explicit_edges.iter().any(|e| {
+                        ir.vertices.get(e.target.0 as usize).is_some_and(|nv| {
+                            matches!(
+                                nv.op,
+                                IrOp::Yield {
+                                    is_delegate: true,
+                                    ..
+                                }
+                            )
+                        })
+                    });
+                    if has_loop_branch || is_delegate_yield {
                         is_loop_iter = true;
                         out.insert(
                             vid,
@@ -1701,13 +1759,9 @@ impl PropagationEngine<'_> {
                     return;
                 };
                 let mut next_fields = item.fields.clone();
-                if matches!(
-                    next_fields.field_path.last(),
-                    Some(FieldSegment::Element(_))
-                ) {
+                // ECMAScript Await unwraps Promises and passes non-Promise values through unchanged.
+                if matches!(next_fields.field_path.last(), Some(FieldSegment::Promise)) {
                     next_fields.field_path.pop();
-                } else if !next_fields.field_path.is_empty() {
-                    return;
                 }
                 Self::enqueue_transition(
                     queue,
@@ -1970,7 +2024,7 @@ impl PropagationEngine<'_> {
                         Some(FieldSegment::Element(idx_opt)) => prop_name
                             .parse::<usize>()
                             .is_ok_and(|ri| idx_opt.is_none_or(|i| i == ri)),
-                        None => false,
+                        Some(FieldSegment::Promise) | None => false,
                     };
                     if matched {
                         let mut next_fields = item.fields.clone();
@@ -1999,6 +2053,37 @@ impl PropagationEngine<'_> {
                             next_fields,
                             item.stack.clone(),
                             Some((step_kind, desc, Some(prop_name), None)),
+                            None,
+                            item.gap_indices.clone(),
+                        );
+                    } else if !item.gap_indices.is_empty()
+                        && prop_name == "value"
+                        && matches!(
+                            item.fields.field_path.last(),
+                            Some(FieldSegment::Element(_))
+                        )
+                    {
+                        // A gap-tainted iterator/generator result (e.g. `gen.next().value`)
+                        // wraps the yielded element inside `{ value, done }`; unwrap the element
+                        // segment and preserve the gap instead of emitting a false `disproved`.
+                        let mut next_fields = item.fields.clone();
+                        next_fields.field_path.pop();
+                        Self::enqueue_transition(
+                            queue,
+                            visited,
+                            untainted_visited,
+                            item,
+                            Arc::clone(ir),
+                            TraceNode::Value(out_val),
+                            v_loc,
+                            next_fields,
+                            item.stack.clone(),
+                            Some((
+                                "propertyRead",
+                                format!("Read property '.{prop_name}'"),
+                                Some(prop_name),
+                                None,
+                            )),
                             None,
                             item.gap_indices.clone(),
                         );
@@ -2347,6 +2432,14 @@ impl PropagationEngine<'_> {
                     });
                 let is_async_iter = matches!(v.op, IrOp::IteratorNext { is_async: true, .. });
                 let mut next_fields = item.fields.clone();
+                let had_outer_promise = if is_async_iter
+                    && matches!(next_fields.field_path.last(), Some(FieldSegment::Promise))
+                {
+                    next_fields.field_path.pop();
+                    true
+                } else {
+                    false
+                };
                 match next_fields.field_path.last() {
                     Some(FieldSegment::Element(elem_idx_opt)) => {
                         let matches_slot = step_info.is_loop
@@ -2358,15 +2451,18 @@ impl PropagationEngine<'_> {
                         }
                         next_fields.field_path.pop();
                     }
-                    Some(FieldSegment::Prop(_)) => return,
-                    None => {}
+                    Some(FieldSegment::Prop(_) | FieldSegment::Promise) => return,
+                    None => {
+                        if had_outer_promise && item.gap_indices.is_empty() {
+                            return;
+                        }
+                    }
                 }
                 if is_async_iter
-                    && matches!(
-                        next_fields.field_path.last(),
-                        Some(FieldSegment::Element(None))
-                    )
+                    && !had_outer_promise
+                    && matches!(next_fields.field_path.last(), Some(FieldSegment::Promise))
                 {
+                    // AsyncFromSyncIterator awaits Promise elements produced by a synchronous iterable.
                     next_fields.field_path.pop();
                 }
                 let (step_kind, desc) = if step_info.is_loop {
@@ -2412,7 +2508,7 @@ impl PropagationEngine<'_> {
                             *elem_idx_opt = Some(i - step_info.rest_offset);
                         }
                     }
-                    Some(FieldSegment::Prop(_)) => return,
+                    Some(FieldSegment::Prop(_) | FieldSegment::Promise) => return,
                     None => {}
                 }
                 Self::enqueue_transition(
@@ -2467,7 +2563,43 @@ impl PropagationEngine<'_> {
                 );
             }
             UseRole::ReturnValue => {
-                self.handle_return(item, v, queue, visited, untainted_visited);
+                if ir.decl_semantics.is_async && !ir.decl_semantics.is_generator {
+                    let mut next_fields = item.fields.clone();
+                    let loc = v_loc.or_else(|| Some(ir.scope_location.clone()));
+                    if !push_promise_segment(queue, &mut next_fields, loc) {
+                        return;
+                    }
+                    let mut async_item = item.clone();
+                    async_item.fields = next_fields;
+                    self.handle_return(&async_item, v, queue, visited, untainted_visited);
+                } else {
+                    self.handle_return(item, v, queue, visited, untainted_visited);
+                }
+            }
+            UseRole::YieldValue => {
+                let mut next_fields = item.fields.clone();
+                let loc = v_loc.or_else(|| Some(ir.scope_location.clone()));
+                if ir.decl_semantics.is_async
+                    && matches!(next_fields.field_path.last(), Some(FieldSegment::Promise))
+                {
+                    // ECMA-262 AsyncGeneratorYield implicitly awaits its operand before yielding.
+                    next_fields.field_path.pop();
+                }
+                if !push_field_segment(
+                    queue,
+                    &mut next_fields,
+                    FieldSegment::Element(None),
+                    loc.clone(),
+                ) {
+                    return;
+                }
+                if ir.decl_semantics.is_async && !push_promise_segment(queue, &mut next_fields, loc)
+                {
+                    return;
+                }
+                let mut yielded_item = item.clone();
+                yielded_item.fields = next_fields;
+                self.handle_return(&yielded_item, v, queue, visited, untainted_visited);
             }
             UseRole::UnknownChild => {
                 let Some(out_val) = v.value else {
@@ -2897,28 +3029,7 @@ impl PropagationEngine<'_> {
         }
 
         // Check if `object_val` traces back to `ThisRef` or a local binding in `ir`.
-        let mut is_this = false;
-        let mut local_bindings = Vec::new();
-        let mut work = vec![object_val];
-        let mut seen = FxHashSet::default();
-        while let Some(v_id) = work.pop() {
-            if !seen.insert(v_id) {
-                continue;
-            }
-            for vert in &ir.vertices {
-                if vert.value == Some(v_id) {
-                    match vert.op {
-                        IrOp::ThisRef => is_this = true,
-                        IrOp::ReadLocal { binding } => local_bindings.push(binding),
-                        IrOp::ValueForward { source, .. } => work.push(source),
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(sources) = ir.value_sources.get(&v_id) {
-                work.extend(sources.iter().copied());
-            }
-        }
+        let (is_this, local_bindings) = trace_prop_write_targets(ir, object_val);
 
         if is_this
             && let Some((top_frame, rest_stack)) = base.stack.split_last()
@@ -2971,6 +3082,24 @@ impl PropagationEngine<'_> {
                     untainted_visited,
                 );
             }
+        } else if is_this
+            && base.stack.is_empty()
+            && ir.scope_kind == IrScopeKind::Constructor
+            && !self
+                .allowed_reverse_files
+                .as_ref()
+                .is_some_and(FxHashSet::is_empty)
+        {
+            self.propagate_unanchored_ctor_this_write(
+                base,
+                ir.root_syntax,
+                &next_fields,
+                prop_name,
+                gaps,
+                queue,
+                visited,
+                untainted_visited,
+            );
         }
 
         for lb in local_bindings {
@@ -2987,6 +3116,94 @@ impl PropagationEngine<'_> {
                 visited,
                 untainted_visited,
             );
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Forwards unanchored constructor `this.prop = ...` mutations to `new` construct sites in `IrCallGraph`."
+    )]
+    fn propagate_unanchored_ctor_this_write(
+        &mut self,
+        base: &TraceItem,
+        ctor_syntax: SyntaxId,
+        next_fields: &ValueFieldState,
+        prop_name: Option<&str>,
+        gaps: &BTreeSet<usize>,
+        queue: &mut DualQueue,
+        visited: &mut FxHashSet<TraceKey>,
+        untainted_visited: &mut FxHashSet<(
+            FunctionIrId,
+            TraceNode,
+            ValueFieldState,
+            Vec<CallFrameKey>,
+        )>,
+    ) {
+        let target_symbol = self.semantic.symbol_at_syntax(ctor_syntax);
+        let allowed_clone = self.allowed_reverse_files.clone();
+        let construct_sites: Vec<SyntaxId> = {
+            let graph = self.call_graph();
+            let mut indices = BTreeSet::new();
+            if let Some(list) = graph.by_decl.get(&ctor_syntax) {
+                indices.extend(list.iter().copied());
+            }
+            if let Some(sym) = target_symbol
+                && let Some(list) = graph.by_symbol.get(&sym)
+            {
+                indices.extend(list.iter().copied());
+            }
+            indices
+                .into_iter()
+                .filter_map(|idx| {
+                    let site = &graph.sites[idx];
+                    if allowed_clone
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&site.file))
+                    {
+                        return None;
+                    }
+                    Some(site.call_syntax)
+                })
+                .collect()
+        };
+        if self.conflict.is_some() {
+            return;
+        }
+        for call_syn in construct_sites {
+            let Ok(caller_ir) = self.ir_provider.enclosing_scope_ir(call_syn) else {
+                continue;
+            };
+            if let Some(&cv_id) = caller_ir.expr_to_vertex.get(&call_syn.local_id())
+                && let Some(cv) = caller_ir.vertices.get(cv_id.0 as usize)
+                && matches!(cv.op, IrOp::Construct { .. })
+                && let Some(out_val) = cv.value
+            {
+                let call_loc = self
+                    .syntax
+                    .syntax_location(call_syn)
+                    .or_else(|| cv.location.clone());
+                Self::enqueue_transition(
+                    queue,
+                    visited,
+                    untainted_visited,
+                    base,
+                    caller_ir,
+                    TraceNode::Value(out_val),
+                    call_loc,
+                    next_fields.clone(),
+                    Vec::new(),
+                    prop_name.map(|p| {
+                        (
+                            "propertyWrite",
+                            format!("Initialized constructed property '{p}'"),
+                            Some(p.to_string()),
+                            None,
+                        )
+                    }),
+                    None,
+                    gaps.clone(),
+                );
+            }
         }
     }
 
@@ -3097,6 +3314,7 @@ impl PropagationEngine<'_> {
                 summary_source,
                 summary_pack_id,
                 values_aspect,
+                promise_summary,
                 ..
             } = top_frame
             && let Some(cb_param_idx) = callee_param_index(&item.ir, call_callee)
@@ -3137,6 +3355,7 @@ impl PropagationEngine<'_> {
                         outer_call_v,
                         &flow.to,
                         flow.preserve_object_path,
+                        *promise_summary,
                         rest_stack,
                         Some(&sum_ev),
                         &item.gap_indices,
@@ -3191,10 +3410,11 @@ impl PropagationEngine<'_> {
                 Some(label.clone()),
             );
 
+            let promise_summary = classify_promise_summary(&matched_values.matcher);
             let mut applied_any = false;
             for flow in &matched_values.aspect.flows {
                 if let Some(transformed) =
-                    match_summary_flow_source(&flow.from, arrival, &item.fields)
+                    match_summary_flow_source(&flow.from, arrival, &item.fields, promise_summary)
                 {
                     applied_any = true;
                     let flow_item = TraceItem {
@@ -3213,6 +3433,7 @@ impl PropagationEngine<'_> {
                         call_v,
                         &flow.to,
                         flow.preserve_object_path,
+                        promise_summary,
                         &item.stack,
                         Some(&sum_ev),
                         &item.gap_indices,
@@ -3532,7 +3753,7 @@ impl PropagationEngine<'_> {
                                     }
                                     elem_fields.field_path.pop();
                                 }
-                                Some(FieldSegment::Prop(_)) => continue,
+                                Some(FieldSegment::Prop(_) | FieldSegment::Promise) => continue,
                                 None => {}
                             }
                             self.bind_into_parameter(
@@ -3885,6 +4106,7 @@ impl PropagationEngine<'_> {
         call_v: &CfgVertex,
         target: &SummaryValueRef,
         preserve_object_path: Option<bool>,
+        promise_summary: Option<PromiseSummaryKind>,
         stack: &[CallFrameData],
         sum_ev: Option<&EvidenceItem>,
         gaps: &BTreeSet<usize>,
@@ -3937,15 +4159,43 @@ impl PropagationEngine<'_> {
             }
             SummaryValueRef::Named(SummaryNamedValueRef::ReturnElement) => {
                 if let Some(out_val) = call_v.value {
-                    if !push_field_segment(
-                        queue,
-                        &mut next_fields,
-                        FieldSegment::Element(None),
-                        call_v
-                            .location
-                            .clone()
-                            .or_else(|| Some(call_ir.scope_location.clone())),
-                    ) {
+                    let loc = call_v
+                        .location
+                        .clone()
+                        .or_else(|| Some(call_ir.scope_location.clone()));
+                    let pushed = match promise_summary {
+                        None => push_field_segment(
+                            queue,
+                            &mut next_fields,
+                            FieldSegment::Element(None),
+                            loc,
+                        ),
+                        Some(PromiseSummaryKind::SingleValue) => {
+                            push_promise_segment(queue, &mut next_fields, loc)
+                        }
+                        Some(PromiseSummaryKind::AllArray) => {
+                            push_field_segment(
+                                queue,
+                                &mut next_fields,
+                                FieldSegment::Element(None),
+                                loc.clone(),
+                            ) && push_promise_segment(queue, &mut next_fields, loc)
+                        }
+                        Some(PromiseSummaryKind::AllSettledArray) => {
+                            push_field_segment(
+                                queue,
+                                &mut next_fields,
+                                FieldSegment::Prop("value".to_string()),
+                                loc.clone(),
+                            ) && push_field_segment(
+                                queue,
+                                &mut next_fields,
+                                FieldSegment::Element(None),
+                                loc.clone(),
+                            ) && push_promise_segment(queue, &mut next_fields, loc)
+                        }
+                    };
+                    if !pushed {
                         return;
                     }
                     Self::enqueue_transition(
@@ -4064,6 +4314,7 @@ impl PropagationEngine<'_> {
                 ) else {
                     return;
                 };
+                let cb_promise_summary = classify_promise_summary(&matched_vals.matcher);
                 let mut cb_stack = stack.to_vec();
                 cb_stack.push(CallFrameData::SummaryCallback {
                     caller_ir: Arc::clone(call_ir),
@@ -4074,6 +4325,7 @@ impl PropagationEngine<'_> {
                     summary_source: matched_vals.source,
                     summary_pack_id: matched_vals.pack_id,
                     values_aspect: matched_vals.aspect,
+                    promise_summary: cb_promise_summary,
                 });
 
                 for cb_syn in cb_syns {
@@ -4166,6 +4418,7 @@ impl PropagationEngine<'_> {
                         matched.pack_id.clone(),
                         Some(label),
                     );
+                    let promise_summary = classify_promise_summary(&matched.matcher);
                     for flow in &matched.aspect.flows {
                         if matches!(
                             flow.from,
@@ -4183,6 +4436,7 @@ impl PropagationEngine<'_> {
                                 v,
                                 &flow.to,
                                 flow.preserve_object_path,
+                                promise_summary,
                                 &[],
                                 Some(&sum_ev),
                                 &item.gap_indices,
@@ -4255,6 +4509,7 @@ impl PropagationEngine<'_> {
                     summary_source,
                     summary_pack_id,
                     values_aspect,
+                    promise_summary,
                     ..
                 } => {
                     let Some(cv) = caller_ir.vertices.get(call_vertex.0 as usize) else {
@@ -4285,6 +4540,7 @@ impl PropagationEngine<'_> {
                                 cv,
                                 &flow.to,
                                 flow.preserve_object_path,
+                                *promise_summary,
                                 rest_stack,
                                 Some(&sum_ev),
                                 &item.gap_indices,
@@ -4340,6 +4596,7 @@ impl PropagationEngine<'_> {
                                 matched.pack_id.clone(),
                                 Some(label),
                             );
+                            let promise_summary = classify_promise_summary(&matched.matcher);
                             for flow in &matched.aspect.flows {
                                 if matches!(
                                     flow.from,
@@ -4353,6 +4610,7 @@ impl PropagationEngine<'_> {
                                         v,
                                         &flow.to,
                                         flow.preserve_object_path,
+                                        promise_summary,
                                         &[],
                                         Some(&sum_ev),
                                         &item.gap_indices,
@@ -4491,6 +4749,7 @@ fn match_summary_flow_source(
     from_ref: &SummaryValueRef,
     arrival: CallArrivalRole,
     fields: &ValueFieldState,
+    promise_summary: Option<PromiseSummaryKind>,
 ) -> Option<ValueFieldState> {
     match (from_ref, arrival) {
         (SummaryValueRef::Named(SummaryNamedValueRef::Receiver), CallArrivalRole::Receiver) => {
@@ -4499,7 +4758,13 @@ fn match_summary_flow_source(
         (
             SummaryValueRef::Named(SummaryNamedValueRef::ReceiverElement),
             CallArrivalRole::Receiver,
-        ) => unwrap_element_field(fields),
+        ) => {
+            if promise_summary.is_some() {
+                Some(unwrap_promise_field(fields))
+            } else {
+                unwrap_element_field(fields)
+            }
+        }
         (
             SummaryValueRef::Tagged(SummaryTaggedValueRef::Arg { index }),
             CallArrivalRole::Arg {
@@ -4513,9 +4778,24 @@ fn match_summary_flow_source(
                 arg_index,
                 is_spread: false,
             },
-        ) if *index == arg_index => unwrap_element_field(fields),
+        ) if *index == arg_index => {
+            let unwrapped = unwrap_element_field(fields)?;
+            if promise_summary.is_some() {
+                Some(unwrap_promise_field(&unwrapped))
+            } else {
+                Some(unwrapped)
+            }
+        }
         _ => None,
     }
+}
+
+fn unwrap_promise_field(fields: &ValueFieldState) -> ValueFieldState {
+    let mut next = fields.clone();
+    if matches!(next.field_path.last(), Some(FieldSegment::Promise)) {
+        next.field_path.pop();
+    }
+    next
 }
 
 fn unwrap_element_field(fields: &ValueFieldState) -> Option<ValueFieldState> {
@@ -4525,9 +4805,35 @@ fn unwrap_element_field(fields: &ValueFieldState) -> Option<ValueFieldState> {
             next.field_path.pop();
             Some(next)
         }
-        Some(FieldSegment::Prop(_)) => None,
+        Some(FieldSegment::Prop(_) | FieldSegment::Promise) => None,
         None => Some(fields.clone()),
     }
+}
+
+fn trace_prop_write_targets(ir: &FunctionIr, object_val: ValueId) -> (bool, Vec<LocalBindingId>) {
+    let mut is_this = false;
+    let mut local_bindings = Vec::new();
+    let mut work = vec![object_val];
+    let mut seen = FxHashSet::default();
+    while let Some(v_id) = work.pop() {
+        if !seen.insert(v_id) {
+            continue;
+        }
+        for vert in &ir.vertices {
+            if vert.value == Some(v_id) {
+                match vert.op {
+                    IrOp::ThisRef => is_this = true,
+                    IrOp::ReadLocal { binding } => local_bindings.push(binding),
+                    IrOp::ValueForward { source, .. } => work.push(source),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(sources) = ir.value_sources.get(&v_id) {
+            work.extend(sources.iter().copied());
+        }
+    }
+    (is_this, local_bindings)
 }
 
 fn resolve_local_binding_of_value(ir: &FunctionIr, val: ValueId) -> Option<LocalBindingId> {

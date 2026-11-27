@@ -14,7 +14,7 @@ pub mod semantic_facade;
 pub mod syntax_view;
 
 pub use boundary::{
-    BoundaryCallProjection, BoundaryChecker, BoundaryDeclarationResolution,
+    BoundaryCallProjection, BoundaryCfgScope, BoundaryChecker, BoundaryDeclarationResolution,
     BoundaryDeclarationTarget, BoundaryImplementationInput, BoundaryImplementationOutcome,
     BoundaryImplementationTarget, BoundaryInstantiatedParameter, BoundaryNode, BoundaryProgram,
     BoundaryProjectFileCatalog, BoundaryProjectId, BoundarySemanticBridge, BoundarySemanticFacade,
@@ -22,7 +22,7 @@ pub use boundary::{
     BoundarySnapshotData, BoundarySourceFile, BoundarySymbol, BoundarySyntaxChildren,
     BoundarySyntaxLookupMatch, BoundarySyntaxMatch, BoundaryType, BoundaryTypeProjection,
     BoundaryTypeProperty, BoundaryTypeSummary, build_boundary_project_file_catalog,
-    lower_scope_to_ir_boundary,
+    lower_cfg_scope_to_ir_boundary, lower_scope_to_ir_boundary,
 };
 pub use hierarchy::ProgramHierarchyIndex;
 pub use impl_resolution::{
@@ -32,9 +32,10 @@ pub use impl_resolution::{
     is_first_party_workspace_path,
 };
 pub use ir_lower::{
-    LoweredScope, is_class_scope_node, lower_class_default_constructor_to_ir,
-    lower_class_static_init_to_ir, lower_class_to_ir, lower_scope_to_ir,
-    lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
+    CfgScopeTarget, LoweredScope, is_class_scope_node, is_statement_level_cfg_scope,
+    lower_class_default_constructor_to_ir, lower_class_static_init_to_ir, lower_class_to_ir,
+    lower_scope_to_ir, lower_scope_to_ir_with_index, normalize_cfg_scope_node,
+    normalize_cfg_scope_target, normalize_function_node, resolve_enclosing_branch_scope,
     resolve_enclosing_cfg_owner, resolve_enclosing_function,
 };
 pub use projects::{

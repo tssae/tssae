@@ -1,0 +1,26 @@
+{
+  "waivers": [
+    {
+      "baselineCommit": "cdfa2ef2aad2675131b7235fada6788a449f80e2",
+      "query": "valuePropagation",
+      "channel": "primary",
+      "file": "src/vs/base/test/browser/ui/tree/compressedObjectTreeModel.test.ts",
+      "target": "valuePropagation@41:10-41:71->21:19-21:75",
+      "fromStatus": "disproved",
+      "toStatus": "inconclusive",
+      "reason": "Fixed generator IrOp::Yield value-propagation modeling, replacing a false disproved through Iterable.map/concat generators with honest inconclusive.",
+      "regressionTest": "packages/tssae/test/value-propagation-ir.test.ts"
+    },
+    {
+      "baselineCommit": "cdfa2ef2aad2675131b7235fada6788a449f80e2",
+      "query": "valuePropagation",
+      "channel": "primary",
+      "file": "src/vs/base/node/shell.ts",
+      "target": "valuePropagation@64:5-64:58->19:11-19:34",
+      "fromStatus": "proved",
+      "toStatus": "disproved",
+      "reason": "Fixed async non-generator ReturnValue Promise wrapping, replacing a false proved from null initializer to unawaited getSystemShellWindows() Promise return with accurate disproved.",
+      "regressionTest": "packages/tssae/test/value-propagation-ir.test.ts"
+    }
+  ]
+}

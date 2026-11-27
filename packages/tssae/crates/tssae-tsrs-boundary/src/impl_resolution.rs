@@ -691,7 +691,8 @@ fn find_provenance_for_expr(
                 export_name: prop_name,
             });
         }
-        if let Some(recv_sym) = checker.get_symbol_at_location_exported(pa.expression())
+        if let Some(recv_sym) =
+            crate::semantic_facade::get_symbol_at_location_safe(checker, pa.expression())
             && let Some(prov) =
                 trace_symbol_package_provenance(checker, recv_sym, prop_name, deepest_only)
         {
@@ -699,7 +700,7 @@ fn find_provenance_for_expr(
         }
     }
 
-    if let Some(raw_sym) = checker.get_symbol_at_location_exported(unwrapped)
+    if let Some(raw_sym) = crate::semantic_facade::get_symbol_at_location_safe(checker, unwrapped)
         && let Some(prov) = trace_symbol_package_provenance(checker, raw_sym, None, deepest_only)
     {
         return Some(prov);
@@ -1241,8 +1242,7 @@ fn resolve_object_literal_member_impl(
     let pa = access.as_property_access_expression();
     let prop_name = prop_key_text(pa.name()).or_else(|| node_text(pa.name()))?;
     let recv = unwrap_expr_wrappers(pa.expression());
-    let recv_sym = checker
-        .get_symbol_at_location_exported(recv)
+    let recv_sym = crate::semantic_facade::get_symbol_at_location_safe(checker, recv)
         .map(|s| unwrap_aliased_symbol(checker, s))
         .filter(|&s| s != checker.get_unknown_symbol())?;
 

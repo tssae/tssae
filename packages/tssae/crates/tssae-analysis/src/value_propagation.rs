@@ -752,7 +752,11 @@ pub fn trace_value_propagation<S: BuildHasher>(
         }
     }
 
-    let built_graph = runner.built_call_graph;
+    let built_graph = if runner.allowed_reverse_files.is_none() {
+        runner.built_call_graph
+    } else {
+        None
+    };
     let outcome = ValuePropagationOutcome {
         results,
         conflict: runner.conflict,
@@ -839,8 +843,20 @@ impl PropagationEngine<'_> {
             return g;
         }
         if self.built_call_graph.is_none() {
+            let scoped_files: Vec<FileId>;
+            let files: &[FileId] = if let Some(allowed) = &self.allowed_reverse_files {
+                scoped_files = self
+                    .project_files
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f))
+                    .collect();
+                &scoped_files
+            } else {
+                self.project_files
+            };
             let g = build_ir_call_graph_with_summaries(
-                self.project_files,
+                files,
                 self.semantic,
                 self.syntax,
                 self.ir_provider,
@@ -2599,7 +2615,23 @@ impl PropagationEngine<'_> {
     ) {
         let is_module = decl_ir.scope_kind == IrScopeKind::ModuleTopLevel;
         let files_to_scan: Vec<FileId> = if is_module {
-            self.project_files.to_vec()
+            self.allowed_reverse_files.as_ref().map_or_else(
+                || self.project_files.to_vec(),
+                |allowed| {
+                    self.project_files
+                        .iter()
+                        .copied()
+                        .filter(|f| {
+                            allowed.contains(f)
+                                || *f == decl_ir.id.file
+                                || self.targets.iter().any(|t| {
+                                    t.syntax.file_id() == *f
+                                        || t.scope_id.is_some_and(|sid| sid.file == *f)
+                                })
+                        })
+                        .collect()
+                },
+            )
         } else {
             vec![decl_ir.id.file]
         };

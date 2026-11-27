@@ -903,7 +903,7 @@ pub struct SemanticModelBridge<'a> {
     file_ids: Option<Arc<RwLock<FileIdRegistry>>>,
     file_indices: Option<RefCell<&'a mut FxHashMap<FileId, Arc<FileSyntaxIndex>>>>,
     sourcemap_cache: Option<&'a SourceMapCache>,
-    hierarchy_index: OnceCell<ProgramHierarchyIndex>,
+    hierarchy_index: OnceCell<Arc<ProgramHierarchyIndex>>,
     shared_symbols: Option<RefCell<&'a mut SymbolRegistry>>,
     local_symbols: RefCell<SymbolRegistry>,
     types: RefCell<InternedTypeMap>,
@@ -985,6 +985,15 @@ impl<'a> SemanticModelBridge<'a> {
     #[must_use]
     pub const fn cwd(&self) -> &'a str {
         self.cwd
+    }
+
+    pub fn set_cached_hierarchy(&self, index: Arc<ProgramHierarchyIndex>) {
+        let _ = self.hierarchy_index.set(index);
+    }
+
+    #[must_use]
+    pub fn cached_hierarchy(&self) -> Option<Arc<ProgramHierarchyIndex>> {
+        self.hierarchy_index.get().cloned()
     }
 
     pub fn ensure_source_file_index(
@@ -1114,15 +1123,17 @@ impl<'a> SemanticModelBridge<'a> {
     }
 
     fn hierarchy_index(&self) -> &ProgramHierarchyIndex {
-        self.hierarchy_index.get_or_init(|| {
-            let mut checker = self.checker.borrow_mut();
-            ProgramHierarchyIndex::build(
-                self.cwd,
-                self.program,
-                self.workspace_programs,
-                &mut checker,
-            )
-        })
+        self.hierarchy_index
+            .get_or_init(|| {
+                let mut checker = self.checker.borrow_mut();
+                Arc::new(ProgramHierarchyIndex::build(
+                    self.cwd,
+                    self.program,
+                    self.workspace_programs,
+                    &mut checker,
+                ))
+            })
+            .as_ref()
     }
 
     fn summarize_decl(

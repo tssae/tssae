@@ -16,8 +16,9 @@ use crate::{
     branch_coverage::{ControlFlowPathStep, StackArena, StackId},
     call_resolution::{IrCallGraph, resolve_call_targets_with_summaries},
     instance_identity::{
-        HostOrigin, InstanceOriginKind, IrCallFrame, IrInstanceResolver, ReceiverBinding,
-        ResolvedInstanceOrigin, find_call_vertex_by_syntax, find_value_producer_vertex,
+        HostOrigin, InstanceOriginKind, IrCallFrame, IrFieldWriteIndex, IrInstanceResolver,
+        ReceiverBinding, ResolvedInstanceOrigin, find_call_vertex_by_syntax,
+        find_value_producer_vertex,
     },
     ir::{
         CfgVertex, ExplicitEdgeKind, FunctionIr, IrCallArg, IrCallKind, IrOp, IrProvider,
@@ -240,7 +241,7 @@ struct CfgExploreNode {
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Receives scopes, target instances, file allowlist, IR environment, summary index, and call graph cache."
+    reason = "Receives scopes, target instances, file allowlist, IR environment, summary index, and call graph/field write caches."
 )]
 pub fn evaluate_instance_cleanup_on_ir<S: BuildHasher>(
     scopes: &[CleanupScopeSpec],
@@ -252,20 +253,37 @@ pub fn evaluate_instance_cleanup_on_ir<S: BuildHasher>(
     ir_provider: &dyn IrProvider,
     summary_index: &BehaviorSummaryIndex,
     cached_call_graph: Option<&IrCallGraph>,
-) -> (InstanceCleanupBatchOutcome, Option<IrCallGraph>) {
+    cached_field_index: Option<&IrFieldWriteIndex>,
+) -> (
+    InstanceCleanupBatchOutcome,
+    Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
+) {
     let owned_allowed: Option<FxHashSet<FileId>> =
         allowed_files.map(|set| set.iter().copied().collect());
+    let extra_field_files: FxHashSet<FileId> = scopes
+        .iter()
+        .map(|s| s.syntax.file_id())
+        .chain(
+            targets
+                .iter()
+                .filter_map(|t| t.origin_syntax.map(SyntaxId::file_id)),
+        )
+        .collect();
     let mut owned_graph: Option<IrCallGraph> = None;
     let mut engine = CleanupAnalyzer {
         targets,
         project_files,
         allowed_files: owned_allowed.as_ref(),
+        extra_field_files,
         semantic,
         syntax,
         ir_provider,
         summary_index,
         cached_call_graph,
         owned_graph: &mut owned_graph,
+        cached_field_index,
+        owned_field_index: None,
         cleanup_index: None,
         vertex_effect_cache: FxHashMap::default(),
         conflict: None,
@@ -280,11 +298,24 @@ pub fn evaluate_instance_cleanup_on_ir<S: BuildHasher>(
     }
 
     let conflict = engine.conflict.take();
+    let owned_field_index = engine.owned_field_index.take();
     drop(engine);
+
+    let ret_graph = if allowed_files.is_none() {
+        owned_graph
+    } else {
+        None
+    };
+    let ret_field_index = if allowed_files.is_none() {
+        owned_field_index
+    } else {
+        None
+    };
 
     (
         InstanceCleanupBatchOutcome { results, conflict },
-        owned_graph,
+        ret_graph,
+        ret_field_index,
     )
 }
 
@@ -294,12 +325,15 @@ struct CleanupAnalyzer<'a> {
     targets: &'a [CleanupTargetSpec],
     project_files: &'a [FileId],
     allowed_files: Option<&'a FxHashSet<FileId>>,
+    extra_field_files: FxHashSet<FileId>,
     semantic: &'a dyn SemanticModel,
     syntax: &'a dyn SyntaxCatalog,
     ir_provider: &'a dyn IrProvider,
     summary_index: &'a BehaviorSummaryIndex,
     cached_call_graph: Option<&'a IrCallGraph>,
     owned_graph: &'a mut Option<IrCallGraph>,
+    cached_field_index: Option<&'a IrFieldWriteIndex>,
+    owned_field_index: Option<IrFieldWriteIndex>,
     cleanup_index: Option<IrCleanupProjectIndex>,
     vertex_effect_cache: FxHashMap<VertexCacheKey, VertexCleanupEffect>,
     conflict: Option<SummaryConflictError>,
@@ -2290,15 +2324,20 @@ impl CleanupAnalyzer<'_> {
         hint: Option<VertexId>,
         call_stack: &[IrCallFrame],
     ) -> Vec<HostOrigin> {
+        let mut extra_files = self.extra_field_files.clone();
+        extra_files.insert(ir.id.file);
         let mut resolver = IrInstanceResolver::new(
             self.project_files,
             self.allowed_files,
+            extra_files,
             self.semantic,
             self.syntax,
             self.ir_provider,
             self.summary_index,
             self.cached_call_graph,
             self.owned_graph,
+            self.cached_field_index,
+            &mut self.owned_field_index,
         );
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);
@@ -2315,15 +2354,20 @@ impl CleanupAnalyzer<'_> {
         hint: Option<VertexId>,
         call_stack: &[IrCallFrame],
     ) -> (Vec<ResolvedEntryFn>, Vec<GapItem>) {
+        let mut extra_files = self.extra_field_files.clone();
+        extra_files.insert(ir.id.file);
         let mut resolver = IrInstanceResolver::new(
             self.project_files,
             self.allowed_files,
+            extra_files,
             self.semantic,
             self.syntax,
             self.ir_provider,
             self.summary_index,
             self.cached_call_graph,
             self.owned_graph,
+            self.cached_field_index,
+            &mut self.owned_field_index,
         );
         let mut active = Vec::new();
         let res = resolver.trace_value(ir, val, hint, call_stack, 0, &mut active);
@@ -3347,22 +3391,24 @@ mod tests {
             evidence: Vec::new(),
         };
 
-        let (batch, _) = evaluate_instance_cleanup_on_ir::<std::collections::hash_map::RandomState>(
-            &[
-                CleanupScopeSpec {
-                    syntax: fn_unguarded,
-                },
-                CleanupScopeSpec { syntax: fn_finally },
-            ],
-            &[target],
-            &[FileId(0)],
-            None,
-            &env,
-            &env,
-            &env,
-            &summaries,
-            None,
-        );
+        let (batch, _, _) =
+            evaluate_instance_cleanup_on_ir::<std::collections::hash_map::RandomState>(
+                &[
+                    CleanupScopeSpec {
+                        syntax: fn_unguarded,
+                    },
+                    CleanupScopeSpec { syntax: fn_finally },
+                ],
+                &[target],
+                &[FileId(0)],
+                None,
+                &env,
+                &env,
+                &env,
+                &summaries,
+                None,
+                None,
+            );
         assert!(batch.conflict.is_none());
 
         // 1. acquire -> write -> release: primary Proved, implicit Disproved with write_syn location.

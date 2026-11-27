@@ -11,6 +11,7 @@ pub mod ir_lower;
 pub mod semantic_facade;
 pub mod syntax_view;
 
+pub use hierarchy::ProgramHierarchyIndex;
 pub use impl_resolution::{
     DeclarationProvenance, FacadeImplementationInput, FacadeImplementationOutcome,
     FacadeImplementationTarget, FirstPartyResolutionSource, ResolvedPackageInfo, SourceMapCache,

@@ -346,6 +346,11 @@ pub struct SnapshotState {
     pub file_syntax_indices: FxHashMap<FileId, Arc<FileSyntaxIndex>>,
     pub symbol_registry: tssae_tsrs_boundary::SymbolRegistry,
     pub ir_call_graph_cache: FxHashMap<String, Arc<tssae_analysis::call_resolution::IrCallGraph>>,
+    pub ir_field_write_cache:
+        FxHashMap<String, Arc<tssae_analysis::instance_identity::IrFieldWriteIndex>>,
+    pub hierarchy_cache: FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
+    pub project_file_catalog_cache:
+        FxHashMap<String, Arc<crate::ir_calls::SnapshotProjectFileCatalog>>,
     pub sourcemap_cache: SourceMapCache,
     pub resolved_package_versions: FxHashMap<String, Option<String>>,
     pub summary_config: SummaryConfigPayload,
@@ -847,6 +852,9 @@ impl EngineServer {
                 file_syntax_indices: FxHashMap::default(),
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
+                ir_field_write_cache: FxHashMap::default(),
+                hierarchy_cache: FxHashMap::default(),
+                project_file_catalog_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
                 resolved_package_versions,
                 summary_config,
@@ -882,6 +890,9 @@ impl EngineServer {
         snapshot.summary_config = params.summaries;
         snapshot.summary_index = index;
         snapshot.ir_call_graph_cache.clear();
+        snapshot.ir_field_write_cache.clear();
+        snapshot.hierarchy_cache.clear();
+        snapshot.project_file_catalog_cache.clear();
         Ok(SnapshotSetSummariesResult { updated: true })
     }
 
@@ -988,6 +999,9 @@ impl EngineServer {
                 file_syntax_indices: FxHashMap::default(),
                 symbol_registry: tssae_tsrs_boundary::SymbolRegistry::new(),
                 ir_call_graph_cache: FxHashMap::default(),
+                ir_field_write_cache: FxHashMap::default(),
+                hierarchy_cache: FxHashMap::default(),
+                project_file_catalog_cache: FxHashMap::default(),
                 sourcemap_cache: SourceMapCache::default(),
                 resolved_package_versions,
                 summary_config: old_summary_config,

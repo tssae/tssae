@@ -261,7 +261,13 @@ pub fn run_value_propagation(
     });
 
     let (outcome, newly_built_graph): (ValuePropagationOutcome, Option<IrCallGraph>) = {
-        let env = SnapshotIrEnv::from_snapshot(snapshot, program, &workspace_programs, checker);
+        let env = SnapshotIrEnv::from_snapshot(
+            snapshot,
+            project_id,
+            program,
+            &workspace_programs,
+            checker,
+        );
         let from_specs = intern_endpoints(&env, &from_inputs);
         let to_specs = intern_endpoints(&env, &to_inputs);
 
@@ -279,7 +285,7 @@ pub fn run_value_propagation(
             &from_specs,
             &to_specs,
             include_member_access,
-            &env.project_files,
+            env.project_files(),
             allowed_files.as_ref(),
             &env,
             &env,

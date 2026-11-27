@@ -11,8 +11,8 @@ use crate::{
     branch_coverage::{StackArena, StackId},
     call_resolution::{IrCallGraph, resolve_call_targets_with_summaries},
     instance_identity::{
-        IrCallFrame, IrInstanceResolver, ReceiverBinding, VisitKey, find_call_vertex_by_syntax,
-        find_value_producer_vertex, static_prop_key,
+        IrCallFrame, IrFieldWriteIndex, IrInstanceResolver, ReceiverBinding, VisitKey,
+        find_call_vertex_by_syntax, find_value_producer_vertex, static_prop_key,
     },
     ir::{
         AssignOp, CfgVertex, ExplicitEdgeKind, FunctionIr, IrBranchDirection, IrBranchKind,
@@ -179,6 +179,7 @@ pub fn analyze_call_effects_on_ir(
     cached_call_graph: Option<&IrCallGraph>,
 ) -> CallEffectsBatchOutcome {
     let mut owned_graph = None;
+    let mut owned_field_index = None;
     let mut analyzer = CallEffectsAnalyzer {
         options,
         project_files,
@@ -188,6 +189,7 @@ pub fn analyze_call_effects_on_ir(
         summary_index,
         cached_call_graph,
         owned_graph: &mut owned_graph,
+        owned_field_index: &mut owned_field_index,
         conflict: None,
     };
 
@@ -214,6 +216,7 @@ struct CallEffectsAnalyzer<'a> {
     summary_index: &'a BehaviorSummaryIndex,
     cached_call_graph: Option<&'a IrCallGraph>,
     owned_graph: &'a mut Option<IrCallGraph>,
+    owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     conflict: Option<SummaryConflictError>,
 }
 
@@ -1044,12 +1047,15 @@ impl CallEffectsAnalyzer<'_> {
         let mut resolver = IrInstanceResolver::new(
             self.project_files,
             None,
+            FxHashSet::default(),
             self.semantic,
             self.syntax,
             self.ir_provider,
             self.summary_index,
             self.cached_call_graph,
             self.owned_graph,
+            None,
+            self.owned_field_index,
         );
         let mut active: Vec<VisitKey> = Vec::new();
         let trace = resolver.trace_value(scope_ir, val, vertex_hint, &ir_stack, 0, &mut active);

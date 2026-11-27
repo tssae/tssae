@@ -107,62 +107,107 @@ pub enum CallTargetsRow {
     },
 }
 
+pub struct SnapshotProjectFileCatalog {
+    pub sf_by_file_id: FxHashMap<FileId, P<SourceFile>>,
+    pub rel_paths_by_file_id: FxHashMap<FileId, String>,
+    pub project_files: Vec<FileId>,
+}
+
+fn build_project_file_catalog(
+    cwd: &str,
+    program: &'static Program,
+    workspace_programs: &[&'static Program],
+    file_ids: &Arc<std::sync::RwLock<tssae_tsrs_boundary::FileIdRegistry>>,
+) -> SnapshotProjectFileCatalog {
+    let mut sf_by_file_id = FxHashMap::default();
+    let mut rel_paths_by_file_id = FxHashMap::default();
+    let mut project_files = Vec::new();
+    let mut seen_rel = FxHashSet::default();
+
+    let mut register_sf = |sf: P<SourceFile>, is_proj: bool| {
+        let rel = normalize_path(&relative_to_cwd(cwd, sf.file_name()));
+        let Ok(mut reg) = file_ids.write() else {
+            return;
+        };
+        let fid = reg.intern(&rel);
+        drop(reg);
+        sf_by_file_id.entry(fid).or_insert(sf);
+        rel_paths_by_file_id
+            .entry(fid)
+            .or_insert_with(|| rel.clone());
+        if is_proj && seen_rel.insert(rel) {
+            project_files.push(fid);
+        }
+    };
+
+    for &sf in program.get_source_files() {
+        if !program.is_source_file_default_library(sf.path()) {
+            register_sf(sf, is_project_source_file(program, sf));
+        }
+    }
+    for &wp in workspace_programs {
+        for &sf in wp.get_source_files() {
+            if !wp.is_source_file_default_library(sf.path()) {
+                register_sf(sf, false);
+            }
+        }
+    }
+    project_files.sort_by(|a, b| {
+        rel_paths_by_file_id
+            .get(a)
+            .cmp(&rel_paths_by_file_id.get(b))
+    });
+
+    SnapshotProjectFileCatalog {
+        sf_by_file_id,
+        rel_paths_by_file_id,
+        project_files,
+    }
+}
+
 pub struct SnapshotIrEnv<'a> {
     pub semantic: SemanticModelBridge<'a>,
     ir_cache: &'a tssae_analysis::ir::SnapshotIrCache,
-    sf_by_file_id: FxHashMap<FileId, P<SourceFile>>,
-    rel_paths_by_file_id: FxHashMap<FileId, String>,
-    pub project_files: Vec<FileId>,
+    catalog: Arc<SnapshotProjectFileCatalog>,
+    project_id: String,
+    hierarchy_cache: &'a mut FxHashMap<String, Arc<tssae_tsrs_boundary::ProgramHierarchyIndex>>,
     pub summary_stats: Cell<SummaryLookupStats>,
+}
+
+impl Drop for SnapshotIrEnv<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.semantic.cached_hierarchy() {
+            self.hierarchy_cache
+                .entry(self.project_id.clone())
+                .or_insert(h);
+        }
+    }
 }
 
 impl<'a> SnapshotIrEnv<'a> {
     pub fn from_snapshot(
         snapshot: &'a mut SnapshotState,
+        project_id: &str,
         program: &'static Program,
         workspace_programs: &'a [&'static Program],
         checker: &'a mut CheckerHandle,
     ) -> Self {
-        let mut sf_by_file_id = FxHashMap::default();
-        let mut rel_paths_by_file_id = FxHashMap::default();
-        let mut project_files = Vec::new();
-        let mut seen_rel = FxHashSet::default();
-        let cwd = &snapshot.cwd;
         let file_ids = Arc::clone(&snapshot.file_ids);
-
-        let mut register_sf = |sf: P<SourceFile>, is_proj: bool| {
-            let rel = normalize_path(&relative_to_cwd(cwd, sf.file_name()));
-            let Ok(mut reg) = file_ids.write() else {
-                return;
-            };
-            let fid = reg.intern(&rel);
-            drop(reg);
-            sf_by_file_id.entry(fid).or_insert(sf);
-            rel_paths_by_file_id
-                .entry(fid)
-                .or_insert_with(|| rel.clone());
-            if is_proj && seen_rel.insert(rel) {
-                project_files.push(fid);
-            }
+        let catalog = if let Some(cached) = snapshot.project_file_catalog_cache.get(project_id) {
+            Arc::clone(cached)
+        } else {
+            let built = Arc::new(build_project_file_catalog(
+                &snapshot.cwd,
+                program,
+                workspace_programs,
+                &file_ids,
+            ));
+            snapshot
+                .project_file_catalog_cache
+                .insert(project_id.to_string(), Arc::clone(&built));
+            built
         };
-
-        for &sf in program.get_source_files() {
-            if !program.is_source_file_default_library(sf.path()) {
-                register_sf(sf, is_project_source_file(program, sf));
-            }
-        }
-        for &wp in workspace_programs {
-            for &sf in wp.get_source_files() {
-                if !wp.is_source_file_default_library(sf.path()) {
-                    register_sf(sf, false);
-                }
-            }
-        }
-        project_files.sort_by(|a, b| {
-            rel_paths_by_file_id
-                .get(a)
-                .cmp(&rel_paths_by_file_id.get(b))
-        });
+        let cached_hierarchy = snapshot.hierarchy_cache.get(project_id).cloned();
 
         let semantic = SemanticModelBridge::with_snapshot_store(
             &snapshot.cwd,
@@ -174,24 +219,33 @@ impl<'a> SnapshotIrEnv<'a> {
             &mut snapshot.symbol_registry,
             &snapshot.sourcemap_cache,
         );
+        if let Some(h) = cached_hierarchy {
+            semantic.set_cached_hierarchy(h);
+        }
 
         Self {
             semantic,
             ir_cache: &snapshot.ir_cache,
-            sf_by_file_id,
-            rel_paths_by_file_id,
-            project_files,
+            catalog,
+            project_id: project_id.to_string(),
+            hierarchy_cache: &mut snapshot.hierarchy_cache,
             summary_stats: Cell::new(SummaryLookupStats::default()),
         }
+    }
+
+    #[must_use]
+    pub fn project_files(&self) -> &[FileId] {
+        &self.catalog.project_files
     }
 
     fn ensure_file_ir_entry(&self, file: FileId) -> Option<Arc<tssae_analysis::ir::FileIrEntry>> {
         if let Some(existing) = self.ir_cache.get_file(file) {
             return Some(existing);
         }
-        let &sf = self.sf_by_file_id.get(&file)?;
+        let &sf = self.catalog.sf_by_file_id.get(&file)?;
         let (fid, file_index) = self.semantic.ensure_source_file_index(sf)?;
         let rel_file = self
+            .catalog
             .rel_paths_by_file_id
             .get(&fid)
             .cloned()
@@ -222,7 +276,10 @@ impl SyntaxCatalog for SnapshotIrEnv<'_> {
     }
 
     fn file_path(&self, file: FileId) -> Option<&str> {
-        self.rel_paths_by_file_id.get(&file).map(String::as_str)
+        self.catalog
+            .rel_paths_by_file_id
+            .get(&file)
+            .map(String::as_str)
     }
 }
 
@@ -576,6 +633,7 @@ pub fn run_callees_of(
     let summary_index = Arc::clone(&snapshot.summary_index);
     let materialized_rows = collect_materialized_callees(
         snapshot,
+        project_id,
         program,
         &workspace_programs,
         checker,
@@ -643,8 +701,13 @@ pub fn run_callees_of(
     Ok(rows)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Coordinates snapshot IR env setup, summary lookup metrics, and callee materialization."
+)]
 fn collect_materialized_callees(
     snapshot: &mut SnapshotState,
+    project_id: &str,
     program: &'static Program,
     workspace_programs: &[&'static Program],
     checker: &mut CheckerHandle,
@@ -652,7 +715,8 @@ fn collect_materialized_callees(
     call_nodes: Vec<(String, P<Node>)>,
     observer: &mut ObserveCollector,
 ) -> Result<Vec<MaterializedCalleesRow>, RpcErr> {
-    let env = SnapshotIrEnv::from_snapshot(snapshot, program, workspace_programs, checker);
+    let env =
+        SnapshotIrEnv::from_snapshot(snapshot, project_id, program, workspace_programs, checker);
     let mut out = Vec::with_capacity(call_nodes.len());
     for (call_id, call_node) in call_nodes {
         let outcome: CallTargetsOutcome = env.semantic.intern_syntax(call_node).map_or_else(
@@ -750,6 +814,7 @@ pub fn run_callers_of(
 
     let (materialized_rows, newly_built_graph) = collect_materialized_callers(
         snapshot,
+        project_id,
         program,
         &workspace_programs,
         checker,
@@ -818,6 +883,7 @@ pub fn run_callers_of(
 )]
 fn collect_materialized_callers(
     snapshot: &mut SnapshotState,
+    project_id: &str,
     program: &'static Program,
     workspace_programs: &[&'static Program],
     checker: &mut CheckerHandle,
@@ -827,17 +893,38 @@ fn collect_materialized_callers(
     allowed_files: Option<&FxHashSet<FileId>>,
     observer: &mut ObserveCollector,
 ) -> Result<(Vec<MaterializedCallersRow>, Option<Arc<IrCallGraph>>), RpcErr> {
-    let env = SnapshotIrEnv::from_snapshot(snapshot, program, workspace_programs, checker);
+    let env =
+        SnapshotIrEnv::from_snapshot(snapshot, project_id, program, workspace_programs, checker);
     let (graph_arc, built_now) = cached_graph.map_or_else(
         || {
-            let g = Arc::new(build_ir_call_graph_with_summaries(
-                &env.project_files,
-                &env,
-                &env,
-                &env,
-                summary_index,
-            ));
-            (Arc::clone(&g), Some(g))
+            allowed_files.map_or_else(
+                || {
+                    let g = Arc::new(build_ir_call_graph_with_summaries(
+                        env.project_files(),
+                        &env,
+                        &env,
+                        &env,
+                        summary_index,
+                    ));
+                    (Arc::clone(&g), Some(g))
+                },
+                |allowed| {
+                    let scoped_files: Vec<FileId> = env
+                        .project_files()
+                        .iter()
+                        .copied()
+                        .filter(|f| allowed.contains(f))
+                        .collect();
+                    let g = Arc::new(build_ir_call_graph_with_summaries(
+                        &scoped_files,
+                        &env,
+                        &env,
+                        &env,
+                        summary_index,
+                    ));
+                    (g, None)
+                },
+            )
         },
         |existing| (existing, None),
     );

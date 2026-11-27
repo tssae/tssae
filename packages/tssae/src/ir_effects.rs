@@ -17,7 +17,7 @@ use tssae_analysis::{
         CleanupScopeSpec, CleanupSiteData, CleanupTargetSpec, ImplicitExceptionCleanupOutcome,
         InstanceCleanupBatchOutcome, TargetCleanupStatusData, evaluate_instance_cleanup_on_ir,
     },
-    instance_identity::{InstanceOriginKind, ResolvedInstanceOrigin},
+    instance_identity::{InstanceOriginKind, IrFieldWriteIndex, ResolvedInstanceOrigin},
 };
 use tssae_common::{
     EvidenceItem, FileId, GapItem, LocalSyntaxId, SemanticModel, SummarySource, SyntaxId,
@@ -652,7 +652,13 @@ pub fn run_call_effects(
         Vec<(P<Node>, MaterializedCallEffects)>,
         Option<tssae_common::SummaryConflictError>,
     ) = {
-        let env = SnapshotIrEnv::from_snapshot(snapshot, program, &workspace_programs, checker);
+        let env = SnapshotIrEnv::from_snapshot(
+            snapshot,
+            project_id,
+            program,
+            &workspace_programs,
+            checker,
+        );
         if let Some(g) = cached_graph.as_deref()
             && let Some(conflict) = &g.conflict
         {
@@ -694,7 +700,7 @@ pub fn run_call_effects(
         let batch: CallEffectsBatchOutcome = analyze_call_effects_on_ir(
             &specs,
             opts,
-            &env.project_files,
+            env.project_files(),
             &env,
             &env,
             &env,
@@ -868,6 +874,7 @@ pub fn run_call_effects(
 type CleanupBatchMaterialized = (
     Vec<(P<Node>, MaterializedScopeCleanup)>,
     Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
     Option<tssae_common::SummaryConflictError>,
 );
 
@@ -904,6 +911,7 @@ pub fn run_instance_cleanup(
 
     let workspace_programs = snapshot.workspace_programs();
     let cached_graph = snapshot.ir_call_graph_cache.get(project_id).cloned();
+    let cached_field_index = snapshot.ir_field_write_cache.get(project_id).cloned();
     let summary_index = Arc::clone(&snapshot.summary_index);
     let file_ids = Arc::clone(&snapshot.file_ids);
     let allowed_files: Option<FxHashSet<FileId>> = lookup_files.map(|files| {
@@ -916,189 +924,209 @@ pub fn run_instance_cleanup(
         set
     });
 
-    let (materialized, newly_built_graph, conflict_opt): CleanupBatchMaterialized = {
-        let env = SnapshotIrEnv::from_snapshot(snapshot, program, &workspace_programs, checker);
-        if let Some(g) = cached_graph.as_deref()
-            && let Some(conflict) = &g.conflict
+    let (materialized, newly_built_graph, newly_built_field_index, conflict_opt): CleanupBatchMaterialized =
         {
-            let stats = env.summary_stats.get();
-            observer.record_summary_lookup_stats(&stats);
-            let err = conflict_rpc_err(conflict);
-            drop(env);
-            return Err(err);
-        }
+            let env = SnapshotIrEnv::from_snapshot(
+                snapshot,
+                project_id,
+                program,
+                &workspace_programs,
+                checker,
+            );
+            if let Some(g) = cached_graph.as_deref()
+                && let Some(conflict) = &g.conflict
+            {
+                let stats = env.summary_stats.get();
+                observer.record_summary_lookup_stats(&stats);
+                let err = conflict_rpc_err(conflict);
+                drop(env);
+                return Err(err);
+            }
 
-        let scope_specs: Vec<CleanupScopeSpec> = scope_inputs
-            .iter()
-            .map(|(_, node)| CleanupScopeSpec {
-                syntax: env.semantic.intern_syntax(*node).unwrap_or_else(|| {
-                    SyntaxId::from_parts(FileId(u32::MAX), LocalSyntaxId(u32::MAX))
-                }),
-            })
-            .collect();
+            let scope_specs: Vec<CleanupScopeSpec> = scope_inputs
+                .iter()
+                .map(|(_, node)| CleanupScopeSpec {
+                    syntax: env.semantic.intern_syntax(*node).unwrap_or_else(|| {
+                        SyntaxId::from_parts(FileId(u32::MAX), LocalSyntaxId(u32::MAX))
+                    }),
+                })
+                .collect();
 
-        let target_specs: Vec<CleanupTargetSpec> = target_inputs
-            .iter()
-            .map(|(_, data)| CleanupTargetSpec {
-                instance_key: data.instance_key.clone(),
-                origin_kind: match data.origin_kind {
-                    "summary-allocation" => InstanceOriginKind::SummaryAllocation,
-                    "parameter" => InstanceOriginKind::Parameter,
-                    _ => InstanceOriginKind::Allocation,
-                },
-                allocation_location: data.allocation_location.clone(),
-                origin_syntax: data
-                    .origin_syntax
-                    .and_then(|n| env.semantic.intern_syntax(n)),
-                summary_id: data.summary_id.clone(),
-                summary_source: data.summary_source,
-                evidence: data.evidence.clone(),
-            })
-            .collect();
+            let target_specs: Vec<CleanupTargetSpec> = target_inputs
+                .iter()
+                .map(|(_, data)| CleanupTargetSpec {
+                    instance_key: data.instance_key.clone(),
+                    origin_kind: match data.origin_kind {
+                        "summary-allocation" => InstanceOriginKind::SummaryAllocation,
+                        "parameter" => InstanceOriginKind::Parameter,
+                        _ => InstanceOriginKind::Allocation,
+                    },
+                    allocation_location: data.allocation_location.clone(),
+                    origin_syntax: data
+                        .origin_syntax
+                        .and_then(|n| env.semantic.intern_syntax(n)),
+                    summary_id: data.summary_id.clone(),
+                    summary_source: data.summary_source,
+                    evidence: data.evidence.clone(),
+                })
+                .collect();
 
-        let (batch, built_graph): (InstanceCleanupBatchOutcome, Option<IrCallGraph>) =
-            evaluate_instance_cleanup_on_ir(
+            let (batch, built_graph, built_field_index): (
+                InstanceCleanupBatchOutcome,
+                Option<IrCallGraph>,
+                Option<IrFieldWriteIndex>,
+            ) = evaluate_instance_cleanup_on_ir(
                 &scope_specs,
                 &target_specs,
-                &env.project_files,
+                env.project_files(),
                 allowed_files.as_ref(),
                 &env,
                 &env,
                 &env,
                 &summary_index,
                 cached_graph.as_deref(),
+                cached_field_index.as_deref(),
             );
-        let stats = env.summary_stats.get();
-        observer.record_summary_lookup_stats(&stats);
+            let stats = env.summary_stats.get();
+            observer.record_summary_lookup_stats(&stats);
 
-        let mat_scopes = scope_inputs
-            .into_iter()
-            .zip(batch.results)
-            .map(|((scope_handle, scope_node), scope_res)| {
-                let target_results = target_inputs
-                    .iter()
-                    .zip(scope_res.target_results)
-                    .map(|((target_handle, _), tr)| {
-                        let verdict_status = match tr.status {
-                            TargetCleanupStatusData::Proved {
-                                cleanup_sites,
-                                evidence,
-                            } => MaterializedTargetStatus::Proved {
-                                cleanup_sites: cleanup_sites
-                                    .into_iter()
-                                    .map(|s| materialize_cleanup_site(&env, s))
-                                    .collect(),
-                                evidence,
-                            },
-                            TargetCleanupStatusData::Disproved {
-                                cleaned_on_any_path,
-                                cleanup_sites,
-                                uncleaned_path,
-                                evidence,
-                            } => MaterializedTargetStatus::Disproved {
-                                cleaned_on_any_path,
-                                cleanup_sites: cleanup_sites
-                                    .into_iter()
-                                    .map(|s| materialize_cleanup_site(&env, s))
-                                    .collect(),
-                                uncleaned_path,
-                                evidence,
-                            },
-                            TargetCleanupStatusData::Inconclusive {
-                                cleanup_sites,
-                                gaps,
-                                evidence,
-                            } => MaterializedTargetStatus::Inconclusive {
-                                cleanup_sites: cleanup_sites
-                                    .into_iter()
-                                    .map(|s| materialize_cleanup_site(&env, s))
-                                    .collect(),
-                                gaps,
-                                evidence,
-                            },
-                        };
-                        let implicit_exceptions = match tr.implicit_exceptions {
-                            ImplicitExceptionCleanupOutcome::Proved {
-                                cleanup_sites,
-                                evidence,
-                            } => MaterializedImplicitOutcome::Proved {
-                                cleanup_sites: cleanup_sites
-                                    .into_iter()
-                                    .map(|s| materialize_cleanup_site(&env, s))
-                                    .collect(),
-                                evidence,
-                            },
-                            ImplicitExceptionCleanupOutcome::Disproved {
-                                may_throw_sites,
-                                counterexample_path,
-                                evidence,
-                            } => MaterializedImplicitOutcome::Disproved {
-                                may_throw_sites,
-                                counterexample_path,
-                                evidence,
-                            },
-                            ImplicitExceptionCleanupOutcome::Inconclusive {
-                                may_throw_sites,
-                                gaps,
-                                evidence,
-                            } => MaterializedImplicitOutcome::Inconclusive {
-                                may_throw_sites,
-                                gaps,
-                                evidence,
-                            },
-                        };
-                        MaterializedTargetCleanup {
-                            handle_id: target_handle.clone(),
-                            instance_key: tr.instance_key,
-                            allocation_location: tr.allocation_location,
-                            status: verdict_status,
-                            implicit_exceptions,
-                        }
-                    })
-                    .collect();
+            let mat_scopes = scope_inputs
+                .into_iter()
+                .zip(batch.results)
+                .map(|((scope_handle, scope_node), scope_res)| {
+                    let target_results = target_inputs
+                        .iter()
+                        .zip(scope_res.target_results)
+                        .map(|((target_handle, _), tr)| {
+                            let verdict_status = match tr.status {
+                                TargetCleanupStatusData::Proved {
+                                    cleanup_sites,
+                                    evidence,
+                                } => MaterializedTargetStatus::Proved {
+                                    cleanup_sites: cleanup_sites
+                                        .into_iter()
+                                        .map(|s| materialize_cleanup_site(&env, s))
+                                        .collect(),
+                                    evidence,
+                                },
+                                TargetCleanupStatusData::Disproved {
+                                    cleaned_on_any_path,
+                                    cleanup_sites,
+                                    uncleaned_path,
+                                    evidence,
+                                } => MaterializedTargetStatus::Disproved {
+                                    cleaned_on_any_path,
+                                    cleanup_sites: cleanup_sites
+                                        .into_iter()
+                                        .map(|s| materialize_cleanup_site(&env, s))
+                                        .collect(),
+                                    uncleaned_path,
+                                    evidence,
+                                },
+                                TargetCleanupStatusData::Inconclusive {
+                                    cleanup_sites,
+                                    gaps,
+                                    evidence,
+                                } => MaterializedTargetStatus::Inconclusive {
+                                    cleanup_sites: cleanup_sites
+                                        .into_iter()
+                                        .map(|s| materialize_cleanup_site(&env, s))
+                                        .collect(),
+                                    gaps,
+                                    evidence,
+                                },
+                            };
+                            let implicit_exceptions = match tr.implicit_exceptions {
+                                ImplicitExceptionCleanupOutcome::Proved {
+                                    cleanup_sites,
+                                    evidence,
+                                } => MaterializedImplicitOutcome::Proved {
+                                    cleanup_sites: cleanup_sites
+                                        .into_iter()
+                                        .map(|s| materialize_cleanup_site(&env, s))
+                                        .collect(),
+                                    evidence,
+                                },
+                                ImplicitExceptionCleanupOutcome::Disproved {
+                                    may_throw_sites,
+                                    counterexample_path,
+                                    evidence,
+                                } => MaterializedImplicitOutcome::Disproved {
+                                    may_throw_sites,
+                                    counterexample_path,
+                                    evidence,
+                                },
+                                ImplicitExceptionCleanupOutcome::Inconclusive {
+                                    may_throw_sites,
+                                    gaps,
+                                    evidence,
+                                } => MaterializedImplicitOutcome::Inconclusive {
+                                    may_throw_sites,
+                                    gaps,
+                                    evidence,
+                                },
+                            };
+                            MaterializedTargetCleanup {
+                                handle_id: target_handle.clone(),
+                                instance_key: tr.instance_key,
+                                allocation_location: tr.allocation_location,
+                                status: verdict_status,
+                                implicit_exceptions,
+                            }
+                        })
+                        .collect();
 
-                let mat = MaterializedScopeCleanup {
-                    scope_handle,
-                    resolved_functions: scope_res
-                        .resolved_functions
-                        .into_iter()
-                        .filter_map(|s| env.semantic.node_for_syntax(s))
-                        .collect(),
-                    target_results,
-                    disposed_instances: scope_res
-                        .disposed_instances
-                        .into_iter()
-                        .map(|s| materialize_cleanup_site(&env, s))
-                        .collect(),
-                    registered_instances: scope_res
-                        .registered_instances
-                        .into_iter()
-                        .map(|s| materialize_cleanup_site(&env, s))
-                        .collect(),
-                    detached_instances: scope_res
-                        .detached_instances
-                        .into_iter()
-                        .map(|s| materialize_cleanup_site(&env, s))
-                        .collect(),
-                    evidence: scope_res.evidence,
-                    gaps: scope_res.gaps,
-                };
-                (scope_node, mat)
-            })
-            .collect();
+                    let mat = MaterializedScopeCleanup {
+                        scope_handle,
+                        resolved_functions: scope_res
+                            .resolved_functions
+                            .into_iter()
+                            .filter_map(|s| env.semantic.node_for_syntax(s))
+                            .collect(),
+                        target_results,
+                        disposed_instances: scope_res
+                            .disposed_instances
+                            .into_iter()
+                            .map(|s| materialize_cleanup_site(&env, s))
+                            .collect(),
+                        registered_instances: scope_res
+                            .registered_instances
+                            .into_iter()
+                            .map(|s| materialize_cleanup_site(&env, s))
+                            .collect(),
+                        detached_instances: scope_res
+                            .detached_instances
+                            .into_iter()
+                            .map(|s| materialize_cleanup_site(&env, s))
+                            .collect(),
+                        evidence: scope_res.evidence,
+                        gaps: scope_res.gaps,
+                    };
+                    (scope_node, mat)
+                })
+                .collect();
 
-        drop(env);
-        (mat_scopes, built_graph, batch.conflict)
-    };
+            drop(env);
+            (mat_scopes, built_graph, built_field_index, batch.conflict)
+        };
 
     if let Some(g) = newly_built_graph {
         let g_arc = Arc::new(g);
         if let Some(conflict) = &g_arc.conflict {
             return Err(conflict_rpc_err(conflict));
         }
+        if allowed_files.is_none() {
+            snapshot
+                .ir_call_graph_cache
+                .insert(project_id.to_string(), g_arc);
+        }
+    }
+    if let Some(fi) = newly_built_field_index
+        && allowed_files.is_none()
+    {
         snapshot
-            .ir_call_graph_cache
-            .insert(project_id.to_string(), g_arc);
+            .ir_field_write_cache
+            .insert(project_id.to_string(), Arc::new(fi));
     }
 
     if let Some(conflict) = conflict_opt {

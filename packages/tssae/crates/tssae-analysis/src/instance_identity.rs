@@ -232,12 +232,13 @@ struct IndexedPropWrite {
 }
 
 #[derive(Default)]
-struct IrFieldWriteIndex {
+pub struct IrFieldWriteIndex {
     writes_by_prop: FxHashMap<String, Vec<IndexedPropWrite>>,
 }
 
 impl IrFieldWriteIndex {
-    fn build(project_files: &[FileId], ir_provider: &dyn IrProvider) -> Self {
+    #[must_use]
+    pub fn build(project_files: &[FileId], ir_provider: &dyn IrProvider) -> Self {
         let mut index = Self::default();
         for &file in project_files {
             for scope in ir_provider.scopes_in_file(file) {
@@ -290,7 +291,7 @@ struct MatchedPropWrite {
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Matches trace_value_propagation signature with project files, summary index, and optional cached call graph."
+    reason = "Matches trace_value_propagation signature with project files, summary index, and optional cached call graph/field write index."
 )]
 pub fn resolve_instances_on_ir<S: BuildHasher>(
     targets: &[InstanceTargetSpec],
@@ -301,20 +302,29 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
     ir_provider: &dyn IrProvider,
     summary_index: &BehaviorSummaryIndex,
     cached_call_graph: Option<&IrCallGraph>,
-) -> (ResolveInstancesBatchOutcome, Option<IrCallGraph>) {
+    cached_field_index: Option<&IrFieldWriteIndex>,
+) -> (
+    ResolveInstancesBatchOutcome,
+    Option<IrCallGraph>,
+    Option<IrFieldWriteIndex>,
+) {
     let owned_allowed: Option<FxHashSet<FileId>> =
         allowed_files.map(|set| set.iter().copied().collect());
+    let extra_field_files: FxHashSet<FileId> = targets.iter().map(|t| t.syntax.file_id()).collect();
     let mut owned_graph: Option<IrCallGraph> = None;
+    let mut owned_field_index: Option<IrFieldWriteIndex> = None;
     let mut resolver = IrInstanceResolver {
         project_files,
         allowed_files: owned_allowed.as_ref(),
+        extra_field_files,
         semantic,
         syntax,
         ir_provider,
         summary_index,
         cached_call_graph,
         owned_graph: &mut owned_graph,
-        field_index: None,
+        cached_field_index,
+        owned_field_index: &mut owned_field_index,
         conflict: None,
     };
 
@@ -329,50 +339,69 @@ pub fn resolve_instances_on_ir<S: BuildHasher>(
     let conflict = resolver.conflict.take();
     drop(resolver);
 
+    let ret_graph = if allowed_files.is_none() {
+        owned_graph
+    } else {
+        None
+    };
+    let ret_field_index = if allowed_files.is_none() {
+        owned_field_index
+    } else {
+        None
+    };
+
     (
         ResolveInstancesBatchOutcome { results, conflict },
-        owned_graph,
+        ret_graph,
+        ret_field_index,
     )
 }
 
 pub(crate) struct IrInstanceResolver<'a> {
     pub(crate) project_files: &'a [FileId],
     pub(crate) allowed_files: Option<&'a FxHashSet<FileId>>,
+    extra_field_files: FxHashSet<FileId>,
     pub(crate) semantic: &'a dyn SemanticModel,
     pub(crate) syntax: &'a dyn SyntaxCatalog,
     pub(crate) ir_provider: &'a dyn IrProvider,
     pub(crate) summary_index: &'a BehaviorSummaryIndex,
     pub(crate) cached_call_graph: Option<&'a IrCallGraph>,
     pub(crate) owned_graph: &'a mut Option<IrCallGraph>,
-    field_index: Option<IrFieldWriteIndex>,
+    cached_field_index: Option<&'a IrFieldWriteIndex>,
+    owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     pub(crate) conflict: Option<SummaryConflictError>,
 }
 
 impl<'a> IrInstanceResolver<'a> {
     #[expect(
         clippy::too_many_arguments,
-        reason = "Constructs internal IR instance resolver from snapshot IR environment and optional call graph cache."
+        reason = "Constructs internal IR instance resolver from snapshot IR environment and optional call graph/field write caches."
     )]
     pub(crate) fn new(
         project_files: &'a [FileId],
         allowed_files: Option<&'a FxHashSet<FileId>>,
+        extra_field_files: FxHashSet<FileId>,
         semantic: &'a dyn SemanticModel,
         syntax: &'a dyn SyntaxCatalog,
         ir_provider: &'a dyn IrProvider,
         summary_index: &'a BehaviorSummaryIndex,
         cached_call_graph: Option<&'a IrCallGraph>,
         owned_graph: &'a mut Option<IrCallGraph>,
+        cached_field_index: Option<&'a IrFieldWriteIndex>,
+        owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     ) -> Self {
         Self {
             project_files,
             allowed_files,
+            extra_field_files,
             semantic,
             syntax,
             ir_provider,
             summary_index,
             cached_call_graph,
             owned_graph,
-            field_index: None,
+            cached_field_index,
+            owned_field_index,
             conflict: None,
         }
     }
@@ -381,8 +410,20 @@ impl<'a> IrInstanceResolver<'a> {
             return Some(g);
         }
         if self.owned_graph.is_none() {
+            let scoped_files: Vec<FileId>;
+            let files: &[FileId] = if let Some(allowed) = self.allowed_files {
+                scoped_files = self
+                    .project_files
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f))
+                    .collect();
+                &scoped_files
+            } else {
+                self.project_files
+            };
             let graph = build_ir_call_graph_with_summaries(
-                self.project_files,
+                files,
                 self.semantic,
                 self.syntax,
                 self.ir_provider,
@@ -397,13 +438,27 @@ impl<'a> IrInstanceResolver<'a> {
     }
 
     fn ensure_field_index(&mut self) -> &IrFieldWriteIndex {
-        if self.field_index.is_none() {
-            self.field_index = Some(IrFieldWriteIndex::build(
-                self.project_files,
-                self.ir_provider,
-            ));
+        if let Some(idx) = self.cached_field_index {
+            return idx;
         }
-        self.field_index.as_ref().expect("field index initialized")
+        if self.owned_field_index.is_none() {
+            let scoped_files: Vec<FileId>;
+            let files: &[FileId] = if let Some(allowed) = self.allowed_files {
+                scoped_files = self
+                    .project_files
+                    .iter()
+                    .copied()
+                    .filter(|f| allowed.contains(f) || self.extra_field_files.contains(f))
+                    .collect();
+                &scoped_files
+            } else {
+                self.project_files
+            };
+            *self.owned_field_index = Some(IrFieldWriteIndex::build(files, self.ir_provider));
+        }
+        self.owned_field_index
+            .as_ref()
+            .expect("field index initialized")
     }
 
     fn resolve_target(&mut self, target: InstanceTargetSpec) -> InstanceResolutionOutcome {
@@ -2010,7 +2065,19 @@ impl<'a> IrInstanceResolver<'a> {
             );
         }
 
-        // 2. Imperative PropWrites across all project scopes.
+        // 2. Imperative PropWrites across all project (or lookupFiles-scoped) scopes.
+        if let Some(syn) = host.origin.origin_syntax {
+            self.extra_field_files.insert(syn.file_id());
+        }
+        if let Some(class_syn) = host_class_syn {
+            self.extra_field_files.insert(class_syn.file_id());
+        }
+        if let Some(host_ir) = &host.host_scope_ir {
+            self.extra_field_files.insert(host_ir.id.file);
+        }
+        for anchor in timeline {
+            self.extra_field_files.insert(anchor.ir.id.file);
+        }
         let candidates: Vec<IndexedPropWrite> = self
             .ensure_field_index()
             .writes_by_prop

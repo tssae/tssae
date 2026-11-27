@@ -28,6 +28,7 @@ import {
   evidenceOf,
   extractBasisEvidence,
   openProject,
+  type Gap,
 } from "tssae";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -723,6 +724,321 @@ export function runQueries() {
       },
       async (host) => {
         await host.typecheck();
+      },
+    );
+  });
+
+  void it("discovers cross-package workspace row projections and relations when opened on a consuming API package", async () => {
+    await withDrizzleHost(
+      undefined,
+      async (host) => {
+        await host.typecheck("packages/api/tsconfig.json");
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "packages/api/tsconfig.json",
+        });
+        try {
+          const projections = await extractDrizzleRowProjections(
+            session.project(),
+          );
+          const selectProj = projections.find((p) => p.queryKind === "select");
+          const relProj = projections.find((p) => p.queryKind === "relational");
+
+          assert.ok(selectProj, "expected cross-package select projection");
+          assert.deepEqual(selectProj.projectedColumns, ["email", "id"]);
+          assert.equal(selectProj.tableName, "users");
+          assert.equal(selectProj.at.file, "packages/db/src/queries.ts");
+
+          assert.ok(relProj, "expected cross-package relational projection");
+          assert.equal(relProj.tableName, "users");
+          assert.deepEqual(relProj.projectedColumns, ["id", "posts"]);
+          assert.equal(relProj.relations.posts?.cardinality, "many");
+          assert.equal(relProj.relations.posts?.targetTable, "posts");
+          assert.deepEqual(relProj.relations.posts?.columns, [
+            "authorId",
+            "id",
+            "title",
+          ]);
+        } finally {
+          await session.close();
+        }
+      },
+      {
+        files: {
+          "packages/db/package.json": JSON.stringify(
+            {
+              name: "@acme/db",
+              version: "1.0.0",
+              type: "module",
+              exports: {
+                "./queries": {
+                  source: "./src/queries.ts",
+                  types: "./src/queries.ts",
+                  default: "./src/queries.ts",
+                },
+                "./schema": {
+                  source: "./src/schema.ts",
+                  types: "./src/schema.ts",
+                  default: "./src/schema.ts",
+                },
+              },
+            },
+            null,
+            2,
+          ),
+          "packages/db/tsconfig.json": JSON.stringify(
+            {
+              compilerOptions: {
+                strict: true,
+                skipLibCheck: true,
+                target: "ES2024",
+                module: "NodeNext",
+                moduleResolution: "NodeNext",
+                noEmit: true,
+              },
+              include: ["src/**/*.ts"],
+            },
+            null,
+            2,
+          ),
+          "packages/db/src/schema.ts": `import { relations } from "drizzle-orm";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+
+export const users = sqliteTable("users", {
+  id: integer("id").primaryKey(),
+  email: text("email").notNull(),
+});
+
+export const posts = sqliteTable("posts", {
+  id: integer("id").primaryKey(),
+  authorId: integer("author_id").notNull(),
+  title: text("title").notNull(),
+});
+
+export const usersRelations = relations(users, ({ many }) => ({
+  posts: many(posts),
+}));
+
+export const postsRelations = relations(posts, ({ one }) => ({
+  author: one(users, {
+    fields: [posts.authorId],
+    references: [users.id],
+  }),
+}));
+`,
+          "packages/db/src/queries.ts": `import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
+
+import { users, type postsRelations, type usersRelations } from "./schema.js";
+
+type Schema = {
+  users: typeof users;
+  usersRelations: typeof usersRelations;
+  postsRelations: typeof postsRelations;
+};
+
+export function selectUserEmails(
+  db: BaseSQLiteDatabase<"sync", unknown, Schema>,
+) {
+  return db.select({ id: users.id, email: users.email }).from(users).all();
+}
+
+export function listUsersWithPosts(
+  db: BaseSQLiteDatabase<"sync", unknown, Schema>,
+) {
+  return db.query.users.findMany({
+    columns: { id: true },
+    with: { posts: true },
+  });
+}
+`,
+          "packages/api/tsconfig.json": JSON.stringify(
+            {
+              compilerOptions: {
+                strict: true,
+                skipLibCheck: true,
+                target: "ES2024",
+                module: "NodeNext",
+                moduleResolution: "NodeNext",
+                customConditions: ["source"],
+                noEmit: true,
+              },
+              include: ["src/**/*.ts"],
+            },
+            null,
+            2,
+          ),
+          "packages/api/src/handler.ts": `import {
+  listUsersWithPosts,
+  selectUserEmails,
+} from "@acme/db/queries";
+
+export function handle(
+  db: Parameters<typeof listUsersWithPosts>[0],
+) {
+  return {
+    emails: selectUserEmails(db),
+    withPosts: listUsersWithPosts(db),
+  };
+}
+`,
+        },
+        setup: (host) => {
+          linkNodeModulesPackage(
+            host.rootDir,
+            "@acme/db",
+            host.resolvePath("packages/db"),
+          );
+        },
+      },
+    );
+  });
+
+  void it("suppresses superseded unresolved-schema-field gaps when .extend() overrides a refined drizzle-zod field", async () => {
+    const baseTsConfig = JSON.stringify(
+      {
+        compilerOptions: {
+          strict: true,
+          skipLibCheck: true,
+          target: "ES2024",
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          noEmit: true,
+        },
+        include: ["src/**/*.ts"],
+      },
+      null,
+      2,
+    );
+
+    await withDrizzleHost(
+      undefined,
+      async (host) => {
+        await host.typecheck();
+
+        let recordedGaps: readonly Gap[] = [];
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project(undefined, {
+            observer: {
+              onGaps: (gaps) => {
+                recordedGaps = gaps;
+              },
+            },
+          });
+
+          const calls = await drizzleZodValidator.extractInputFields(ctx, {
+            scope: "calls",
+          });
+          assert.equal(calls.length, 1);
+          const parseRes = calls[0]!;
+          assert.equal(parseRes.hasDynamicFields, false);
+          assert.deepEqual(parseRes.requiredFields, ["id"]);
+          assert.deepEqual(parseRes.defaultedFields, ["age"]);
+          assert.equal(
+            parseRes.gaps.filter((g) => g.kind === "unresolved-schema-field")
+              .length,
+            0,
+          );
+          assert.equal(recordedGaps.length, 0);
+        } finally {
+          await session.close();
+        }
+      },
+      {
+        linkZod: true,
+        files: {
+          "tsconfig.json": baseTsConfig,
+          "src/index.ts": `import { integer, sqliteTable } from "drizzle-orm/sqlite-core";
+import { createSelectSchema } from "drizzle-zod";
+import { z } from "zod";
+
+const users = sqliteTable("users", {
+  id: integer("id").primaryKey(),
+  age: integer("age").notNull(),
+});
+
+declare function runtimeAgeValidator(): z.ZodType<number>;
+
+const overriddenSchema = createSelectSchema(users, {
+  age: runtimeAgeValidator(),
+}).extend({
+  age: z.number().default(18),
+});
+
+export function parseOverridden(row: unknown) {
+  return overriddenSchema.parse(row);
+}
+`,
+        },
+      },
+    );
+
+    await withDrizzleHost(
+      undefined,
+      async (host) => {
+        await host.typecheck();
+
+        let recordedGaps: readonly Gap[] = [];
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project(undefined, {
+            observer: {
+              onGaps: (gaps) => {
+                recordedGaps = gaps;
+              },
+            },
+          });
+
+          const calls = await drizzleZodValidator.extractInputFields(ctx, {
+            scope: "calls",
+          });
+          assert.equal(calls.length, 1);
+          const parseRes = calls[0]!;
+          assert.equal(
+            parseRes.gaps.filter((g) => g.kind === "unresolved-schema-field")
+              .length,
+            1,
+          );
+          assert.equal(
+            recordedGaps.filter((g) => g.kind === "unresolved-schema-field")
+              .length,
+            1,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+      {
+        linkZod: true,
+        files: {
+          "tsconfig.json": baseTsConfig,
+          "src/index.ts": `import { integer, sqliteTable } from "drizzle-orm/sqlite-core";
+import { createSelectSchema } from "drizzle-zod";
+import type { z } from "zod";
+
+const users = sqliteTable("users", {
+  id: integer("id").primaryKey(),
+  age: integer("age").notNull(),
+});
+
+declare function runtimeAgeValidator(): z.ZodType<number>;
+
+const rawRefinedSchema = createSelectSchema(users, {
+  age: runtimeAgeValidator(),
+});
+
+export function parseRaw(row: unknown) {
+  return rawRefinedSchema.parse(row);
+}
+`,
+        },
       },
     );
   });

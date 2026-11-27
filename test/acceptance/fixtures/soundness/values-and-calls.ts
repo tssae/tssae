@@ -69,6 +69,24 @@ export function runIteratorValue(): void {
   }
 }
 
+export function runGeneratorNextValue(): void {
+  const token = source("val-generator-next-value", { kind: "gen-next" });
+  sink("val-generator-next-value", yieldSingle(token).next().value);
+}
+
+async function* yieldMappedArray<T>(item: T): AsyncGenerator<T[]> {
+  yield [item].map((x) => x);
+}
+
+export async function runAsyncGeneratorContainerValue(): Promise<void> {
+  const token = source("val-async-generator-array-elem", {
+    kind: "async-gen-array",
+  });
+  for await (const arr of yieldMappedArray(token)) {
+    sink("val-async-generator-array-elem", arr[0]);
+  }
+}
+
 export class BaseWorker {
   execute(): void {
     recordCallee("BaseWorker.execute");
@@ -125,12 +143,14 @@ function optionalPing(): void {
   recordCallee("optionalPing");
 }
 
-export function runValuesAndCallsScenarios(): void {
+export async function runValuesAndCallsScenarios(): Promise<void> {
   runDestructureDefault();
   runNullishAndOptional();
   runAccessorValue();
   runClosureReassignValue();
   runIteratorValue();
+  runGeneratorNextValue();
+  await runAsyncGeneratorContainerValue();
   invokeWorker(new DerivedWorker());
   invokeReassignedClosure();
   invokeOptionalTarget({ ping: optionalPing });

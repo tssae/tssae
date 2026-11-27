@@ -17,7 +17,6 @@ import {
   readRepoHeadState,
   resolveBaselineCacheDir,
   resolveBaselineRevision,
-  resolvePerfCacheDir,
   resolveRepoRoot,
 } from "@tssae/acceptance";
 
@@ -102,7 +101,6 @@ void describe("shared baseline artifact foundation", () => {
   void it("resolves baseline cache directory compatibly with TSSAE_PERF_CACHE_DIR", () => {
     const custom = resolveBaselineCacheDir("/tmp/tssae-baseline-custom");
     assert.equal(custom, "/tmp/tssae-baseline-custom");
-    assert.equal(resolvePerfCacheDir("/tmp/tssae-baseline-custom"), custom);
   });
 
   void it("resolves repo root, head dirty state, and merge-base revision", () => {

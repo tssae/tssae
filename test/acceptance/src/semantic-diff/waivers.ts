@@ -136,18 +136,11 @@ function validateWaiverEntry(raw: unknown, index: number): SemanticDiffWaiver {
  */
 export function resolveDefaultWaiversPath(): string {
   const currentDir = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    resolve(currentDir, "../../semantic-diff-waivers.json"),
-    resolve(currentDir, "../../../semantic-diff-waivers.json"),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
+  const candidate = resolve(currentDir, "../../semantic-diff-waivers.json");
+  if (existsSync(candidate)) {
+    return candidate;
   }
-  throw new Error(
-    `Cannot locate semantic-diff-waivers.json (checked ${candidates.join(", ")}).`,
-  );
+  throw new Error(`Cannot locate semantic-diff-waivers.json at ${candidate}.`);
 }
 
 /** Loads and validates declarative semantic diff waivers from a JSON manifest file. */

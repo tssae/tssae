@@ -6,6 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -102,7 +103,7 @@ function resolveWorkerInvocation(): {
 }
 
 function resolveInstalledTssaeEntry(host: PreparedAcceptanceHost): string {
-  return resolve(host.hostDir, "node_modules", "tssae", "dist", "index.js");
+  return createRequire(join(host.hostDir, "package.json")).resolve("tssae");
 }
 
 async function runDigestWorker(options: {

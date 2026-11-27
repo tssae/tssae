@@ -72,9 +72,6 @@ export function resolveBaselineCacheDir(override?: string): string {
   return join(baseCache, "tssae", "perf-ab");
 }
 
-/** Alias retained for existing perf callers and unit tests. */
-export const resolvePerfCacheDir = resolveBaselineCacheDir;
-
 /** Finds the Git top-level directory containing `startDir`. */
 export function resolveRepoRoot(startDir: string = process.cwd()): string {
   return execFileSync("git", ["rev-parse", "--show-toplevel"], {

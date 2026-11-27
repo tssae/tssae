@@ -3,7 +3,6 @@ export {
   readRepoHeadState,
   resolveBaselineCacheDir,
   resolveBaselineRevision,
-  resolvePerfCacheDir,
   resolveRepoRoot,
   type BaselineArtifact,
   type PrepareBaselineArtifactOptions,

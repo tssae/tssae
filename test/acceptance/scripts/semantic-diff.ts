@@ -1,4 +1,4 @@
-import { runSemanticDiffCli } from "../src/semantic-diff/cli.ts";
+import { runSemanticDiffCli } from "@tssae/acceptance";
 
 void runSemanticDiffCli(process.argv.slice(2)).then(
   (code) => {

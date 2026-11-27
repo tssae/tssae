@@ -430,7 +430,15 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "  yield* yieldSingle(item);",
             "}",
             "",
-            "export function runGeneratorFlows(): void {",
+            "async function* yieldMappedArray(item: string): AsyncGenerator<string[]> {",
+            "  yield [item].map((x) => x);",
+            "}",
+            "",
+            "async function* delegateAsyncMappedArray(item: string): AsyncGenerator<string[]> {",
+            "  yield* yieldMappedArray(item);",
+            "}",
+            "",
+            "export async function runGeneratorFlows(): Promise<void> {",
             "  const raw = origin();",
             "  for (const elem of yieldSingle(raw)) {",
             "    sink('genForOf', elem);",
@@ -441,6 +449,15 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "  const [destructured] = yieldSingle(raw);",
             "  sink('genDestructure', destructured);",
             "  sink('genObjectItself', yieldSingle(raw));",
+            "  sink('genNextValue', yieldSingle(raw).next().value);",
+            "  for await (const arr of yieldMappedArray(raw)) {",
+            "    sink('asyncGenArrContainer', arr);",
+            "    sink('asyncGenArrElem', arr[0]);",
+            "  }",
+            "  for await (const dArr of delegateAsyncMappedArray(raw)) {",
+            "    sink('asyncGenDelegateArrContainer', dArr);",
+            "    sink('asyncGenDelegateArrElem', dArr[0]);",
+            "  }",
             "}",
             "",
           ].join("\n"),
@@ -467,6 +484,11 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
             "genDelegate",
             "genDestructure",
             "genObjectItself",
+            "genNextValue",
+            "asyncGenArrContainer",
+            "asyncGenArrElem",
+            "asyncGenDelegateArrContainer",
+            "asyncGenDelegateArrElem",
           ] as const;
           const targets = tags.map((tag) => {
             const sinkCall = calls.find((c) =>
@@ -490,6 +512,19 @@ void describe("tssae IR value propagation syntax, summaries, and tri-state isola
           assert.equal(byTag.get("genDelegate")!.status, "proved");
           assert.equal(byTag.get("genDestructure")!.status, "proved");
           assert.equal(byTag.get("genObjectItself")!.status, "disproved");
+          const nextValueRow = byTag.get("genNextValue")!;
+          assert.notEqual(
+            nextValueRow.status,
+            "disproved",
+            `Expected gen.next().value not to be disproved, got ${JSON.stringify(nextValueRow)}`,
+          );
+          assert.equal(byTag.get("asyncGenArrContainer")!.status, "disproved");
+          assert.equal(byTag.get("asyncGenArrElem")!.status, "proved");
+          assert.equal(
+            byTag.get("asyncGenDelegateArrContainer")!.status,
+            "disproved",
+          );
+          assert.equal(byTag.get("asyncGenDelegateArrElem")!.status, "proved");
         } finally {
           await session.close();
         }

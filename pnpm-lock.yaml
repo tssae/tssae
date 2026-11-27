@@ -243,10 +243,10 @@ importers:
   packages/drizzle:
     dependencies:
       '@tssae/zod':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../zod
       tssae:
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../tssae
     devDependencies:
       '@tssae/test-hosts':
@@ -325,7 +325,7 @@ importers:
   packages/zod:
     dependencies:
       tssae:
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../tssae
     devDependencies:
       '@tssae/test-hosts':

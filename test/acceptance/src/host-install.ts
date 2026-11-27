@@ -88,6 +88,10 @@ function runAsyncCommand(
 /**
  * Installs candidate TSSAE packages (including unscoped `tssae`) from one local
  * artifact batch into a clean host checkout via the loopback registry.
+ *
+ * Defaults `engineStrict` to `true` and prepends the managed Node `24.0.0`
+ * `bin` directory (`options.nodeBinDir` or the shared out-of-repo runtime) to
+ * `PATH` so package-manager engine checks run against Node `24.0.0`.
  */
 export async function installArtifactPackages(
   options: InstallArtifactPackagesOptions,

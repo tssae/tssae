@@ -101,6 +101,52 @@
       "cache": false,
       "tags": ["quality:heavy"]
     },
+    "semantic-diff": {
+      "dependsOn": ["build", "^build", "//#toolchain:prepare"],
+      "passThroughEnv": [
+        "INIT_CWD",
+        "TSSAE_SEMANTIC_DIFF_CWD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "XDG_CACHE_HOME",
+        "CARGO_NET_OFFLINE",
+        "TSSAE_ACCEPTANCE_PACK_DIR",
+        "TSSAE_PERF_CACHE_DIR",
+        "TSSAE_CORPUS_CACHE_DIR",
+        "TSSAE_CORPUS_HOST_MIRROR_DIR"
+      ],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "cache": false,
+      "tags": ["work:on-demand"]
+    },
+    "semantic-diff:gate": {
+      "dependsOn": ["build", "^build", "//#toolchain:prepare", "perf:gate"],
+      "passThroughEnv": [
+        "INIT_CWD",
+        "TSSAE_SEMANTIC_DIFF_CWD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "XDG_CACHE_HOME",
+        "CARGO_NET_OFFLINE",
+        "TSSAE_ACCEPTANCE_PACK_DIR",
+        "TSSAE_PERF_CACHE_DIR",
+        "TSSAE_CORPUS_CACHE_DIR",
+        "TSSAE_CORPUS_HOST_MIRROR_DIR"
+      ],
+      "inputs": ["$TURBO_DEFAULT$"],
+      "outputs": [],
+      "cache": false,
+      "tags": ["quality:heavy"]
+    },
     "test": {
       "dependsOn": ["^build", "@tssae/test-hosts#build", "^typecheck"],
       "inputs": ["$TURBO_DEFAULT$"],

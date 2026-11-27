@@ -116,6 +116,45 @@ export type {
   ScenarioStats,
   WorkerRunSample,
 } from "./perf/types.ts";
+export { collectQueryDigest } from "./semantic-diff/digest.ts";
+export {
+  diffDigests,
+  formatSemanticDiffReport,
+  type DiffDigestsOptions,
+} from "./semantic-diff/diff.ts";
+export {
+  loadSemanticDiffWaivers,
+  resolveDefaultWaiversPath,
+} from "./semantic-diff/waivers.ts";
+export {
+  runSemanticDiffCli,
+  type SemanticDiffCliIo,
+} from "./semantic-diff/cli.ts";
+export {
+  formatSemanticDiffCliUsage,
+  parseSemanticDiffCliArgs,
+  type SemanticDiffCliOptions,
+} from "./semantic-diff/cli-args.ts";
+export {
+  runSemanticDiffGate,
+  type RunSemanticDiffOptions,
+  type SemanticDiffGateRunResult,
+} from "./semantic-diff/runner.ts";
+export type {
+  CollectQueryDigestOptions,
+  DigestSample,
+  NormalizedLocation,
+  QueryChannelCounts,
+  QueryDigest,
+  RegressionFinding,
+  SemanticDiffResult,
+  SemanticDiffWaiver,
+  SemanticOutcomeChannel,
+  SemanticOutcomeStatus,
+  SemanticQueryName,
+  StatusTransitionCount,
+  UnknownCountDelta,
+} from "./semantic-diff/types.ts";
 export {
   runConformanceCli,
   type RunConformanceCliHost,

@@ -126,7 +126,7 @@
       "tags": ["quality:heavy"]
     },
     "test": {
-      "dependsOn": ["@tssae/test-hosts#build", "tssae#build", "^typecheck"],
+      "dependsOn": ["^build", "@tssae/test-hosts#build", "^typecheck"],
       "inputs": ["$TURBO_DEFAULT$"],
       "outputs": [],
       "tags": ["quality:light"]

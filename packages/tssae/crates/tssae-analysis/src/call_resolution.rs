@@ -640,11 +640,11 @@ fn resolve_implicit_getter_call(
         }
         let obj_ctx = ObjectLookupContext::from_collector(collector);
         if let Some(local_prop) =
-            resolve_local_object_property(ir, recv, member_name, &[], Some(&obj_ctx))
+            resolve_local_object_property(ir, recv, member_name, &[], 0, Some(&obj_ctx))
             && !local_prop.values.is_empty()
         {
             for (prop_ir, prop_val, _) in local_prop.values {
-                trace_callable_value(&prop_ir, prop_val, &[], 0, None, 0, collector);
+                trace_callable_value(&prop_ir, prop_val, &[], 1, None, 0, collector);
             }
             if local_prop.is_exhaustive && !collector.targets.is_empty() {
                 return;
@@ -1265,8 +1265,14 @@ fn trace_prop_read_construct(
     }
     let obj_ctx = ObjectLookupContext::from_collector(collector);
     if let Some(member_name) = prop_key_static_name(key)
-        && let Some(prop_vals) =
-            resolve_local_object_property(ir, object, member_name, call_stack, Some(&obj_ctx))
+        && let Some(prop_vals) = resolve_local_object_property(
+            ir,
+            object,
+            member_name,
+            call_stack,
+            depth + 1,
+            Some(&obj_ctx),
+        )
     {
         if !prop_vals.is_exhaustive {
             collector.push_dynamic_gap(format!(
@@ -1544,9 +1550,14 @@ fn resolve_prop_read_callable(
     // 2. Local or imported object-literal property resolution (`const obj = { run: fn }; obj.run()`,
     //    `export const posix: IPath = { normalize() {} }`, or destructured IIFE exports).
     let obj_ctx = ObjectLookupContext::from_collector(collector);
-    if let Some(prop_vals) =
-        resolve_local_object_property(ir, object_val, member_name, call_stack, Some(&obj_ctx))
-    {
+    if let Some(prop_vals) = resolve_local_object_property(
+        ir,
+        object_val,
+        member_name,
+        call_stack,
+        depth + 1,
+        Some(&obj_ctx),
+    ) {
         if !prop_vals.is_exhaustive {
             collector.push_dynamic_gap(format!(
                 "Object literal holding property '{member_name}' may have overwritten or spread properties."
@@ -1929,7 +1940,7 @@ impl<'a> ObjectLookupContext<'a> {
 
 struct ObjectPropSearch<'a> {
     ctx: Option<&'a ObjectLookupContext<'a>>,
-    visited: FxHashSet<(FunctionIrId, ValueId, usize)>,
+    visited: &'a mut FxHashSet<(FunctionIrId, ValueId, String, usize)>,
     out: ObjectPropLookupResult,
 }
 
@@ -1938,18 +1949,49 @@ fn resolve_local_object_property(
     object_val: ValueId,
     prop_name: &str,
     call_stack: &[CallFrame],
+    initial_depth: usize,
     ctx: Option<&ObjectLookupContext<'_>>,
 ) -> Option<ObjectPropLookupResult> {
+    let mut visited = FxHashSet::default();
+    resolve_local_object_property_with_visited(
+        ir,
+        object_val,
+        prop_name,
+        call_stack,
+        initial_depth,
+        ctx,
+        &mut visited,
+    )
+}
+
+fn resolve_local_object_property_with_visited(
+    ir: &Arc<FunctionIr>,
+    object_val: ValueId,
+    prop_name: &str,
+    call_stack: &[CallFrame],
+    initial_depth: usize,
+    ctx: Option<&ObjectLookupContext<'_>>,
+    visited: &mut FxHashSet<(FunctionIrId, ValueId, String, usize)>,
+) -> Option<ObjectPropLookupResult> {
+    if initial_depth >= MAX_TRACE_DEPTH {
+        return None;
+    }
     let mut search = ObjectPropSearch {
         ctx,
-        visited: FxHashSet::default(),
+        visited,
         out: ObjectPropLookupResult {
             values: Vec::new(),
             is_exhaustive: true,
         },
     };
-    if !collect_object_alloc_props(ir, object_val, prop_name, call_stack, 0, &mut search)
-        || search.out.values.is_empty()
+    if !collect_object_alloc_props(
+        ir,
+        object_val,
+        prop_name,
+        call_stack,
+        initial_depth,
+        &mut search,
+    ) || search.out.values.is_empty()
     {
         return None;
     }
@@ -1997,7 +2039,7 @@ fn collect_object_props_from_decl_syntax(
         ctx.syntax,
         ctx.ir_provider,
     );
-    if writes.writes.is_empty() {
+    if writes.mutability != BindingMutability::Const || writes.writes.is_empty() {
         return false;
     }
     if !writes.is_exhaustive {
@@ -2036,9 +2078,12 @@ fn collect_object_alloc_props(
     search: &mut ObjectPropSearch<'_>,
 ) -> bool {
     if depth >= MAX_TRACE_DEPTH
-        || !search
-            .visited
-            .insert((ir.id, val, stack_fingerprint(call_stack)))
+        || !search.visited.insert((
+            ir.id,
+            val,
+            prop_name.to_owned(),
+            stack_fingerprint(call_stack),
+        ))
     {
         return false;
     }
@@ -2155,8 +2200,14 @@ fn collect_object_alloc_props(
                 ..
             } => {
                 let resolved_inner = if let Some(inner_name) = prop_key_static_name(inner_key)
-                    && let Some(inner_props) = resolve_local_object_property(
-                        ir, *inner_obj, inner_name, call_stack, search.ctx,
+                    && let Some(inner_props) = resolve_local_object_property_with_visited(
+                        ir,
+                        *inner_obj,
+                        inner_name,
+                        call_stack,
+                        depth + 1,
+                        search.ctx,
+                        search.visited,
                     ) {
                     if !inner_props.is_exhaustive {
                         search.out.is_exhaustive = false;

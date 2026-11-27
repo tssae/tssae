@@ -6,7 +6,12 @@ import { describe, it } from "node:test";
 import { promisify } from "node:util";
 
 import { linkNodeModulesPackage, withTempHost } from "@tssae/test-hosts";
-import { isSameInstance, openProject, type SyntaxRef } from "tssae";
+import {
+  defineSummaries,
+  isSameInstance,
+  openProject,
+  type SyntaxRef,
+} from "tssae";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -1109,6 +1114,367 @@ void describe("tssae first-party implementation resolution", () => {
 
           const [callees] = await ctx.calleesOf([resolvedTrigger.call]);
           assert.ok(callees);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("completes binary-recursive methods and deep closure-capturing helper chains in instanceCleanup under 500ms", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/cleanup-recursion.ts": [
+            "class Disposable {",
+            "  dispose(): void {}",
+            "}",
+            "class DisposableStore {",
+            "  add<T extends Disposable>(item: T): T { return item; }",
+            "  dispose(): void {}",
+            "}",
+            "class HelperWrapper {",
+            "  constructor(readonly inner: HelperWrapper | null) {}",
+            "}",
+            "class Sash {",
+            "  onPointerStart(depth: number, factory: HelperWrapper): void {",
+            "    if (depth <= 0) { return; }",
+            "    this.onPointerStart(depth - 1, new HelperWrapper(factory));",
+            "    this.onPointerStart(depth - 1, new HelperWrapper(factory));",
+            "  }",
+            "}",
+            "function invokeCb(cb: () => void): void { cb(); }",
+            "export function runBinaryAndDeepClosure(): void {",
+            "  const cleaned = new Disposable();",
+            "  const leaked = new Disposable();",
+            "  const rootStore = new DisposableStore();",
+            "  const sash = new Sash();",
+            "  sash.onPointerStart(12, new HelperWrapper(null));",
+            "  const step1 = (): void => { step2(); };",
+            "  const step2 = (): void => { step3(); };",
+            "  const step3 = (): void => { step4(); };",
+            "  const step4 = (): void => { step5(); };",
+            "  const step5 = (): void => { step6(); };",
+            "  const step6 = (): void => { step7(); };",
+            "  const step7 = (): void => { step8(); };",
+            "  const step8 = (): void => { step9(); };",
+            "  const step9 = (): void => { step10(); };",
+            "  const step10 = (): void => {",
+            "    invokeCb(() => {",
+            "      rootStore.add(cleaned);",
+            "    });",
+            "  };",
+            "  step1();",
+            "  rootStore.dispose();",
+            "  void leaked;",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: {
+            packs: [
+              defineSummaries({
+                id: "cleanup-recursion-pack",
+                entries: [
+                  {
+                    match: {
+                      module: "src/cleanup-recursion.ts",
+                      memberPath: ["Disposable", "prototype", "dispose"],
+                    },
+                    effects: {
+                      completeness: "complete",
+                      resourceOps: [
+                        { kind: "disposes-target", target: "receiver" },
+                      ],
+                    },
+                  },
+                  {
+                    match: {
+                      module: "src/cleanup-recursion.ts",
+                      memberPath: ["DisposableStore", "prototype", "dispose"],
+                    },
+                    effects: {
+                      completeness: "complete",
+                      resourceOps: [
+                        { kind: "disposes-target", target: "receiver" },
+                      ],
+                    },
+                  },
+                  {
+                    match: {
+                      module: "src/cleanup-recursion.ts",
+                      memberPath: ["DisposableStore", "prototype", "add"],
+                    },
+                    effects: {
+                      completeness: "complete",
+                      resourceOps: [
+                        {
+                          kind: "registers-into-container",
+                          item: { argIndex: 0 },
+                          container: "receiver",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/cleanup-recursion.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runFn = fns.find((f) =>
+            f.text.includes("function runBinaryAndDeepClosure"),
+          );
+          const news = await ctx.findSyntax({
+            files: ["src/cleanup-recursion.ts"],
+            kinds: ["NewExpression"],
+          });
+          const disps = news.filter((n) => n.text === "new Disposable()");
+          assert.ok(runFn);
+          assert.equal(disps.length, 2);
+
+          const instRows = await ctx.resolveInstances(disps.map((d) => d.ref));
+          const targets = instRows.map((r) => {
+            assert.ok(r.status === "proved" && r.instance);
+            return r.instance;
+          });
+
+          const startMs = Date.now();
+          const [cleanup] = await ctx.instanceCleanup({
+            scopes: [runFn.ref],
+            targets,
+          });
+          const elapsedMs = Date.now() - startMs;
+
+          assert.ok(
+            elapsedMs < 500,
+            `expected fast instanceCleanup on binary recursion + deep closure chain, took ${elapsedMs}ms`,
+          );
+          assert.equal(cleanup?.targetResults[0]?.status, "proved");
+          assert.equal(
+            cleanup?.targetResults[1]?.status,
+            "disproved",
+            `unexpected targetResults[1]: ${JSON.stringify(cleanup?.targetResults[1])}`,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("resolves cross-file destructured IIFE exports for both calleesOf and callersOf", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/dom.ts": [
+            "export const { getWindow, getWindowById } = (function () {",
+            "  return {",
+            "    getWindow() {",
+            "      return 1;",
+            "    },",
+            "    getWindowById() {",
+            "      return 2;",
+            "    },",
+            "  };",
+            "})();",
+            "",
+          ].join("\n"),
+          "src/consumer.ts": [
+            "import { getWindow } from './dom.js';",
+            "import * as ns from './dom.js';",
+            "",
+            "export function runDomCalls(): number {",
+            "  return getWindow() + ns.getWindowById();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const calls = await ctx.findSyntax({
+            files: ["src/consumer.ts"],
+            kinds: ["CallExpression"],
+          });
+          const directCall = calls.find((c) => c.text === "getWindow()");
+          const nsCall = calls.find((c) => c.text === "ns.getWindowById()");
+          assert.ok(directCall && nsCall);
+
+          const callRows = await ctx.resolveCalls([directCall.ref, nsCall.ref]);
+          const callRefs = callRows.map((r) => {
+            assert.ok(r.call);
+            return r.call;
+          });
+          const callees = await ctx.calleesOf(callRefs);
+          assert.equal(callees.length, 2);
+          for (const row of callees) {
+            assert.equal(row.completeness, "complete");
+            assert.equal(row.resolvedTargets.length, 1);
+            assert.equal(row.resolvedTargets[0]?.location?.file, "src/dom.ts");
+            assert.ok((row.resolvedTargets[0]?.location?.line ?? 0) >= 3);
+          }
+
+          const domMethods = await ctx.findSyntax({
+            files: ["src/dom.ts"],
+            kinds: ["MethodDeclaration"],
+          });
+          const getWinMethod = domMethods.find((m) =>
+            m.text.startsWith("getWindow()"),
+          );
+          const getWinByIdMethod = domMethods.find((m) =>
+            m.text.startsWith("getWindowById()"),
+          );
+          assert.ok(getWinMethod && getWinByIdMethod);
+
+          const declRows = await ctx.resolveDeclarations([
+            getWinMethod.ref,
+            getWinByIdMethod.ref,
+          ]);
+          const declRefs = declRows.map((r) => {
+            assert.ok(r.declaration);
+            return r.declaration;
+          });
+          const callersRows = await ctx.callersOf(declRefs);
+          assert.equal(callersRows.length, 2);
+          assert.equal(callersRows[0]?.completeness, "complete");
+          assert.equal(callersRows[0]?.callSites.length, 1);
+          assert.equal(callersRows[1]?.completeness, "complete");
+          assert.equal(callersRows[1]?.callSites.length, 1);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("lowers class member and parameter decorators for callersOf and calleesOf", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              experimentalDecorators: true,
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/decorators.ts": [
+            "function throttle(_delay: number) {",
+            "  return function (_target: object, _key: string, _desc: PropertyDescriptor): void {};",
+            "}",
+            "function inject(_token: string) {",
+            "  return function (_target: object, _key: string | symbol | undefined, _index: number): void {};",
+            "}",
+            "export class Service {",
+            "  @throttle(100)",
+            "  report(@inject('x') p: number): number {",
+            "    return p;",
+            "  }",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/decorators.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const throttleFn = fns.find((f) =>
+            f.text.includes("function throttle("),
+          );
+          const injectFn = fns.find((f) => f.text.includes("function inject("));
+          assert.ok(throttleFn && injectFn);
+
+          const [throttleDecl, injectDecl] = await ctx.resolveDeclarations([
+            throttleFn.ref,
+            injectFn.ref,
+          ]);
+          assert.ok(throttleDecl?.declaration && injectDecl?.declaration);
+
+          const [throttleCallers, injectCallers] = await ctx.callersOf([
+            throttleDecl.declaration,
+            injectDecl.declaration,
+          ]);
+          assert.equal(throttleCallers?.completeness, "complete");
+          assert.equal(throttleCallers?.callSites.length, 1);
+          assert.equal(injectCallers?.completeness, "complete");
+          assert.equal(injectCallers?.callSites.length, 1);
+
+          const calls = await ctx.findSyntax({
+            files: ["src/decorators.ts"],
+            kinds: ["CallExpression"],
+          });
+          const throttleCall = calls.find((c) => c.text === "throttle(100)");
+          const injectCall = calls.find((c) => c.text === "inject('x')");
+          assert.ok(throttleCall && injectCall);
+
+          const [resolvedThrottleCall, resolvedInjectCall] =
+            await ctx.resolveCalls([throttleCall.ref, injectCall.ref]);
+          assert.ok(resolvedThrottleCall?.call && resolvedInjectCall?.call);
+
+          const [throttleCallees, injectCallees] = await ctx.calleesOf([
+            resolvedThrottleCall.call,
+            resolvedInjectCall.call,
+          ]);
+          assert.equal(throttleCallees?.completeness, "complete");
+          assert.equal(throttleCallees?.resolvedTargets.length, 1);
+          assert.equal(throttleCallees?.resolvedTargets[0]?.name, "throttle");
+          assert.equal(injectCallees?.completeness, "complete");
+          assert.equal(injectCallees?.resolvedTargets.length, 1);
+          assert.equal(injectCallees?.resolvedTargets[0]?.name, "inject");
         } finally {
           await session.close();
         }

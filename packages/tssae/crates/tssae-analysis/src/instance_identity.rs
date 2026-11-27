@@ -588,10 +588,18 @@ impl<'a> IrInstanceResolver<'a> {
             return self.resolve_parameter(ir, param_idx, &[], 0, active);
         }
 
-        if let Some(binding) = ir.bindings.iter().find(|b| b.syntax == target.syntax) {
+        if let Some(binding) = ir.bindings.iter().find(|b| {
+            b.syntax == target.syntax
+                || self
+                    .semantic
+                    .resolve_declaration(b.syntax)
+                    .and_then(|d| d.primary_syntax)
+                    == Some(target.syntax)
+        }) {
             let anchor_v = ir
                 .syntax_to_vertex
                 .get(&target.syntax)
+                .or_else(|| ir.syntax_to_vertex.get(&binding.syntax))
                 .copied()
                 .unwrap_or(ir.normal_exit);
             return self.trace_local_binding(ir, binding.id, anchor_v, &[], 0, active);

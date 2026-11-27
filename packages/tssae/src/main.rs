@@ -1,13 +1,11 @@
-mod call_effects;
-mod calls_values;
-mod cfg;
 mod comments;
-mod instance_identity;
-mod native_adapter;
+mod ir_calls;
+mod ir_effects;
+mod ir_impls;
+mod ir_instances;
+mod ir_values;
 mod observe;
-mod package_impl;
 mod projection;
-mod projects;
 mod serve;
 
 use std::{env, ffi::OsString, process::ExitCode, thread};

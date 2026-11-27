@@ -5,28 +5,18 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tssae-adapter-api = { path = "../adapter-api" }
+tssae-common = { path = "crates/tssae-common" }
+tssae-analysis = { path = "crates/tssae-analysis" }
+tssae-tsrs-boundary = { path = "crates/tssae-tsrs-boundary" }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsrs_api = "=7.1.0-beta.tsrs4"
-tsrs_ast = "=7.1.0-beta.tsrs4"
-tsrs_binder = "=7.1.0-beta.tsrs4"
-tsrs_checker = "=7.1.0-beta.tsrs4"
-tsrs_compiler = "=7.1.0-beta.tsrs4"
-tsrs_core = "=7.1.0-beta.tsrs4"
-tsrs_diagnostics = "=7.1.0-beta.tsrs4"
-tsrs_module = "=7.1.0-beta.tsrs4"
-tsrs_parser = "=7.1.0-beta.tsrs4"
-tsrs_project = "=7.1.0-beta.tsrs4"
-tsrs_scanner = "=7.1.0-beta.tsrs4"
-tsrs_vfs = "=7.1.0-beta.tsrs4"
 
 [lints]
 workspace = true
 
 [workspace]
-members = ["."]
+members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.lints.rust]

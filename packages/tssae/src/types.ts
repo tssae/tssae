@@ -10,10 +10,8 @@ import type {
 import type {
   CallEffectsOptions,
   CallEffectsResult,
-  CleanupModelOperation,
   InstanceCleanupOptions,
   InstanceCleanupScopeResult,
-  LifecycleEventBehavior,
 } from "./call-effects.ts";
 import type {
   CallTargetsResult,
@@ -22,13 +20,6 @@ import type {
   ValuePropagationResult,
 } from "./calls-values.ts";
 import type {
-  ConfiguredAdapter,
-  FactQueryOptions,
-  FactResult,
-  FactType,
-} from "./facts.ts";
-import type {
-  InstanceModelBehavior,
   InstanceProjectionSelection,
   InstanceResolutionResult,
   InstanceTargetRef,
@@ -54,54 +45,40 @@ import type {
   SyntaxLookupSelection,
   TypeProjectionSelection,
 } from "./projection.ts";
+import type {
+  SummaryConflictDetails,
+  SummaryDiscoverySource,
+  SummaryOptions,
+} from "./summaries.ts";
 
 export type TssaeErrorCode =
   | "INVALID_CONFIG"
   | "PROJECT_LOAD_ERROR"
-  | "FACT_CONFLICT"
+  | "SUMMARY_CONFLICT"
   | "STALE_REFERENCE"
   | "CROSS_PROJECT_REFERENCE"
   | "STALE_SNAPSHOT"
   | "SESSION_CLOSED"
-  | "NATIVE_ADAPTER_LOAD"
-  | "NATIVE_ADAPTER_EXTRACT"
   | "ENGINE_ERROR"
   | "INVALID_QUERY";
 
-export type FactConflictParty = {
-  readonly providerId: string;
-  readonly providers: readonly string[];
-  readonly conclusion: unknown;
-  readonly conclusionSummary: string;
-  readonly evidence: readonly Evidence[];
-};
-
-export type FactConflictDetails = {
-  readonly factTypeId: string;
-  readonly projectId: string;
-  readonly snapshotId: number;
-  readonly subjectHandleId: string;
-  readonly subjectLocation?: DiagnosticLocation;
-  readonly condition?: unknown;
-  readonly reason: string;
-  readonly parties: readonly [FactConflictParty, FactConflictParty];
-};
-
-/** Execution failure raised when project configuration, loading, queries, or adapters fail. */
+/** Execution failure raised when project configuration, loading, or queries fail. */
 export class TssaeError extends Error {
   readonly code: TssaeErrorCode;
-  readonly conflict?: FactConflictDetails;
+  readonly summaryConflict?: SummaryConflictDetails;
 
   constructor(
     code: TssaeErrorCode,
     message: string,
-    options?: ErrorOptions & { readonly conflict?: FactConflictDetails },
+    options?: ErrorOptions & {
+      readonly summaryConflict?: SummaryConflictDetails;
+    },
   ) {
     super(message, options);
     this.name = "TssaeError";
     this.code = code;
-    if (options?.conflict !== undefined) {
-      this.conflict = options.conflict;
+    if (options?.summaryConflict !== undefined) {
+      this.summaryConflict = options.summaryConflict;
     }
   }
 }
@@ -130,6 +107,7 @@ export type SyntaxKind =
   | "Identifier"
   | "CallExpression"
   | "NewExpression"
+  | "TaggedTemplateExpression"
   | "ReturnStatement"
   | "VariableDeclaration"
   | "BinaryExpression"
@@ -233,10 +211,11 @@ export type DiagnosticLocation = {
 };
 
 export type Evidence = {
-  readonly kind: "source" | "type" | "note" | "model";
+  readonly kind: "source" | "type" | "note" | "summary";
   readonly message: string;
   readonly at?: DiagnosticLocation;
-  readonly modelId?: string;
+  readonly summaryId?: string;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly declaration?: string;
 };
 
@@ -282,72 +261,14 @@ export type SourceFileOrigin = {
   readonly projects: readonly SourceFileProjectOrigin[];
 };
 
-export type Model = {
-  readonly id: string;
-  readonly version?: string;
-  readonly description?: string;
-  readonly facts?: Readonly<Record<string, unknown>>;
-  readonly instanceBehaviors?: readonly InstanceModelBehavior[];
-  readonly cleanupOperations?: readonly CleanupModelOperation[];
-  readonly lifecycleEvents?: readonly LifecycleEventBehavior[];
-};
-
-export type EngineProviderExtractionStats = {
-  readonly extractions: number;
-  readonly candidates: number;
-};
-
-/** Native adapter state returned by the active engine snapshot registry. */
-export type NativeAdapterObservation = {
-  /** The package name configured by the project. */
-  readonly packageName: string;
-  /** Provider ID declared by the loaded adapter manifest. */
-  readonly providerId: string;
-  /** `reused` means the snapshot update retained the existing loaded library. */
-  readonly status: "loaded" | "reused";
-};
-
 export type ExplainCleanupPath = {
   readonly instanceKey: string;
   readonly allocationLocation?: DiagnosticLocation;
   readonly scopeLocation: DiagnosticLocation;
   readonly cleanupLocations: readonly DiagnosticLocation[];
-  readonly modelIds: readonly string[];
+  readonly summaryIds: readonly string[];
   readonly summary: string;
   readonly evidence: readonly Evidence[];
-};
-
-export type ExplainGapResolutionStatus = "unresolved" | "resolved_by_override";
-
-export type ExplainGapResolution = {
-  readonly providerId: string;
-  readonly operation: string;
-  readonly conclusion: string;
-  readonly at?: DiagnosticLocation;
-};
-
-export type ExplainLocalGap = {
-  readonly status: ExplainGapResolutionStatus;
-  readonly factTypeId: string;
-  readonly providerId: string;
-  readonly field?: string;
-  readonly gap: Gap;
-  readonly subjectLocation?: DiagnosticLocation;
-  readonly resolvedBy?: ExplainGapResolution;
-  readonly impact?: string;
-};
-
-export type ExplainProviderEvaluationStatus =
-  | "evaluated"
-  | "reused"
-  | "skipped";
-
-export type ExplainProviderEvaluation = {
-  readonly providerId: string;
-  readonly factTypeId?: string;
-  readonly status: ExplainProviderEvaluationStatus;
-  readonly reason?: string;
-  readonly subjectLocation?: DiagnosticLocation;
 };
 
 export type SourceRange = {
@@ -407,8 +328,6 @@ export type TypeAtResult = {
 /** Typed query context bound to one opened project and active snapshot. */
 export type ProjectContext = {
   readonly project: ProjectSummary;
-  readonly models: readonly Model[];
-  getModel: (id: string) => Model | undefined;
   findSyntax: (
     options: FindSyntaxOptions,
   ) => Promise<readonly SyntaxNodeResult[]>;
@@ -483,21 +402,16 @@ export type ProjectContext = {
   instanceCleanup: (
     options: InstanceCleanupOptions,
   ) => Promise<readonly InstanceCleanupScopeResult[]>;
-  facts: <SubjectKind extends ProgramObjectKind, Condition, Value>(
-    factType: FactType<SubjectKind, Condition, Value>,
-    options?: FactQueryOptions<NoInfer<SubjectKind>, NoInfer<Condition>>,
-  ) => Promise<readonly FactResult<SubjectKind, Value>[]>;
+  /** Reports domain-level information gaps to the active `QueryObserver.onGaps` hook. */
+  recordGaps: (gaps: readonly Gap[]) => void;
 };
 
 export type OpenProjectOptions = {
   readonly cwd: string;
   readonly tsconfig?: string;
   readonly projects?: readonly string[];
-  readonly models?: readonly Model[];
-  readonly adapters?: readonly ConfiguredAdapter[];
+  readonly summaries?: SummaryOptions;
   readonly additionalInputs?: readonly string[];
-  /** Directory used to resolve adapter package names; defaults to `cwd`. */
-  readonly adapterResolutionRoot?: string;
   readonly observe?: ObserveMode | ObserveOptions;
   readonly onRpcMetrics?: (metrics: EngineCallIoMetrics) => void;
 };
@@ -520,9 +434,7 @@ export type SessionUpdateOptions = {
   readonly changed?: readonly string[];
   readonly created?: readonly string[];
   readonly deleted?: readonly string[];
-  readonly adapterResolutionRoot?: string;
-  readonly models?: readonly Model[];
-  readonly adapters?: readonly ConfiguredAdapter[];
+  readonly summaries?: SummaryOptions;
   readonly entries?: readonly string[];
   readonly additionalInputs?: readonly string[];
   readonly observe?: ObserveMode | ObserveOptions;
@@ -580,7 +492,6 @@ export type ProjectSession = {
   readonly fileOrigins: readonly SourceFileOrigin[];
   readonly workspaceSourceFiles: readonly string[];
   readonly additionalInputs: readonly AdditionalInputEntry[];
-  readonly nativeAdapters: readonly NativeAdapterObservation[];
   readonly memory: MemoryStats;
   readonly projectContexts: readonly ProjectContext[];
   project: (

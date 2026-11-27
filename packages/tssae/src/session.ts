@@ -22,7 +22,6 @@ import {
 import {
   createCallEffectsCache,
   createCallEffectsQueries,
-  validateCleanupAndLifecycleModels,
 } from "./call-effects.ts";
 import {
   createCallsValuesCache,
@@ -35,24 +34,9 @@ import {
   summarizeSyntaxSnippet,
 } from "./evidence.ts";
 import {
-  FactCache,
-  executeFactQuery,
-  validateAdapters,
-  type AdapterContext,
-  type EngineFactExtractionOptions,
-  type EngineNativeSubQueryTrace,
-  type FactContribution,
-  type FactExplainTrace,
-  type FactQueryOptions,
-  type FactType,
-  type LibraryAdapter,
-} from "./facts.ts";
-import {
   createInstanceIdentityCache,
   createInstanceIdentityQueries,
-  validateInstanceBehaviors,
 } from "./instance-identity.ts";
-import { resolveNativeAdapterPackages } from "./native-adapters.ts";
 import {
   ObservationCollector,
   buildRpcRequestOptions,
@@ -66,19 +50,21 @@ import {
 import { createProjectionQueries, validateProgramRefs } from "./projection.ts";
 import { buildFileOrigins, resolveProjectEntries } from "./projects.ts";
 import {
+  discoverAndLoadSummaries,
+  normalizeSummaryOptions,
+  type NormalizedSummaryOptions,
+  type ResolvedPackageSummary,
+  type SummaryConfigPayload,
+} from "./summaries.ts";
+import {
   TssaeError,
   makeProgramRef,
   type CommentKind,
   type DiagnosticLocation,
-  type Evidence,
   type FindSyntaxOptions,
   type Gap,
   type MemoryStats,
-  type Model,
-  type NativeAdapterObservation,
   type OpenProjectOptions,
-  type ProgramObjectKind,
-  type ProgramRef,
   type ProjectContext,
   type ProjectContextOptions,
   type ProjectSession,
@@ -98,7 +84,7 @@ type EngineOpenResult = {
   readonly snapshotDigest: string;
   readonly projects: readonly ProjectSummary[];
   readonly workspaceSourceFiles: readonly string[];
-  readonly nativeAdapters: readonly NativeAdapterObservation[];
+  readonly resolvedPackages?: readonly ResolvedPackageSummary[];
   readonly engineRssBytes?: number;
 };
 
@@ -113,9 +99,7 @@ type EngineUpdateResult = EngineOpenResult & {
 type NormalizedSessionConfig = {
   readonly tsconfig?: string;
   readonly projects?: readonly string[];
-  readonly models: readonly Model[];
-  readonly adapters: readonly LibraryAdapter[];
-  readonly adapterPackages: readonly string[];
+  readonly summaries: NormalizedSummaryOptions;
   readonly additionalInputs: readonly string[];
 };
 
@@ -147,108 +131,14 @@ type EngineTypeItem = {
 type EngineBatchResult = {
   readonly results: readonly {
     readonly items: readonly unknown[];
-    readonly additionalInputs?: readonly string[];
-    readonly adapterInputs?: readonly {
-      readonly adapterId: string;
-      readonly path: string;
-    }[];
-    readonly subQueries?: readonly EngineNativeSubQueryTrace[];
   }[];
 };
-
-function registerModelProvenance(model: Model): Model {
-  const message =
-    typeof model.description === "string" && model.description.trim() !== ""
-      ? model.description
-      : `Project model "${model.id}"`;
-  return registerProvenance(model, [
-    {
-      kind: "model",
-      modelId: model.id,
-      message,
-    },
-  ]);
-}
-
-function validateModels(models: readonly Model[]): readonly Model[] {
-  const seen = new Set<string>();
-  for (const model of models) {
-    defineModel(model);
-    if (seen.has(model.id)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Duplicate model id: "${model.id}".`,
-      );
-    }
-    seen.add(model.id);
-  }
-  return [...models];
-}
-
-/** Validates a project model definition and attaches provenance metadata. */
-export function defineModel(model: Model): Model {
-  if (typeof model.id !== "string" || model.id.trim() === "") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      "Model id must be a non-empty string.",
-    );
-  }
-  if (model.version !== undefined && typeof model.version !== "string") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${model.id}" version must be a string when provided.`,
-    );
-  }
-  validateInstanceBehaviors(model.id, model.instanceBehaviors);
-  validateCleanupAndLifecycleModels(
-    model.id,
-    model.cleanupOperations,
-    model.lifecycleEvents,
-  );
-  return registerModelProvenance(model);
-}
-
-function validateAdapterPackageNames(
-  packageNames: readonly string[],
-): readonly string[] {
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const rawName of packageNames) {
-    if (typeof rawName !== "string" || rawName.trim() === "") {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        "Adapter package names must be non-empty strings.",
-      );
-    }
-    const packageName = rawName.trim();
-    if (seen.has(packageName)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Duplicate adapter package name: "${packageName}".`,
-      );
-    }
-    seen.add(packageName);
-    normalized.push(packageName);
-  }
-  return normalized;
-}
 
 function normalizeOpenOptions(
   options: OpenProjectOptions,
 ): NormalizedSessionConfig {
   resolveProjectEntries(options);
-  const models = validateModels(options.models ?? []);
-  const configuredAdapters = options.adapters ?? [];
-  const adapters = validateAdapters(
-    configuredAdapters.filter(
-      (adapter): adapter is LibraryAdapter => typeof adapter !== "string",
-    ),
-  );
-  const adapterPackages = validateAdapterPackageNames(
-    configuredAdapters.filter(
-      (adapter): adapter is string => typeof adapter === "string",
-    ),
-  );
+  const summaries = normalizeSummaryOptions(options.summaries);
   const additionalInputs = validateAdditionalInputPaths(
     options.additionalInputs,
   );
@@ -257,29 +147,9 @@ function normalizeOpenOptions(
     ...(options.projects !== undefined
       ? { projects: [...options.projects] }
       : {}),
-    models,
-    adapters,
-    adapterPackages,
+    summaries,
     additionalInputs,
   };
-}
-
-function combineConfiguredAdapters(
-  configuredAdapters: readonly LibraryAdapter[],
-  packageAdapters: readonly LibraryAdapter[],
-  packageNames: readonly string[],
-): readonly LibraryAdapter[] {
-  try {
-    return validateAdapters([...configuredAdapters, ...packageAdapters]);
-  } catch (error) {
-    if (packageNames.length === 0) throw error;
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Configured adapter package(s) ${packageNames.map((name) => `"${name}"`).join(", ")} could not be registered: ${detail}`,
-      { cause: error },
-    );
-  }
 }
 
 function stableSerialize(value: unknown): string {
@@ -295,34 +165,6 @@ function stableSerialize(value: unknown): string {
     .filter((key) => record[key] !== undefined)
     .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
     .join(",")}}`;
-}
-
-function summarizeAdapter(adapter: LibraryAdapter) {
-  return {
-    id: adapter.id,
-    version: adapter.version ?? null,
-    provides: adapter.provides
-      .map((provider) => provider.factType.id)
-      .toSorted(),
-  };
-}
-
-function summarizeModel(model: Model) {
-  return {
-    id: model.id,
-    version: model.version ?? null,
-    description: model.description ?? null,
-    facts: model.facts ?? null,
-    ...(model.instanceBehaviors !== undefined
-      ? { instanceBehaviors: model.instanceBehaviors }
-      : {}),
-    ...(model.cleanupOperations !== undefined
-      ? { cleanupOperations: model.cleanupOperations }
-      : {}),
-    ...(model.lifecycleEvents !== undefined
-      ? { lifecycleEvents: model.lifecycleEvents }
-      : {}),
-  };
 }
 
 function toSyntaxNodeResult(
@@ -462,23 +304,10 @@ function resolveNextConfig(
   current: NormalizedSessionConfig,
   options?: SessionUpdateOptions,
 ): NormalizedSessionConfig {
-  const models = options?.models
-    ? validateModels(options.models)
-    : current.models;
-  const adapters = options?.adapters
-    ? validateAdapters(
-        options.adapters.filter(
-          (adapter): adapter is LibraryAdapter => typeof adapter !== "string",
-        ),
-      )
-    : current.adapters;
-  const adapterPackages = options?.adapters
-    ? validateAdapterPackageNames(
-        options.adapters.filter(
-          (adapter): adapter is string => typeof adapter === "string",
-        ),
-      )
-    : current.adapterPackages;
+  const summaries =
+    options?.summaries !== undefined
+      ? normalizeSummaryOptions(options.summaries)
+      : current.summaries;
   const additionalInputs =
     options?.additionalInputs !== undefined
       ? validateAdditionalInputPaths(options.additionalInputs)
@@ -492,18 +321,14 @@ function resolveNextConfig(
     }
     return {
       projects: [...options.entries],
-      models,
-      adapters,
-      adapterPackages,
+      summaries,
       additionalInputs,
     };
   }
   return {
     ...(current.tsconfig !== undefined ? { tsconfig: current.tsconfig } : {}),
     ...(current.projects !== undefined ? { projects: current.projects } : {}),
-    models,
-    adapters,
-    adapterPackages,
+    summaries,
     additionalInputs,
   };
 }
@@ -531,36 +356,16 @@ function collectInvalidatedBy(
     reasons.push("entries");
   }
   if (
-    stableSerialize(prevConfig.models.map(summarizeModel)) !==
-    stableSerialize(nextConfig.models.map(summarizeModel))
-  ) {
-    reasons.push("models");
-  }
-  if (
     stableSerialize(prevConfig.additionalInputs) !==
     stableSerialize(nextConfig.additionalInputs)
   ) {
     reasons.push("additionalInputs");
   }
   if (
-    stableSerialize(
-      prevConfig.adapters
-        .map(summarizeAdapter)
-        .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
-    ) !==
-    stableSerialize(
-      nextConfig.adapters
-        .map(summarizeAdapter)
-        .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
-    )
+    stableSerialize(prevConfig.summaries) !==
+    stableSerialize(nextConfig.summaries)
   ) {
-    reasons.push("adapters");
-  }
-  if (
-    stableSerialize(prevConfig.adapterPackages) !==
-    stableSerialize(nextConfig.adapterPackages)
-  ) {
-    reasons.push("adapterPackages");
+    reasons.push("summaries");
   }
   return reasons;
 }
@@ -617,30 +422,41 @@ export async function openProject(
 ): Promise<ProjectSession> {
   let normalizedConfig = normalizeOpenOptions(options);
   const absCwd = resolve(options.cwd);
-  let adapterResolutionRoot = resolve(options.adapterResolutionRoot ?? absCwd);
-  let packageResolution = await resolveNativeAdapterPackages(
-    normalizedConfig.adapterPackages,
-    adapterResolutionRoot,
-  );
-  let activeAdapters = combineConfiguredAdapters(
-    normalizedConfig.adapters,
-    packageResolution.adapters,
-    normalizedConfig.adapterPackages,
-  );
   const initialEntries = resolveProjectEntries(normalizedConfig);
 
   const client = new EngineClient();
   let openResult: EngineOpenResult;
+  let currentSummaryPayload: SummaryConfigPayload;
+  let currentSummaryFiles: readonly {
+    readonly filePath: string;
+    readonly packId: string;
+  }[];
   try {
     openResult = await client.request<EngineOpenResult>(
       "snapshot.open",
       {
         cwd: absCwd,
         entries: initialEntries,
-        nativeAdapters: packageResolution.nativeAdapters,
       },
       buildRpcRequestOptions(options.observe, options.onRpcMetrics),
     );
+    const discovered = await discoverAndLoadSummaries({
+      cwd: absCwd,
+      projectConfigFiles: openResult.projects.map((p) => p.configFile),
+      resolvedPackages: openResult.resolvedPackages ?? [],
+      options: normalizedConfig.summaries,
+    });
+    currentSummaryPayload = discovered.payload;
+    currentSummaryFiles = discovered.registeredFiles;
+    if (
+      currentSummaryPayload.packs.length > 0 ||
+      !currentSummaryPayload.enableBuiltin
+    ) {
+      await client.request("snapshot.setSummaries", {
+        snapshotId: openResult.snapshotId,
+        summaries: currentSummaryPayload,
+      });
+    }
   } catch (err) {
     await client.close();
     throw err;
@@ -651,7 +467,6 @@ export async function openProject(
   let currentSnapshotDigest = openResult.snapshotDigest;
   let currentProjects = openResult.projects;
   let currentWorkspaceSourceFiles = openResult.workspaceSourceFiles;
-  let currentNativeAdapters = openResult.nativeAdapters;
   let currentFileOrigins = buildFileOrigins(openResult.projects);
   let lastEngineRssBytes = openResult.engineRssBytes;
   let closed = false;
@@ -666,7 +481,6 @@ export async function openProject(
   const callEffectsCache = createCallEffectsCache();
   const instanceCache = createInstanceIdentityCache();
   const packageImplCache = createPackageImplCache();
-  const factCache = new FactCache();
   const commentScanCache = new Map<
     string,
     Promise<readonly ScannedComment[]>
@@ -692,6 +506,10 @@ export async function openProject(
       readonly filePath: string;
       readonly source: AdditionalInputSource;
     }[],
+    summaryFiles: readonly {
+      readonly filePath: string;
+      readonly packId: string;
+    }[],
   ) {
     const registry = createAdditionalInputRegistry({ cwd: absCwd });
     for (const filePath of configInputs) {
@@ -703,6 +521,12 @@ export async function openProject(
     for (const item of dynamic) {
       registry.registerAdditionalInput(item.filePath, item.source);
     }
+    for (const item of summaryFiles) {
+      registry.registerAdditionalInput(item.filePath, {
+        kind: "summary",
+        id: item.packId,
+      });
+    }
     return registry;
   }
 
@@ -710,6 +534,7 @@ export async function openProject(
     normalizedConfig.additionalInputs,
     explicitRegistrations,
     dynamicRegistrations,
+    currentSummaryFiles,
   );
 
   const dynamicRegistrar: AdditionalInputRegistrar = {
@@ -738,7 +563,6 @@ export async function openProject(
   function createProjectContext(
     project: ProjectSummary,
     activeSnapshotId: number,
-    models: readonly Model[],
     contextOptions?: ProjectContextOptions,
   ): ProjectContext {
     const assertActiveSnapshot = (): void => {
@@ -763,12 +587,6 @@ export async function openProject(
         : {}),
       ...(observer?.onQueryCompleted !== undefined
         ? { onQueryCompleted: observer.onQueryCompleted }
-        : {}),
-      ...(observer?.onFactExplain !== undefined
-        ? { onFactExplain: observer.onFactExplain }
-        : {}),
-      ...(observer?.onProviderEvaluation !== undefined
-        ? { onProviderEvaluation: observer.onProviderEvaluation }
         : {}),
     });
     const getRpcOptions = () =>
@@ -835,7 +653,6 @@ export async function openProject(
     const instanceQueries = createInstanceIdentityQueries({
       client,
       cache: instanceCache,
-      models,
       sessionToken,
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
@@ -850,7 +667,6 @@ export async function openProject(
     const callEffectsQueries = createCallEffectsQueries({
       client,
       cache: callEffectsCache,
-      models,
       sessionToken,
       snapshotId: activeSnapshotId,
       projectId: project.projectId,
@@ -877,54 +693,6 @@ export async function openProject(
       recordGaps,
       getRpcOptions,
       ...(collector.isActive() ? { onQueryCompleted: recordQueryEvent } : {}),
-    });
-
-    const adapterProjectionQueries = createProjectionQueries({
-      client,
-      sessionToken,
-      snapshotId: activeSnapshotId,
-      projectId: project.projectId,
-      assertOpen: assertActiveSnapshot,
-      recordGaps: () => {},
-      getRpcOptions,
-    });
-
-    const adapterCallsValuesQueries = createCallsValuesQueries({
-      client,
-      cache: callsValuesCache,
-      sessionToken,
-      snapshotId: activeSnapshotId,
-      projectId: project.projectId,
-      cwd: absCwd,
-      sourceFiles: project.sourceFiles,
-      assertOpen: assertActiveSnapshot,
-      recordGaps: () => {},
-      getRpcOptions,
-    });
-
-    const adapterCallEffectsQueries = createCallEffectsQueries({
-      client,
-      cache: callEffectsCache,
-      models,
-      sessionToken,
-      snapshotId: activeSnapshotId,
-      projectId: project.projectId,
-      cwd: absCwd,
-      sourceFiles: project.sourceFiles,
-      assertOpen: assertActiveSnapshot,
-      recordGaps: () => {},
-      getRpcOptions,
-    });
-
-    const adapterPackageImplQueries = createPackageImplQueries({
-      client,
-      cache: packageImplCache,
-      sessionToken,
-      snapshotId: activeSnapshotId,
-      projectId: project.projectId,
-      assertOpen: assertActiveSnapshot,
-      recordGaps: () => {},
-      getRpcOptions,
     });
 
     const runFindSyntax = async (
@@ -1329,7 +1097,12 @@ export async function openProject(
         }
         const mapped = toBranchCoverageItem(raw, targetRef);
         if (recordRuleQuery) {
-          recordGaps(mapped.gaps);
+          if (mapped.status === "inconclusive") {
+            recordGaps(mapped.gaps);
+          }
+          if (mapped.implicitExceptions.status === "inconclusive") {
+            recordGaps(mapped.implicitExceptions.gaps);
+          }
         }
         results.push(mapped);
       }
@@ -1349,169 +1122,8 @@ export async function openProject(
       return results;
     };
 
-    const createAdapterContext = (
-      adapterId: string,
-      onAdditionalInput: (filePath: string, sourceAdapterId?: string) => void,
-      facts: ProjectContext["facts"],
-      onEngineSubQuery: (trace: EngineNativeSubQueryTrace) => void,
-    ): AdapterContext => {
-      const scopedAdapterInputs = createScopedAdditionalInputRegistrar(
-        dynamicRegistrar,
-        { kind: "adapter", id: adapterId },
-      );
-      return {
-        project,
-        models,
-        getModel: (id: string) => models.find((model) => model.id === id),
-        ...adapterProjectionQueries,
-        ...adapterCallsValuesQueries,
-        ...adapterPackageImplQueries,
-        ...adapterCallEffectsQueries,
-        facts,
-        findSyntax: (query: FindSyntaxOptions) => runFindSyntax(query, false),
-        typeAt: (targets: readonly SyntaxRef[]) => runTypeAt(targets, false),
-        listBranches: (functions: readonly SyntaxRef[]) =>
-          runListBranches(functions, false),
-        branchCoverage: (query: BranchCoverageOptions) =>
-          runBranchCoverage(query, false),
-        extractEngineFacts: async <
-          SubjectKind extends ProgramObjectKind,
-          Condition = unknown,
-          Value = unknown,
-        >(
-          extractOptions: EngineFactExtractionOptions<SubjectKind, Condition>,
-        ): Promise<readonly FactContribution<SubjectKind, Value>[]> => {
-          assertActiveSnapshot();
-          if (extractOptions.targets !== undefined) {
-            if (extractOptions.targets.length === 0) {
-              return [];
-            }
-            validateProgramRefs(
-              extractOptions.targets,
-              sessionToken,
-              activeSnapshotId,
-              project.projectId,
-            );
-          }
-
-          const explainMode =
-            extractOptions.explain ?? collector.isExplainEnabled();
-          const batch = await client.request<EngineBatchResult>(
-            "query.batch",
-            {
-              snapshotId: activeSnapshotId,
-              projectId: project.projectId,
-              steps: [
-                {
-                  op: "extractFacts",
-                  factTypeId: extractOptions.factTypeId,
-                  providerId: extractOptions.providerId,
-                  ...(extractOptions.reportProviderId !== undefined
-                    ? { reportProviderId: extractOptions.reportProviderId }
-                    : {}),
-                  ...(extractOptions.targets !== undefined
-                    ? {
-                        targets: extractOptions.targets.map(
-                          (target) => target.handleId,
-                        ),
-                      }
-                    : {}),
-                  ...(extractOptions.condition !== undefined
-                    ? { condition: extractOptions.condition }
-                    : {}),
-                  ...(explainMode ? { explain: true } : {}),
-                },
-              ],
-            },
-            getRpcOptions(),
-          );
-
-          const rawItems = (batch.results[0]?.items ?? []) as readonly {
-            readonly subject: string;
-            readonly subjectLocation?: DiagnosticLocation;
-            readonly value: Value;
-            readonly evidence?: readonly Evidence[];
-            readonly gaps?: readonly Gap[];
-            readonly explainTrace?: FactExplainTrace;
-          }[];
-          const additionalInputs = batch.results[0]?.additionalInputs ?? [];
-          const adapterInputs = batch.results[0]?.adapterInputs ?? [];
-          const attributedPaths = new Set<string>();
-          for (const entry of adapterInputs) {
-            const attributedId =
-              entry.adapterId === extractOptions.providerId
-                ? (extractOptions.reportProviderId ?? entry.adapterId)
-                : entry.adapterId;
-            attributedPaths.add(entry.path);
-            onAdditionalInput(entry.path, attributedId);
-            dynamicRegistrar.registerAdditionalInput(entry.path, {
-              kind: "adapter",
-              id: attributedId,
-            });
-          }
-          for (const filePath of additionalInputs) {
-            if (!attributedPaths.has(filePath)) {
-              onAdditionalInput(filePath);
-              scopedAdapterInputs.registerAdditionalInput(filePath);
-            }
-          }
-          for (const subQuery of batch.results[0]?.subQueries ?? []) {
-            onEngineSubQuery(subQuery);
-          }
-
-          return rawItems.map((item) => {
-            const ref = makeProgramRef(
-              "syntax",
-              sessionToken,
-              project.projectId,
-              activeSnapshotId,
-              item.subject,
-            );
-            if (item.subjectLocation !== undefined) {
-              syntaxLocations.set(ref, item.subjectLocation);
-              recordSyntaxLocation(ref, item.subjectLocation);
-            }
-            return {
-              subject: ref as unknown as ProgramRef<SubjectKind>,
-              value: item.value,
-              ...(item.evidence !== undefined
-                ? { evidence: item.evidence }
-                : {}),
-              ...(item.gaps !== undefined ? { gaps: item.gaps } : {}),
-              ...(item.explainTrace !== undefined
-                ? { explainTrace: item.explainTrace }
-                : {}),
-            };
-          });
-        },
-        registerAdditionalInput: (filePath: string) => {
-          assertActiveSnapshot();
-          onAdditionalInput(filePath);
-          return scopedAdapterInputs.registerAdditionalInput(filePath);
-        },
-        readAdditionalInput: (filePath: string) => {
-          assertActiveSnapshot();
-          onAdditionalInput(filePath);
-          return scopedAdapterInputs.readAdditionalInput(filePath);
-        },
-      };
-    };
-
-    const replayAdapterAdditionalInput = (
-      adapterId: string,
-      filePath: string,
-    ): void => {
-      assertActiveSnapshot();
-      dynamicRegistrar.registerAdditionalInput(filePath, {
-        kind: "adapter",
-        id: adapterId,
-      });
-    };
-
     return {
       project,
-      models,
-      getModel: (id: string) => models.find((model) => model.id === id),
       ...projectionQueries,
       ...callsValuesQueries,
       ...callEffectsQueries,
@@ -1523,25 +1135,6 @@ export async function openProject(
         runListBranches(functions, true),
       branchCoverage: (query: BranchCoverageOptions) =>
         runBranchCoverage(query, true),
-      facts: <SubjectKind extends ProgramObjectKind, Condition, Value>(
-        factType: FactType<SubjectKind, Condition, Value>,
-        factOptions?: FactQueryOptions<SubjectKind, Condition>,
-      ) =>
-        executeFactQuery({
-          factType,
-          options: factOptions,
-          adapters: activeAdapters,
-          factCache,
-          sessionToken,
-          snapshotId: activeSnapshotId,
-          projectId: project.projectId,
-          assertActiveSnapshot,
-          createAdapterContext,
-          replayAdapterAdditionalInput,
-          recordGaps,
-          collector,
-          syntaxLocations,
-        }),
       registerAdditionalInput: (filePath: string) => {
         assertActiveSnapshot();
         return scopedInputs.registerAdditionalInput(filePath);
@@ -1549,6 +1142,10 @@ export async function openProject(
       readAdditionalInput: (filePath: string) => {
         assertActiveSnapshot();
         return scopedInputs.readAdditionalInput(filePath);
+      },
+      recordGaps: (gaps: readonly Gap[]) => {
+        assertActiveSnapshot();
+        recordGaps(gaps);
       },
     };
   }
@@ -1602,7 +1199,6 @@ export async function openProject(
     callEffectsCache.clear();
     instanceCache.clear();
     packageImplCache.clear();
-    factCache.clear();
     commentScanCache.clear();
     try {
       await client.request("snapshot.release", {
@@ -1634,20 +1230,13 @@ export async function openProject(
     get additionalInputs(): readonly AdditionalInputEntry[] {
       return sessionRegistry.listAdditionalInputs();
     },
-    get nativeAdapters(): readonly NativeAdapterObservation[] {
-      return currentNativeAdapters;
-    },
     get memory() {
       return readMemoryStats(lastEngineRssBytes);
     },
     get projectContexts(): readonly ProjectContext[] {
       assertOpen();
       return currentProjects.map((project) =>
-        createProjectContext(
-          project,
-          currentSnapshotId,
-          normalizedConfig.models,
-        ),
+        createProjectContext(project, currentSnapshotId),
       );
     },
     project: (
@@ -1655,12 +1244,7 @@ export async function openProject(
       contextOptions?: ProjectContextOptions,
     ): ProjectContext => {
       const resolved = resolveProjectTarget(target);
-      return createProjectContext(
-        resolved,
-        currentSnapshotId,
-        normalizedConfig.models,
-        contextOptions,
-      );
+      return createProjectContext(resolved, currentSnapshotId, contextOptions);
     },
     scanComments: async (
       scanOptions?: ScanCommentsOptions,
@@ -1708,27 +1292,6 @@ export async function openProject(
       assertOpen();
       const changedAdditionalFiles = sessionRegistry.refresh();
       const nextConfig = resolveNextConfig(normalizedConfig, updateOptions);
-      const nextAdapterResolutionRoot = resolve(
-        updateOptions?.adapterResolutionRoot ?? adapterResolutionRoot,
-      );
-      const adapterPackagesChanged =
-        nextAdapterResolutionRoot !== adapterResolutionRoot ||
-        stableSerialize(nextConfig.adapterPackages) !==
-          stableSerialize(normalizedConfig.adapterPackages);
-      const nextPackageResolution = adapterPackagesChanged
-        ? await resolveNativeAdapterPackages(
-            nextConfig.adapterPackages,
-            nextAdapterResolutionRoot,
-          )
-        : packageResolution;
-      const nextActiveAdapters = combineConfiguredAdapters(
-        nextConfig.adapters,
-        nextPackageResolution.adapters,
-        nextConfig.adapterPackages,
-      );
-      const nativeAdapterSpecsChanged =
-        stableSerialize(nextPackageResolution.nativeAdapters) !==
-        stableSerialize(packageResolution.nativeAdapters);
       const nextEntries = resolveProjectEntries(nextConfig);
       const previousSnapshotId = currentSnapshotId;
 
@@ -1740,9 +1303,6 @@ export async function openProject(
           changed: updateOptions?.changed ?? [],
           created: updateOptions?.created ?? [],
           deleted: updateOptions?.deleted ?? [],
-          ...(nativeAdapterSpecsChanged
-            ? { nativeAdapters: nextPackageResolution.nativeAdapters }
-            : {}),
         },
         buildRpcRequestOptions(
           updateOptions?.observe,
@@ -1750,23 +1310,41 @@ export async function openProject(
         ),
       );
 
+      const discovered = await discoverAndLoadSummaries({
+        cwd: absCwd,
+        projectConfigFiles: updated.projects.map((p) => p.configFile),
+        resolvedPackages: updated.resolvedPackages ?? [],
+        options: nextConfig.summaries,
+      });
+      const summariesChanged =
+        stableSerialize(discovered.payload) !==
+        stableSerialize(currentSummaryPayload);
+      if (summariesChanged) {
+        await client.request("snapshot.setSummaries", {
+          snapshotId: updated.snapshotId,
+          summaries: discovered.payload,
+        });
+      }
+
       const invalidatedBy = collectInvalidatedBy(
         normalizedConfig,
         nextConfig,
         updateOptions,
         changedAdditionalFiles,
       );
+      const effectiveInvalidatedBy =
+        summariesChanged && !invalidatedBy.includes("summaries")
+          ? [...invalidatedBy, "summaries"]
+          : invalidatedBy;
       const updatedFileOrigins = buildFileOrigins(updated.projects);
 
       normalizedConfig = nextConfig;
-      adapterResolutionRoot = nextAdapterResolutionRoot;
-      packageResolution = nextPackageResolution;
-      activeAdapters = nextActiveAdapters;
+      currentSummaryPayload = discovered.payload;
+      currentSummaryFiles = discovered.registeredFiles;
       currentSnapshotId = updated.snapshotId;
       currentSnapshotDigest = updated.snapshotDigest;
       currentProjects = updated.projects;
       currentWorkspaceSourceFiles = updated.workspaceSourceFiles;
-      currentNativeAdapters = updated.nativeAdapters;
       currentFileOrigins = updatedFileOrigins;
       lastEngineRssBytes = updated.engineRssBytes;
       syntaxCache.clear();
@@ -1776,12 +1354,12 @@ export async function openProject(
       callEffectsCache.clear();
       instanceCache.clear();
       packageImplCache.clear();
-      factCache.clear();
       commentScanCache.clear();
       sessionRegistry = buildSessionRegistry(
         nextConfig.additionalInputs,
         explicitRegistrations,
         dynamicRegistrations,
+        currentSummaryFiles,
       );
       const updatedAdditionalInputs = sessionRegistry.listAdditionalInputs();
 
@@ -1791,7 +1369,7 @@ export async function openProject(
         recomputedFiles: updated.recomputedFiles,
         reusedFiles: updated.reusedFiles,
         removedFiles: updated.removedFiles,
-        invalidatedBy,
+        invalidatedBy: effectiveInvalidatedBy,
       };
 
       return {

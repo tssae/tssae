@@ -1,12 +1,10 @@
 import {
-  TssaeError,
   createAdditionalInputRegistry,
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
-  defineModel,
+  defineSummaries,
   isSameInstance,
+  extractBasisEvidence,
   openProject,
+  registerProvenance,
   type AdditionalInputEntry,
   type AdditionalInputRegistrar,
   type AdditionalInputSource,
@@ -14,45 +12,56 @@ import {
   type CallRef,
   type DeclarationRef,
   type ExplainCleanupPath,
-  type FactConflictDetails,
-  type FactConflictParty,
   type InstanceCleanupScopeResult,
   type InstanceRef,
+  type ProvenanceCarrier,
   type SignatureRef,
   type SyntaxRef,
   type TypeRef,
 } from "tssae";
 
-const extModel = defineModel({
-  id: "ext-model",
-  instanceBehaviors: [
+const extSummaries = defineSummaries({
+  id: "ext-summaries",
+  entries: [
     {
-      kind: "allocates-fresh-instance",
-      match: { container: "IMenuService", member: "createMenu" },
+      match: { memberPath: ["IMenuService", "prototype", "createMenu"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
     },
     {
-      kind: "forwards-argument",
-      match: { container: "Disposable", member: "_register" },
-      argumentIndex: 0,
-    },
-  ],
-  cleanupOperations: [
-    {
-      kind: "disposes-target",
-      match: { member: "dispose" },
-      target: "receiver",
+      match: { memberPath: ["Disposable", "prototype", "_register"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "forwards-instance", from: { argIndex: 0 } },
+      },
     },
     {
-      kind: "replaces-previous-value",
-      match: { container: "MutableDisposable", member: "value" },
-      target: "receiver",
+      match: { memberPath: ["dispose"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
     },
-  ],
-  lifecycleEvents: [
     {
-      kind: "lifecycle-end-callback",
-      match: { symbol: "onDidDisconnect" },
-      callbackArgumentIndex: 0,
+      match: { memberPath: ["MutableDisposable", "prototype", "value"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "replaces-previous-value", target: "receiver" }],
+      },
+    },
+    {
+      match: { memberPath: ["onDidDisconnect"] },
+      calls: {
+        completeness: "complete",
+        invokesCallbacks: [
+          {
+            callbackArgIndex: 0,
+            timing: "lifecycle-end",
+          },
+        ],
+      },
     },
   ],
 });
@@ -60,72 +69,33 @@ const extModel = defineModel({
 const registrar: AdditionalInputRegistrar = createAdditionalInputRegistry({
   cwd: "/tmp/workspace",
 });
-const adapterSource: AdditionalInputSource = {
-  kind: "adapter",
-  id: "demo-adapter",
+const ruleSource: AdditionalInputSource = {
+  kind: "rule",
+  id: "demo-rule",
 };
 const regEntry: AdditionalInputEntry = registrar.registerAdditionalInput(
   "allowed-packages.json",
-  adapterSource,
+  ruleSource,
 );
 void regEntry;
 
-const sampleFact = defineFactType<
-  "syntax",
-  { readonly strict?: boolean } | undefined,
-  readonly string[]
->({
-  id: "demo.sample-fact",
-  subjectKind: "syntax",
-  merge: (existing, incoming) => {
-    if (existing.value[0] === incoming.value[0]) {
-      return { ok: true, value: [...existing.value, ...incoming.value] };
-    }
-    return {
-      ok: false,
-      conflict: {
-        message: "Mismatched head tag",
-        existingConclusion: existing.value[0] ?? "none",
-        incomingConclusion: incoming.value[0] ?? "none",
-      },
-    };
-  },
-});
-
-function inspectConflict(
-  err: TssaeError,
-): readonly FactConflictParty[] | undefined {
-  const details: FactConflictDetails | undefined = err.conflict;
-  return details?.parties;
-}
-void inspectConflict;
-
-const sampleAdapter = defineAdapter({
-  id: "demo-adapter",
-  provides: [
-    defineFactProvider(sampleFact, async (ctx) => {
-      const adapterInput: AdditionalInputEntry = ctx.registerAdditionalInput(
-        "allowed-packages.json",
-      );
-      if (adapterInput.exists) {
-        const raw: string = ctx.readAdditionalInput("allowed-packages.json");
-        void raw;
-      }
-      const nodes = await ctx.findSyntax({ kinds: ["CallExpression"] });
-      return nodes.map((n) => ({ subject: n.ref, value: ["ok"] }));
-    }),
-  ],
-});
+const domainCarrier: ProvenanceCarrier<{ readonly name: string }> =
+  registerProvenance({ name: "demo" }, []);
+void extractBasisEvidence([domainCarrier]);
 
 export const sampleExplainPath: ExplainCleanupPath | undefined = undefined;
+export function inspectExplainSummaryIds(
+  path: ExplainCleanupPath | undefined,
+): readonly string[] | undefined {
+  return path?.summaryIds;
+}
 
 export async function runExternalConsumer(cwd: string): Promise<void> {
   const session = await openProject({
     cwd,
     tsconfig: "tsconfig.json",
-    adapters: [sampleAdapter],
     additionalInputs: ["allowed-packages.json"],
-    models: [extModel],
+    summaries: { packs: [extSummaries] },
   });
   try {
     const ctx = session.project();
@@ -140,12 +110,13 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
       range: { file: "src/app.ts", startLine: 1, endLine: 20 },
       kinds: ["CallExpression"],
     });
-    const facts = await ctx.facts(sampleFact, {
-      targets: syntaxNodes.map((n) => n.ref),
-      providerId: "demo-adapter",
-      condition: { strict: true },
-    });
-    void facts;
+    ctx.recordGaps([]);
+    const declRows = await ctx.resolveDeclarations(
+      syntaxNodes.map((n) => n.ref),
+      { select: { packageName: true, exportName: true } },
+    );
+    void declRows[0]?.packageName;
+    void declRows[0]?.exportName;
     const callResolutions = await ctx.resolveCalls(
       syntaxNodes.map((n) => n.ref),
       { select: { signature: true, location: true } },
@@ -159,8 +130,12 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     const resolvedInstances = await ctx.resolveInstances(callRefs);
     const instRefs: InstanceRef[] = [];
     for (const instRow of resolvedInstances) {
-      if (instRow.instance !== null) {
+      if (instRow.status === "proved" && instRow.instance !== null) {
         instRefs.push(instRow.instance);
+      } else if (instRow.status === "inconclusive") {
+        void instRow.gaps.length;
+      } else {
+        void instRow.evidence.length;
       }
     }
     const projectedInstances = await ctx.projectInstances(instRefs, {
@@ -169,7 +144,7 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
         originKind: true,
         allocationLocation: true,
         originSyntax: true,
-        modelId: true,
+        summaryId: true,
         evidence: true,
       },
     });
@@ -219,9 +194,30 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
                 from: syn,
                 to: [decl, ...callRefs],
               });
-              void callers;
-              void callees;
-              void prop.results[0]?.reachable;
+              const firstCaller = callers[0];
+              if (firstCaller !== undefined) {
+                void extractBasisEvidence([firstCaller]);
+                if (firstCaller.completeness === "incomplete") {
+                  void firstCaller.gaps.length;
+                }
+              }
+              const firstCallee = callees[0];
+              if (
+                firstCallee !== undefined &&
+                firstCallee.completeness === "incomplete"
+              ) {
+                void firstCallee.gaps.length;
+              }
+              const firstProp = prop.results[0];
+              if (firstProp !== undefined) {
+                if (firstProp.status === "proved") {
+                  void firstProp.paths[0].steps.length;
+                } else if (firstProp.status === "inconclusive") {
+                  void firstProp.gaps.length;
+                } else {
+                  void firstProp.evidence.length;
+                }
+              }
             }
           }
         }
@@ -235,11 +231,39 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
     const effectsResults: readonly CallEffectsResult[] = await ctx.callEffects({
       targets: callRefs,
     });
-    const firstEffect = effectsResults[0]?.fieldWrites[0];
+    const firstEffResult = effectsResults[0];
+    if (
+      firstEffResult !== undefined &&
+      firstEffResult.completeness === "incomplete"
+    ) {
+      void firstEffResult.gaps.length;
+    }
+    const firstEffect = firstEffResult?.fieldWrites[0];
     if (firstEffect !== undefined) {
       const writeSyn: SyntaxRef = firstEffect.syntax;
       const recvSyn: SyntaxRef = firstEffect.receiverSyntax;
-      await ctx.branchCoverage({ branches: [], targets: [writeSyn] });
+      const [cov] = await ctx.branchCoverage({
+        branches: [],
+        targets: [writeSyn],
+      });
+      if (cov !== undefined) {
+        if (cov.status === "disproved") {
+          void cov.counterexamplePath.steps.length;
+        } else if (cov.status === "inconclusive") {
+          void cov.gaps.length;
+        } else {
+          void cov.targetReachable;
+        }
+        if (cov.implicitExceptions.status === "disproved") {
+          void cov.implicitExceptions.mayThrowSites.length;
+          void cov.implicitExceptions.counterexamplePath.steps.length;
+        } else if (cov.implicitExceptions.status === "inconclusive") {
+          void cov.implicitExceptions.mayThrowSites.length;
+          void cov.implicitExceptions.gaps.length;
+        } else {
+          void cov.implicitExceptions.evidence.length;
+        }
+      }
       await ctx.resolveInstances([recvSyn]);
     }
     const firstCleanup = cleanupResults[0];
@@ -247,6 +271,26 @@ export async function runExternalConsumer(cwd: string): Promise<void> {
       const disposedInst: InstanceRef | undefined =
         firstCleanup.disposedInstances[0]?.instance;
       void disposedInst;
+      const firstTarget = firstCleanup.targetResults[0];
+      if (firstTarget !== undefined) {
+        if (firstTarget.status === "proved") {
+          void firstTarget.cleanupSites[0].location;
+        } else if (firstTarget.status === "disproved") {
+          void firstTarget.cleanedOnAnyPath;
+          void firstTarget.uncleanedPath.length;
+        } else {
+          void firstTarget.gaps.length;
+        }
+        if (firstTarget.implicitExceptions.status === "disproved") {
+          void firstTarget.implicitExceptions.mayThrowSites.length;
+          void firstTarget.implicitExceptions.counterexamplePath.length;
+        } else if (firstTarget.implicitExceptions.status === "inconclusive") {
+          void firstTarget.implicitExceptions.mayThrowSites.length;
+          void firstTarget.implicitExceptions.gaps.length;
+        } else {
+          void firstTarget.implicitExceptions.cleanupSites.length;
+        }
+      }
     }
   } finally {
     await session.close();

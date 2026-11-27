@@ -29,7 +29,8 @@ void describe("@tssae/acceptance infrastructure", () => {
       };
 
       assert.equal(extractPackageScope("tssae"), undefined);
-      assert.equal(extractPackageScope("@tssae/adapters"), "@tssae");
+      assert.equal(extractPackageScope("@tssae/zod"), "@tssae");
+      assert.equal(extractPackageScope("@tssae/drizzle"), "@tssae");
 
       const server = await startArtifactRegistry([artifact], {
         upstreamRegistryUrl: null,

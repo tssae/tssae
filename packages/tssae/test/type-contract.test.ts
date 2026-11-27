@@ -226,31 +226,6 @@ void describe("tssae external TypeScript consumer contract", () => {
           expectedPattern: /TS2322|TS2345/u,
         },
         {
-          name: 'CallRef passed to FactType<"syntax">',
-          body: `
-            declare const callRef: CallRef;
-            declare const syntaxFact: FactType<"syntax", { readonly mode?: string } | undefined, string>;
-            await ctx.facts(syntaxFact, { targets: [callRef] });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
-          name: "wrong condition passed to FactType",
-          body: `
-            declare const syntaxFact: FactType<"syntax", { readonly mode: "a" | "b" }, string>;
-            await ctx.facts(syntaxFact, { condition: { mode: "c" } });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
-          name: "non-string providerId passed to facts",
-          body: `
-            declare const syntaxFact: FactType<"syntax", undefined, string>;
-            await ctx.facts(syntaxFact, { providerId: 123 });
-          `,
-          expectedPattern: /TS2322|TS2345/u,
-        },
-        {
           name: "SyntaxRef passed to projectInstances",
           body: `
             const syntaxRef = undefined as unknown as SyntaxRef;
@@ -372,11 +347,137 @@ void describe("tssae external TypeScript consumer contract", () => {
           `,
           expectedPattern: /TS2322|TS2345/u,
         },
+        {
+          name: "counterexamplePath cannot be read on BranchCoverageItem before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.counterexamplePath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on BranchCoverageItem before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "mayThrowSites cannot be read on implicitExceptions before narrowing",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.mayThrowSites;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "counterexamplePath cannot be read on implicitExceptions before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.counterexamplePath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on implicitExceptions before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [cov] = await ctx.branchCoverage({ branches: [], targets: [synRef] });
+            void cov?.implicitExceptions.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on CallTargetsResult before narrowing to incomplete",
+          body: `
+            declare const callRef: CallRef;
+            const [res] = await ctx.calleesOf([callRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on DeclarationCallersResult before narrowing to incomplete",
+          body: `
+            declare const declRef: DeclarationRef;
+            const [res] = await ctx.callersOf([declRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "paths cannot be read on ValuePropagationTargetResult before narrowing to proved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.results[0]?.paths;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on ValuePropagationTargetResult before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const res = await ctx.valuePropagation({ from: synRef, to: [synRef] });
+            void res.results[0]?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "instance cannot be read on InstanceResolutionResult before narrowing to proved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [res] = await ctx.resolveInstances([synRef]);
+            void res?.instance;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on InstanceResolutionResult before narrowing to inconclusive",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [res] = await ctx.resolveInstances([synRef]);
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "gaps cannot be read on CallEffectsResult before narrowing to incomplete",
+          body: `
+            declare const callRef: CallRef;
+            const [res] = await ctx.callEffects({ targets: [callRef] });
+            void res?.gaps;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "uncleanedPath cannot be read on TargetInstanceCleanupResult before narrowing to disproved",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [scope] = await ctx.instanceCleanup({ scopes: [synRef] });
+            void scope?.targetResults[0]?.uncleanedPath;
+          `,
+          expectedPattern: /TS2339/u,
+        },
+        {
+          name: "mayThrowSites cannot be read on TargetInstanceCleanupResult implicitExceptions before narrowing",
+          body: `
+            declare const synRef: SyntaxRef;
+            const [scope] = await ctx.instanceCleanup({ scopes: [synRef] });
+            void scope?.targetResults[0]?.implicitExceptions.mayThrowSites;
+          `,
+          expectedPattern: /TS2339/u,
+        },
       ];
 
       for (const testCase of negativeCases) {
         const snippet = [
-          'import { extractBasisEvidence, type CallRef, type DeclarationRef, type FactType, type InstanceRef, type ProjectContext, type SignatureRef, type SyntaxRef, type TypeRef } from "tssae";',
+          'import { extractBasisEvidence, type CallRef, type DeclarationRef, type InstanceRef, type ProjectContext, type SignatureRef, type SyntaxRef, type TypeRef } from "tssae";',
           "",
           "export async function checkContract(ctx: ProjectContext): Promise<void> {",
           testCase.body,

@@ -3,7 +3,11 @@ import { performance } from "node:perf_hooks";
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { registerProvenance } from "./evidence.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
-import type { ResolvedImplementationTarget } from "./package-impl.ts";
+import {
+  mapRawImplementationTarget,
+  type RawResolvedImplementationTarget,
+  type ResolvedImplementationTarget,
+} from "./package-impl.ts";
 import { validateProgramRefs } from "./projection.ts";
 import {
   makeProgramRef,
@@ -37,8 +41,16 @@ export type DeclarationCallersResult = {
   readonly declaration: DeclarationRef;
   readonly calls: readonly CallRef[];
   readonly callSites: readonly DirectCallInfo[];
-  readonly gaps: readonly Gap[];
-};
+  readonly evidence: readonly Evidence[];
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 export type CallTargetInfo = {
   readonly declaration: DeclarationRef;
@@ -66,6 +78,11 @@ export type ValuePropagationStepKind =
   | "propertyRead"
   | "destructure"
   | "restDestructure"
+  | "arrayElement"
+  | "spread"
+  | "forOfElement"
+  | "closureCapture"
+  | "summaryFlow"
   | "conditionalBranch"
   | "alias";
 
@@ -90,11 +107,26 @@ export type ValuePropagationPath = {
 export type ValuePropagationTargetResult = {
   readonly from: ValueEndpoint;
   readonly to: ValueEndpoint;
-  readonly reachable: boolean;
-  readonly paths: readonly ValuePropagationPath[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly status: "proved";
+      readonly paths: readonly [
+        ValuePropagationPath,
+        ...ValuePropagationPath[],
+      ];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly partialPaths?: readonly ValuePropagationPath[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 export type ValuePropagationOptions = {
   readonly propagation?: ValuePropagationMode;
@@ -153,7 +185,6 @@ export type ValuePropagationResult = {
   readonly propagation: ValuePropagationMode;
   readonly results: readonly ValuePropagationTargetResult[];
   readonly reachableTargets: readonly ValueEndpoint[];
-  readonly gaps: readonly Gap[];
 };
 
 export type CallTargetsResult = {
@@ -162,8 +193,15 @@ export type CallTargetsResult = {
   readonly resolvedTargets: readonly CallTargetInfo[];
   readonly returnTarget: SyntaxRef;
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawParameterBinding = {
   readonly argumentIndex: number;
@@ -186,15 +224,23 @@ type RawDeclarationCallersRow = {
   readonly declaration: string;
   readonly calls: readonly string[];
   readonly callSites: readonly RawDirectCallInfo[];
-  readonly gaps: readonly Gap[];
-};
+  readonly evidence: readonly Evidence[];
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawCallTargetInfo = {
   readonly declaration: string;
   readonly name: string | null;
   readonly location: DiagnosticLocation | null;
   readonly isExternal: boolean;
-  readonly implementation?: ResolvedImplementationTarget | null;
+  readonly implementation?: RawResolvedImplementationTarget | null;
   readonly parameterBindings: readonly RawParameterBinding[];
   readonly returnExpressions: readonly string[];
 };
@@ -205,8 +251,15 @@ type RawCallTargetsRow = {
   readonly resolvedTargets: readonly RawCallTargetInfo[];
   readonly returnTarget: string;
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawValuePropagationPath = {
   readonly from: string;
@@ -220,16 +273,27 @@ type RawValuePropagationPath = {
 type RawValuePropagationTargetRow = {
   readonly from: string;
   readonly to: string;
-  readonly reachable: boolean;
-  readonly paths: readonly RawValuePropagationPath[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly status: "proved";
+      readonly paths: readonly RawValuePropagationPath[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly partialPaths?: readonly RawValuePropagationPath[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 type RawValuePropagationResult = {
   readonly propagation: ValuePropagationMode;
   readonly results: readonly RawValuePropagationTargetRow[];
-  readonly gaps: readonly Gap[];
 };
 
 type EngineBatchResult = {
@@ -382,7 +446,7 @@ export function createCallsValuesQueries(deps: {
                 `Engine omitted callersOf result for "${decl.handleId}".`,
               );
             }
-            return {
+            const common = {
               declaration: decl,
               calls: raw.calls.map((id) =>
                 makeProgramRef("call", sessionToken, projectId, snapshotId, id),
@@ -438,8 +502,13 @@ export function createCallsValuesQueries(deps: {
                   ],
                 ),
               ),
-              gaps: raw.gaps,
+              evidence: raw.evidence,
             };
+            const row: DeclarationCallersResult =
+              raw.completeness === "incomplete"
+                ? { ...common, completeness: "incomplete", gaps: raw.gaps }
+                : { ...common, completeness: "complete" };
+            return registerProvenance(row, raw.evidence);
           });
           cache.callersCache.set(key, rowPromise);
         }
@@ -449,7 +518,9 @@ export function createCallsValuesQueries(deps: {
         declarations.map((decl) => cache.callersCache.get(cacheKeyFor(decl))!),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.completeness === "incomplete") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {
@@ -511,7 +582,7 @@ export function createCallsValuesQueries(deps: {
                 `Engine omitted calleesOf result for "${call.handleId}".`,
               );
             }
-            const result: CallTargetsResult = {
+            const common = {
               call,
               targets: raw.targets.map((id) =>
                 makeProgramRef(
@@ -535,7 +606,17 @@ export function createCallsValuesQueries(deps: {
                   location: target.location,
                   isExternal: target.isExternal,
                   ...(target.implementation !== undefined
-                    ? { implementation: target.implementation }
+                    ? {
+                        implementation:
+                          target.implementation !== null
+                            ? mapRawImplementationTarget(
+                                target.implementation,
+                                sessionToken,
+                                projectId,
+                                snapshotId,
+                              )
+                            : null,
+                      }
                     : {}),
                   parameterBindings: mapBindings(
                     target.parameterBindings,
@@ -575,7 +656,7 @@ export function createCallsValuesQueries(deps: {
                 ) {
                   targetEvidence.push({
                     kind: "source",
-                    message: `Resolved ${mappedTarget.implementation.resolutionMode} implementation '${mappedTarget.implementation.file}' for '${mappedTarget.name ?? "<anonymous>"}'`,
+                    message: `Resolved ${mappedTarget.implementation.resolutionSource} implementation '${mappedTarget.implementation.file}' for '${mappedTarget.name ?? "<anonymous>"}'`,
                     at: mappedTarget.implementation.location,
                     ...(mappedTarget.name !== null
                       ? { declaration: mappedTarget.name }
@@ -601,8 +682,11 @@ export function createCallsValuesQueries(deps: {
                 raw.returnTarget,
               ),
               evidence: raw.evidence,
-              gaps: raw.gaps,
             };
+            const result: CallTargetsResult =
+              raw.completeness === "incomplete"
+                ? { ...common, completeness: "incomplete", gaps: raw.gaps }
+                : { ...common, completeness: "complete" };
             return registerProvenance(result, raw.evidence);
           });
           cache.calleesCache.set(key, rowPromise);
@@ -617,7 +701,9 @@ export function createCallsValuesQueries(deps: {
         ),
       );
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.completeness === "incomplete") {
+          recordGaps(row.gaps);
+        }
       }
 
       if (onQueryCompleted) {
@@ -655,7 +741,6 @@ export function createCallsValuesQueries(deps: {
           propagation,
           results: [],
           reachableTargets: [],
-          gaps: [],
         };
       }
 
@@ -710,36 +795,74 @@ export function createCallsValuesQueries(deps: {
             if (!raw) {
               throw new Error("Engine omitted valuePropagation result.");
             }
+            const mapPaths = (
+              rawPaths: readonly RawValuePropagationPath[],
+              fromRef: ValueEndpoint,
+              toRef: ValueEndpoint,
+            ): readonly ValuePropagationPath[] =>
+              rawPaths.map((p) =>
+                registerProvenance(
+                  {
+                    from: endpointByHandle.get(p.from) ?? fromRef,
+                    to: endpointByHandle.get(p.to) ?? toRef,
+                    steps: p.steps,
+                    evidence: p.evidence,
+                    sourcePath: p.sourcePath,
+                    omittedProperties: p.omittedProperties,
+                  },
+                  p.evidence,
+                ),
+              );
+
             const results: ValuePropagationTargetResult[] = raw.results.map(
               (row) => {
                 const fromRef = endpointByHandle.get(row.from)!;
                 const toRef = endpointByHandle.get(row.to)!;
+                if (row.status === "proved") {
+                  const mappedPaths = mapPaths(row.paths, fromRef, toRef);
+                  const [firstPath, ...restPaths] = mappedPaths;
+                  if (!firstPath) {
+                    throw new Error(
+                      "Engine returned proved valuePropagation result with no paths.",
+                    );
+                  }
+                  const targetResult: ValuePropagationTargetResult = {
+                    from: fromRef,
+                    to: toRef,
+                    status: "proved",
+                    paths: [firstPath, ...restPaths],
+                    evidence: row.evidence,
+                  };
+                  return registerProvenance(targetResult, row.evidence);
+                }
+                if (row.status === "disproved") {
+                  const targetResult: ValuePropagationTargetResult = {
+                    from: fromRef,
+                    to: toRef,
+                    status: "disproved",
+                    evidence: row.evidence,
+                  };
+                  return registerProvenance(targetResult, row.evidence);
+                }
+                const partialPaths = row.partialPaths
+                  ? mapPaths(row.partialPaths, fromRef, toRef)
+                  : undefined;
                 const targetResult: ValuePropagationTargetResult = {
                   from: fromRef,
                   to: toRef,
-                  reachable: row.reachable,
-                  paths: row.paths.map((p) =>
-                    registerProvenance(
-                      {
-                        from: endpointByHandle.get(p.from) ?? fromRef,
-                        to: endpointByHandle.get(p.to) ?? toRef,
-                        steps: p.steps,
-                        evidence: p.evidence,
-                        sourcePath: p.sourcePath,
-                        omittedProperties: p.omittedProperties,
-                      },
-                      p.evidence,
-                    ),
-                  ),
-                  evidence: row.evidence,
+                  status: "inconclusive",
+                  ...(partialPaths !== undefined && partialPaths.length > 0
+                    ? { partialPaths }
+                    : {}),
                   gaps: row.gaps,
+                  evidence: row.evidence,
                 };
                 return registerProvenance(targetResult, row.evidence);
               },
             );
             const reachableSet = new Set<ValueEndpoint>();
             for (const row of results) {
-              if (row.reachable) {
+              if (row.status === "proved") {
                 reachableSet.add(row.to);
               }
             }
@@ -747,14 +870,17 @@ export function createCallsValuesQueries(deps: {
               propagation: raw.propagation,
               results,
               reachableTargets: [...reachableSet],
-              gaps: raw.gaps,
             };
           });
         cache.valueCache.set(cacheKey, promise);
       }
 
       const result = await promise;
-      recordGaps(result.gaps);
+      for (const row of result.results) {
+        if (row.status === "inconclusive") {
+          recordGaps(row.gaps);
+        }
+      }
       if (onQueryCompleted) {
         onQueryCompleted(
           "valuePropagation",

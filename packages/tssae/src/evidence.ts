@@ -1,18 +1,23 @@
-import type { BranchCoverageItem, BranchEdgeInfo } from "./branch-coverage.ts";
+import type {
+  BranchCoverageItem,
+  BranchEdgeInfo,
+  ImplicitExceptionCoverageOutcome,
+} from "./branch-coverage.ts";
 import type {
   CallbackInvocationInfo,
   CleanupSiteInfo,
   FieldEffect,
+  ImplicitExceptionCleanupOutcome,
   TargetInstanceCleanupResult,
 } from "./call-effects.ts";
 import type {
   CallTargetInfo,
   CallTargetsResult,
+  DeclarationCallersResult,
   DirectCallInfo,
   ValuePropagationPath,
   ValuePropagationTargetResult,
 } from "./calls-values.ts";
-import type { FactResult } from "./facts.ts";
 import type {
   InstanceProjectionSelection,
   InstanceResolutionResult,
@@ -29,28 +34,38 @@ import type {
   ProjectedSyntaxLookupRow,
   SyntaxLookupSelection,
 } from "./projection.ts";
+import type { BehaviorSummaryPack } from "./summaries.ts";
 import type {
   DiagnosticLocation,
   Evidence,
-  Model,
   SyntaxNodeResult,
   SyntaxRef,
 } from "./types.ts";
 
-/** Any individual query result, model, or fact item that carries per-item provenance. */
+declare const provenanceCarrierBrand: unique symbol;
+
+/** Structural marker attached by `registerProvenance` so domain-library results work in `basis` lists. */
+export type ProvenanceCarrier<T extends object = object> = T & {
+  readonly [provenanceCarrierBrand]: true;
+};
+
+/** Any individual query result, behavior summary, or provenance-registered domain item that carries per-item provenance. */
 export type SelectableQueryResult =
   | ValuePropagationPath
   | ValuePropagationTargetResult
   | BranchCoverageItem
+  | ImplicitExceptionCoverageOutcome
   | BranchEdgeInfo
   | CallTargetsResult
   | CallTargetInfo
+  | DeclarationCallersResult
   | DirectCallInfo
   | FieldEffect
   | CallbackInvocationInfo
   | ResolvedInstanceInfo
   | InstanceResolutionResult
   | TargetInstanceCleanupResult
+  | ImplicitExceptionCleanupOutcome
   | CleanupSiteInfo
   | ImplementationResolutionResult
   | SyntaxNodeResult
@@ -59,8 +74,8 @@ export type SelectableQueryResult =
   | ProjectedCallRow<CallProjectionSelection>
   | ProjectedCallResolutionRow<CallProjectionSelection>
   | ProjectedInstanceRow<InstanceProjectionSelection>
-  | Model
-  | FactResult;
+  | BehaviorSummaryPack
+  | ProvenanceCarrier;
 
 /** Item accepted in `basis` lists to supply selected provenance or explicit evidence. */
 export type DiagnosticBasis = SelectableQueryResult | Evidence;
@@ -99,7 +114,10 @@ export function normalizeEvidenceItem(item: Evidence): Evidence {
     kind: item.kind,
     message: item.message,
     ...(item.at !== undefined ? { at: normalizeLocation(item.at) } : {}),
-    ...(item.modelId !== undefined ? { modelId: item.modelId } : {}),
+    ...(item.summaryId !== undefined ? { summaryId: item.summaryId } : {}),
+    ...(item.summarySource !== undefined
+      ? { summarySource: item.summarySource }
+      : {}),
     ...(item.declaration !== undefined
       ? { declaration: item.declaration }
       : {}),
@@ -121,7 +139,8 @@ function evidenceKey(item: Evidence): string {
     loc !== undefined
       ? `${loc.file}:${loc.start}:${loc.end}:${loc.line}:${loc.column}:${loc.endLine}:${loc.endColumn}`
       : null,
-    item.modelId ?? null,
+    item.summaryId ?? null,
+    item.summarySource ?? null,
     item.declaration ?? null,
   ]);
 }
@@ -143,18 +162,18 @@ export function dedupeEvidence(
   return out;
 }
 
-/** Associates per-item provenance evidence with a materialized query result, model, or fact object. */
+/** Associates per-item provenance evidence with a materialized query result, behavior summary, or domain item. */
 export function registerProvenance<T extends object>(
   item: T,
   evidence: readonly Evidence[],
-): T {
+): ProvenanceCarrier<T> {
   provenanceRegistry.set(item, {
     evidence: dedupeEvidence(evidence),
   });
-  return item;
+  return item as ProvenanceCarrier<T>;
 }
 
-/** Returns the normalized provenance evidence recorded on a query result, model, or fact item. */
+/** Returns the normalized provenance evidence recorded on a query result, behavior summary, or domain item. */
 export function evidenceOf(item: SelectableQueryResult): readonly Evidence[] {
   if (typeof item !== "object" || item === null) {
     return [];
@@ -180,7 +199,7 @@ function isEvidenceItem(value: unknown): value is Evidence {
     (candidate.kind === "source" ||
       candidate.kind === "type" ||
       candidate.kind === "note" ||
-      candidate.kind === "model") &&
+      candidate.kind === "summary") &&
     typeof candidate.message === "string"
   );
 }

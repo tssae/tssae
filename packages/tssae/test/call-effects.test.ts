@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { copyDirectory, resolveHostDir, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
-  defineModel,
+  defineSummaries,
   evidenceOf,
   extractBasisEvidence,
   isSameInstance,
@@ -15,63 +15,141 @@ import {
   type SyntaxRef,
 } from "tssae";
 
-const LIFECYCLE_MODEL = defineModel({
-  id: "test-lifecycle-model",
-  instanceBehaviors: [
+const LIFECYCLE_ALLOC_SUMMARIES = defineSummaries({
+  id: "test-lifecycle-alloc-summaries",
+  entries: [
     {
-      kind: "allocates-fresh-instance",
-      match: { symbol: "createExternalResource" },
-      description: "createExternalResource allocates a fresh disposable",
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["createExternalResource"],
+      },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
     },
     {
-      kind: "forwards-argument",
-      match: { container: "Disposable", member: "_register" },
-      argumentIndex: 0,
-      description: "_register returns its registered argument",
-    },
-  ],
-  cleanupOperations: [
-    {
-      kind: "disposes-target",
-      match: { member: "dispose" },
-      target: "receiver",
-      description: ".dispose() releases the receiver instance",
-    },
-    {
-      kind: "disposes-target",
-      match: { container: "MutableDisposable", member: "clear" },
-      target: "receiver",
-      description: "MutableDisposable.clear() disposes its held value",
-    },
-    {
-      kind: "replaces-previous-value",
-      match: { container: "MutableDisposable", member: "value" },
-      target: "receiver",
-      description:
-        "Assigning MutableDisposable.value disposes the previous held value",
-    },
-    {
-      kind: "registers-into-container",
-      match: { container: "DisposableStore", member: "add" },
-      target: { argumentIndex: 0 },
-      containerTarget: "receiver",
-      description: "DisposableStore.add registers child into store",
-    },
-    {
-      kind: "detaches-from-container",
-      match: { container: "DisposableStore", member: "delete" },
-      target: { argumentIndex: 0 },
-      containerTarget: "receiver",
-      description: "DisposableStore.delete detaches without disposing",
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["Disposable", "prototype", "_register"],
+      },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "forwards-instance", from: { argIndex: 0 } },
+      },
     },
   ],
-  lifecycleEvents: [
+});
+
+const LIFECYCLE_SUMMARIES = defineSummaries({
+  id: "test-lifecycle-summaries",
+  entries: [
+    ...LIFECYCLE_ALLOC_SUMMARIES.entries,
     {
-      kind: "lifecycle-end-callback",
-      match: { symbol: "onDidDisconnect" },
-      callbackArgumentIndex: 0,
-      eventName: "disconnect",
-      description: "onDidDisconnect callback runs when connection ends",
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["IDisposable", "prototype", "dispose"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["Disposable", "prototype", "dispose"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["DisposableStore", "prototype", "dispose"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["DisposableStore", "prototype", "add"],
+      },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "forwards-instance", from: { argIndex: 0 } },
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [
+          {
+            kind: "registers-into-container",
+            item: { argIndex: 0 },
+            container: "receiver",
+          },
+        ],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["DisposableStore", "prototype", "delete"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [
+          {
+            kind: "detaches-from-container",
+            item: { argIndex: 0 },
+            container: "receiver",
+          },
+        ],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["MutableDisposable", "prototype", "dispose"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["MutableDisposable", "prototype", "clear"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["MutableDisposable", "prototype", "value"],
+      },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "replaces-previous-value", target: "receiver" }],
+      },
+    },
+    {
+      match: {
+        package: "@acme/lifecycle",
+        memberPath: ["onDidDisconnect"],
+      },
+      calls: {
+        completeness: "complete",
+        invokesCallbacks: [{ callbackArgIndex: 0, timing: "lifecycle-end" }],
+      },
     },
   ],
 });
@@ -97,7 +175,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [LIFECYCLE_MODEL],
+          summaries: { packs: [LIFECYCLE_SUMMARIES] },
         });
         try {
           const ctx = session.project();
@@ -135,7 +213,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             const target = getVarInitInFn(fnName, varName);
             const [res] = await ctx.resolveInstances([target]);
             assert.ok(
-              res?.instance,
+              res?.status === "proved" && res.instance !== null,
               `expected instance for ${fnName}.${varName}`,
             );
             instancesByName.set(`${fnName}.${varName}`, res.instance);
@@ -276,8 +354,9 @@ void describe("tssae call-effects and instanceCleanup", () => {
 
         // Verify close A clean B
         const closeAB = recorded.closeAButCleanB;
-        assert.equal(closeAB.targetResults[0]!.status, "not-cleaned");
-        assert.equal(closeAB.targetResults[0]!.cleanedOnAllPaths, false);
+        const closeABTarget = closeAB.targetResults[0]!;
+        assert.equal(closeABTarget.status, "disproved");
+        assert.equal(closeABTarget.cleanedOnAnyPath, false);
         assert.equal(closeAB.disposedInstances.length, 1);
         assert.ok(
           isSameInstance(
@@ -289,8 +368,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
 
         // Verify cross-file helper multi-hop forwarding
         const helperRes = recorded.extractedHelperCleanup;
-        assert.equal(helperRes.targetResults[0]!.status, "covered");
-        assert.equal(helperRes.targetResults[0]!.cleanedOnAllPaths, true);
+        assert.equal(helperRes.targetResults[0]!.status, "proved");
         assert.ok(
           helperRes.targetResults[0]!.evidence.some(
             (e) =>
@@ -301,31 +379,31 @@ void describe("tssae call-effects and instanceCleanup", () => {
 
         // Verify container wrapper only cleans wrapped A, not B
         const wrapRes = recorded.containerWrapperCleanup;
-        assert.equal(wrapRes.targetResults[0]!.status, "covered");
-        assert.equal(wrapRes.targetResults[1]!.status, "not-cleaned");
+        assert.equal(wrapRes.targetResults[0]!.status, "proved");
+        assert.equal(wrapRes.targetResults[1]!.status, "disproved");
         assert.equal(
           recorded.containerWrapperNarrow.targetResults[0]!.status,
-          "not-cleaned",
+          "disproved",
         );
         assert.equal(
           recorded.containerWrapperNarrow.targetResults[1]!.status,
-          "not-cleaned",
+          "disproved",
         );
 
         // Verify MutableDisposable.value = second disposes first, and .clear() disposes second
         const repRes = recorded.mutableReplace;
-        assert.equal(repRes.targetResults[0]!.status, "covered");
+        assert.equal(repRes.targetResults[0]!.status, "proved");
         assert.equal(
           repRes.targetResults[0]!.cleanupSites[0]!.operationKind,
           "replaces-previous-value",
         );
-        assert.equal(repRes.targetResults[1]!.status, "not-cleaned");
+        assert.equal(repRes.targetResults[1]!.status, "disproved");
         const clrRes = recorded.mutableClear;
-        assert.equal(clrRes.targetResults[1]!.status, "covered");
+        assert.equal(clrRes.targetResults[1]!.status, "proved");
 
         // Verify .delete() detaches without disposing
         const detRes = recorded.detachWithoutDispose;
-        assert.equal(detRes.targetResults[0]!.status, "not-cleaned");
+        assert.equal(detRes.targetResults[0]!.status, "disproved");
         assert.equal(detRes.disposedInstances.length, 0);
         assert.equal(detRes.detachedInstances.length, 1);
         assert.ok(
@@ -336,30 +414,29 @@ void describe("tssae call-effects and instanceCleanup", () => {
         );
 
         // Verify partial, multi-branch covered, and dead
-        assert.equal(recorded.partial.targetResults[0]!.status, "partial");
-        assert.equal(recorded.partial.targetResults[0]!.cleanedOnAnyPath, true);
-        assert.equal(
-          recorded.partial.targetResults[0]!.cleanedOnAllPaths,
-          false,
-        );
+        const partialTarget = recorded.partial.targetResults[0]!;
+        assert.equal(partialTarget.status, "disproved");
+        assert.equal(partialTarget.cleanedOnAnyPath, true);
+        assert.ok(partialTarget.uncleanedPath.length > 0);
 
-        assert.equal(recorded.multiBranch.targetResults[0]!.status, "covered");
-        assert.equal(
-          recorded.multiBranch.targetResults[0]!.cleanedOnAllPaths,
-          true,
-        );
+        assert.equal(recorded.multiBranch.targetResults[0]!.status, "proved");
 
-        assert.equal(recorded.dead.targetResults[0]!.status, "not-cleaned");
-        assert.equal(recorded.dead.targetResults[0]!.cleanedOnAnyPath, false);
+        const deadTarget = recorded.dead.targetResults[0]!;
+        assert.equal(deadTarget.status, "disproved");
+        assert.equal(deadTarget.cleanedOnAnyPath, false);
 
         // Verify dynamic callback preserves known effects and gaps
         const kDyn = recorded.knownPlusDyn;
-        assert.equal(kDyn.targetResults[0]!.status, "covered");
+        assert.equal(kDyn.targetResults[0]!.status, "proved");
         assert.equal(kDyn.disposedInstances.length, 1);
         assert.ok(kDyn.gaps.some((g) => g.kind === "dynamic-callee"));
 
         const wDyn = recorded.wrongPlusDyn;
-        assert.equal(wDyn.targetResults[0]!.status, "unknown");
+        const wDynTarget = wDyn.targetResults[0]!;
+        // Under IR optional-chaining semantics (`extraCb?.()`), the nullish branch exits
+        // without calling `extraCb` or disposing `resA`, yielding a known counterexample.
+        assert.equal(wDynTarget.status, "disproved");
+        assert.ok(wDynTarget.uncleanedPath.length > 0);
         assert.equal(wDyn.disposedInstances.length, 1);
         assert.ok(
           isSameInstance(
@@ -389,7 +466,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [LIFECYCLE_MODEL],
+          summaries: { packs: [LIFECYCLE_SUMMARIES] },
         });
 
         try {
@@ -409,7 +486,9 @@ void describe("tssae call-effects and instanceCleanup", () => {
           assert.ok(connVar?.initializer && disconnectCall);
 
           const [resolved] = await ctx.resolveInstances([connVar.initializer]);
-          assert.ok(resolved?.instance);
+          assert.ok(
+            resolved?.status === "proved" && resolved.instance !== null,
+          );
 
           const [cleanup] = await ctx.instanceCleanup({
             scopes: [disconnectCall.ref],
@@ -417,8 +496,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
           });
           const targetRes = cleanup?.targetResults[0];
           assert.ok(targetRes);
-          assert.equal(targetRes.status, "covered");
-          assert.equal(targetRes.cleanedOnAllPaths, true);
+          assert.equal(targetRes.status, "proved");
           assert.equal(targetRes.allocationLocation?.file, "src/app.ts");
           assert.equal(targetRes.allocationLocation?.line, 6);
           assert.ok(
@@ -431,8 +509,8 @@ void describe("tssae call-effects and instanceCleanup", () => {
           );
           const evidence = evidenceOf(targetRes);
           assert.equal(
-            targetRes.cleanupSites[0]?.modelId,
-            "test-lifecycle-model",
+            targetRes.cleanupSites[0]?.summaryId,
+            "test-lifecycle-summaries",
           );
           assert.ok(
             evidence.some((e) => e.message.includes("releaseResource")),
@@ -541,7 +619,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
                   })
                 : null;
 
-            const branchStatus = coverage[0]?.status ?? "unknown";
+            const branchStatus = coverage[0]?.status ?? "inconclusive";
             const rawPropagated = rawProp.reachableTargets.length > 0;
             const parsedDataPropagated =
               (dataProp?.reachableTargets.length ?? 0) > 0;
@@ -553,7 +631,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             };
 
             if (
-              branchStatus !== "covered" ||
+              branchStatus !== "proved" ||
               rawPropagated ||
               !parsedDataPropagated
             ) {
@@ -568,12 +646,12 @@ void describe("tssae call-effects and instanceCleanup", () => {
         }
 
         assert.deepEqual(routeAudit.unsafeRoute, {
-          branchStatus: "covered",
+          branchStatus: "proved",
           rawPropagated: true,
           parsedDataPropagated: false,
         });
         assert.deepEqual(routeAudit.safeRoute, {
-          branchStatus: "covered",
+          branchStatus: "proved",
           rawPropagated: false,
           parsedDataPropagated: true,
         });
@@ -648,7 +726,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
             });
             postCallGuardStatus[fnName] = cov!.status;
 
-            if (cov!.status !== "covered") {
+            if (cov!.status !== "proved") {
               flaggedFns.push(fnName);
             }
           }
@@ -691,6 +769,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
 
         // flushJobDynamic preserves direct writes AND records callbackInvocation + dynamic-callee Gap
         const dynEff = effectsByFn.get("flushJobDynamic")!;
+        assert.equal(dynEff.completeness, "incomplete");
         assert.ok(dynEff.fieldWrites.length >= 2);
         assert.ok(
           dynEff.callbackInvocations.some(
@@ -700,9 +779,9 @@ void describe("tssae call-effects and instanceCleanup", () => {
         assert.ok(dynEff.gaps.some((g) => g.kind === "dynamic-callee"));
 
         // branchCoverage distinguishes unguarded vs guarded post-call clear
-        assert.equal(postCallGuardStatus.flushJobBuggy, "bypass");
-        assert.equal(postCallGuardStatus.flushJobDynamic, "bypass");
-        assert.equal(postCallGuardStatus.flushJobFixed, "covered");
+        assert.equal(postCallGuardStatus.flushJobBuggy, "disproved");
+        assert.equal(postCallGuardStatus.flushJobDynamic, "disproved");
+        assert.equal(postCallGuardStatus.flushJobFixed, "proved");
 
         // flushJobFixed's clear also records structural guard
         const fixedEff = effectsByFn.get("flushJobFixed")!;
@@ -722,7 +801,7 @@ void describe("tssae call-effects and instanceCleanup", () => {
     );
   });
 
-  void it("rejects stale references in callEffects/instanceCleanup and invalidates cleanup cache when models update", async () => {
+  void it("rejects stale references in callEffects/instanceCleanup and invalidates cleanup cache when summaries update", async () => {
     await withTempHost(
       {
         host: "sdk-queries/call-effects-model-update",
@@ -746,7 +825,8 @@ void describe("tssae call-effects and instanceCleanup", () => {
           const closeVar = vars.find((v) => v.text.startsWith("close ="))!;
           const scope = closeVar.initializer!;
           const [instRes] = await ctx.resolveInstances([itemVar.initializer!]);
-          const inst = instRes!.instance!;
+          assert.ok(instRes?.status === "proved" && instRes.instance !== null);
+          const inst = instRes.instance;
           const [cleanupRes] = await ctx.instanceCleanup({
             scopes: [scope],
             targets: [inst],
@@ -761,31 +841,21 @@ void describe("tssae call-effects and instanceCleanup", () => {
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [
-            defineModel({
-              id: "base-alloc",
-              instanceBehaviors: [
-                {
-                  kind: "allocates-fresh-instance",
-                  match: { symbol: "createExternalResource" },
-                },
-              ],
-            }),
-          ],
+          summaries: { packs: [LIFECYCLE_ALLOC_SUMMARIES] },
         });
 
         try {
           const first = await queryCleanupStatus(session.project());
-          // Without cleanupOperations model, external `.dispose()` is unmodeled and yields `unknown`
-          assert.equal(first.status, "unknown");
+          // Without cleanup summary, external `.dispose()` is unmodeled and yields `inconclusive`
+          assert.equal(first.status, "inconclusive");
 
-          // Update models to add `disposes-target` for `.dispose()` -> must invalidate cache and return `covered`
+          // Update summaries to add `disposes-target` for `.dispose()` -> must invalidate cache and return `proved`
           await session.update({
-            models: [LIFECYCLE_MODEL],
+            summaries: { packs: [LIFECYCLE_SUMMARIES] },
           });
           const ctx2 = session.project();
           const second = await queryCleanupStatus(ctx2);
-          assert.equal(second.status, "covered");
+          assert.equal(second.status, "proved");
 
           // Using stale refs captured from snapshot 1 in snapshot 2 must throw STALE_REFERENCE
           await assert.rejects(
@@ -951,14 +1021,14 @@ void describe("tssae call-effects and instanceCleanup", () => {
             branches: [guardBranch.ref],
             targets: [guardedWrite.syntax],
           });
-          assert.equal(guardedCov?.status, "covered");
+          assert.equal(guardedCov?.status, "proved");
 
           const [unguardedCov] = await ctx.branchCoverage({
             scope: unguardedWrite.cfgScope!,
             branches: [],
             targets: [unguardedWrite.syntax],
           });
-          assert.equal(unguardedCov?.status, "bypass");
+          assert.equal(unguardedCov?.status, "disproved");
 
           const evidence = extractBasisEvidence([
             indirectInv,
@@ -993,6 +1063,734 @@ void describe("tssae call-effects and instanceCleanup", () => {
                 (e.at.line === 20 || e.at.line === 32),
             ),
             false,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("evaluates dual explicit/implicit-exception cleanup verdicts for mayThrow writes, try/finally, explicit throw, using [Symbol.dispose], extracted helpers, and multi-instance disambiguation", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "cleanup-dual-verdicts-host",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2024",
+              lib: ["ES2024", "ESNext.Disposable"],
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "node_modules/@acme/io/package.json": JSON.stringify({
+            name: "@acme/io",
+            version: "1.0.0",
+            types: "./index.d.ts",
+          }),
+          "node_modules/@acme/io/index.d.ts": [
+            "export interface Handle extends Disposable {",
+            "  write(data: string): void;",
+            "}",
+            "export declare function acquire(): Handle;",
+            "export declare function release(h: Handle): void;",
+            "export declare function write(h: Handle): void;",
+            "",
+          ].join("\n"),
+          "src/helpers.ts": [
+            'import { release, type Handle } from "@acme/io";',
+            "export function closeQuietly(h: Handle): void {",
+            "  release(h);",
+            "}",
+            "",
+          ].join("\n"),
+          "src/scenarios.ts": [
+            'import { acquire, release, write, type Handle } from "@acme/io";',
+            'import { closeQuietly } from "./helpers.js";',
+            "",
+            "export function acquireWriteRelease(): void {",
+            "  const r = acquire();",
+            "  write(r);",
+            "  release(r);",
+            "}",
+            "",
+            "export function tryFinallyRelease(): void {",
+            "  const r = acquire();",
+            "  try {",
+            "    write(r);",
+            "  } finally {",
+            "    release(r);",
+            "  }",
+            "}",
+            "",
+            "export function explicitThrowSkipsRelease(bad: boolean): void {",
+            "  const r = acquire();",
+            "  if (bad) {",
+            '    throw new Error("boom");',
+            "  }",
+            "  release(r);",
+            "}",
+            "",
+            "export function usingAutoDispose(): void {",
+            "  using r = acquire();",
+            "  write(r);",
+            "}",
+            "",
+            "export function helperExtractedRelease(protectedByFinally: boolean): void {",
+            "  const direct = acquire();",
+            "  if (protectedByFinally) {",
+            "    try {",
+            "      write(direct);",
+            "    } finally {",
+            "      closeQuietly(direct);",
+            "    }",
+            "  } else {",
+            "    write(direct);",
+            "    closeQuietly(direct);",
+            "  }",
+            "}",
+            "",
+            "export function multiInstanceOnlyCleansB(): void {",
+            "  const a = acquire();",
+            "  const b = acquire();",
+            "  try {",
+            "    write(b);",
+            "  } finally {",
+            "    closeQuietly(b);",
+            "  }",
+            "  void a;",
+            "}",
+            "",
+            "export function unknownDynamicCleanup(cb: (h: Handle) => void): void {",
+            "  const r = acquire();",
+            "  cb(r);",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const ioSummaries = defineSummaries({
+          id: "acme-io-summaries",
+          entries: [
+            {
+              match: { package: "@acme/io", memberPath: ["acquire"] },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
+              },
+            },
+            {
+              match: { package: "@acme/io", memberPath: ["release"] },
+              effects: {
+                completeness: "complete",
+                resourceOps: [
+                  { kind: "disposes-target", target: { argIndex: 0 } },
+                ],
+              },
+            },
+            {
+              match: { package: "@acme/io", memberPath: ["write"] },
+              effects: {
+                completeness: "complete",
+                resourceOps: [],
+              },
+            },
+          ],
+        });
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: { packs: [ioSummaries] },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/scenarios.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const varDecls = await ctx.findSyntax({
+            files: ["src/scenarios.ts"],
+            kinds: ["VariableDeclaration"],
+          });
+
+          const getFn = (name: string) =>
+            fns.find((f) => f.text.includes(`function ${name}(`))!;
+          const resolveVar = async (fnName: string, varName: string) => {
+            const fn = getFn(fnName);
+            const decl = varDecls.find(
+              (v) =>
+                v.location.start >= fn.location.start &&
+                v.location.end <= fn.location.end &&
+                v.text.startsWith(`${varName} =`),
+            )!;
+            const [res] = await ctx.resolveInstances([decl.initializer!]);
+            assert.ok(
+              res?.status === "proved" && res.instance !== null,
+              `expected resolved instance for ${fnName}.${varName}`,
+            );
+            return res.instance;
+          };
+
+          // 1. acquire -> write -> release (no try/finally): primary proved, implicitExceptions disproved at write(r)
+          const r1 = await resolveVar("acquireWriteRelease", "r");
+          const [res1] = await ctx.instanceCleanup({
+            scopes: [getFn("acquireWriteRelease").ref],
+            targets: [r1],
+          });
+          const t1 = res1!.targetResults[0]!;
+          assert.equal(t1.status, "proved");
+          assert.equal(t1.implicitExceptions.status, "disproved");
+          assert.ok(
+            t1.implicitExceptions.mayThrowSites.some(
+              (s) => s.file === "src/scenarios.ts" && s.line === 6,
+            ),
+          );
+          assert.ok(t1.implicitExceptions.counterexamplePath.length > 0);
+          assert.ok(
+            evidenceOf(t1.implicitExceptions).some(
+              (e) => e.at?.file === "src/scenarios.ts" && e.at.line === 6,
+            ),
+          );
+
+          // 2. try { write(r); } finally { release(r); }: both primary & implicitExceptions proved
+          const r2 = await resolveVar("tryFinallyRelease", "r");
+          const [res2] = await ctx.instanceCleanup({
+            scopes: [getFn("tryFinallyRelease").ref],
+            targets: [r2],
+          });
+          const t2 = res2!.targetResults[0]!;
+          assert.equal(t2.status, "proved");
+          assert.equal(t2.implicitExceptions.status, "proved");
+
+          // 3. Explicit throw skipping release: primary directly disproved with uncleanedPath
+          const r3 = await resolveVar("explicitThrowSkipsRelease", "r");
+          const [res3] = await ctx.instanceCleanup({
+            scopes: [getFn("explicitThrowSkipsRelease").ref],
+            targets: [r3],
+          });
+          const t3 = res3!.targetResults[0]!;
+          assert.equal(t3.status, "disproved");
+          assert.equal(t3.cleanedOnAnyPath, true);
+          assert.ok(t3.uncleanedPath.length > 0);
+
+          // 4. `using r = acquire(); write(r);`: stdlib Symbol.dispose gives both proved
+          const r4 = await resolveVar("usingAutoDispose", "r");
+          const [res4] = await ctx.instanceCleanup({
+            scopes: [getFn("usingAutoDispose").ref],
+            targets: [r4],
+          });
+          const t4 = res4!.targetResults[0]!;
+          assert.equal(t4.status, "proved");
+          assert.equal(t4.implicitExceptions.status, "proved");
+
+          // 5. Cross-helper extraction (`closeQuietly`): preserves dual conclusions (protected finally vs unprotected path)
+          const r5 = await resolveVar("helperExtractedRelease", "direct");
+          const [res5] = await ctx.instanceCleanup({
+            scopes: [getFn("helperExtractedRelease").ref],
+            targets: [r5],
+          });
+          const t5 = res5!.targetResults[0]!;
+          assert.equal(t5.status, "proved");
+          assert.equal(t5.implicitExceptions.status, "disproved");
+          assert.ok(
+            t5.implicitExceptions.mayThrowSites.some(
+              (s) => s.file === "src/scenarios.ts" && s.line === 41,
+            ),
+          );
+
+          // 6. Multi-instance disambiguation: a is disproved, b is proved (explicit + implicit)
+          const a = await resolveVar("multiInstanceOnlyCleansB", "a");
+          const b = await resolveVar("multiInstanceOnlyCleansB", "b");
+          const [res6] = await ctx.instanceCleanup({
+            scopes: [getFn("multiInstanceOnlyCleansB").ref],
+            targets: [a, b],
+          });
+          const resA = res6!.targetResults[0]!;
+          const resB = res6!.targetResults[1]!;
+          assert.equal(resA.status, "disproved");
+          assert.equal(resA.allocationLocation?.line, 47);
+          assert.equal(resB.status, "proved");
+          assert.equal(resB.implicitExceptions.status, "proved");
+          assert.equal(resB.allocationLocation?.line, 48);
+          assert.ok(
+            resB.cleanupSites.some(
+              (s) =>
+                s.location.file === "src/helpers.ts" ||
+                s.viaCallLocation?.file === "src/scenarios.ts",
+            ),
+          );
+
+          // 7. Unconditional dynamic callback yields `inconclusive` with critical dynamic-callee gap
+          const r7 = await resolveVar("unknownDynamicCleanup", "r");
+          const [res7] = await ctx.instanceCleanup({
+            scopes: [getFn("unknownDynamicCleanup").ref],
+            targets: [r7],
+          });
+          const t7 = res7!.targetResults[0]!;
+          assert.equal(t7.status, "inconclusive");
+          assert.ok(t7.gaps.some((g) => g.kind === "dynamic-callee"));
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("completes deep diamond call DAGs without exponential blowup or duplicate field effects", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-dag-dedup",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/dag.ts": [
+            "class DagRunner {",
+            "  public done = false;",
+            "  f0(): void { this.f1a(); this.f1b(); this.f1c(); }",
+            "  f1a(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f1b(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f1c(): void { this.f2a(); this.f2b(); this.f2c(); }",
+            "  f2a(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f2b(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f2c(): void { this.f3a(); this.f3b(); this.f3c(); }",
+            "  f3a(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f3b(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f3c(): void { this.f4a(); this.f4b(); this.f4c(); }",
+            "  f4a(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f4b(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f4c(): void { this.f5a(); this.f5b(); this.f5c(); }",
+            "  f5a(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f5b(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f5c(): void { this.f6a(); this.f6b(); this.f6c(); }",
+            "  f6a(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f6b(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f6c(): void { this.f7a(); this.f7b(); this.f7c(); }",
+            "  f7a(): void { this.leaf(); }",
+            "  f7b(): void { this.leaf(); }",
+            "  f7c(): void { this.leaf(); }",
+            "  leaf(): void { this.done = true; }",
+            "}",
+            "export function runDag(): void {",
+            "  const runner = new DagRunner();",
+            "  runner.f0();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/dag.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runDag = fns.find((f) => f.text.includes("function runDag"));
+          assert.ok(runDag);
+
+          const startMs = Date.now();
+          const [res] = await ctx.callEffects({
+            targets: [runDag.ref],
+            includeReads: true,
+            includeWrites: true,
+            followCallbacks: true,
+          });
+          const elapsedMs = Date.now() - startMs;
+
+          assert.equal(res?.completeness, "complete");
+          assert.ok(
+            elapsedMs < 5000,
+            `expected fast DAG traversal, took ${elapsedMs}ms`,
+          );
+          const doneWrites = res.fieldWrites.filter(
+            (w) => w.propertyName === "done" && w.valueText === "true",
+          );
+          assert.equal(doneWrites.length, 1);
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("does not leak unrelated external callers for unbound callback parameters or mark private methods as open-external-hierarchy", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-unbound-param",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/lib.ts": [
+            "export class Runner {",
+            "  constructor(private readonly fn: () => void) { this.run(); }",
+            "  private run(): void { this.fn(); }",
+            "}",
+            "export function createRunner(cb: () => void): Runner {",
+            "  return new Runner(cb);",
+            "}",
+            "",
+          ].join("\n"),
+          "src/unrelated.ts": [
+            'import { createRunner, type Runner } from "./lib.js";',
+            "const unrelatedState = { leakedWrite: 0 };",
+            "export function someUnrelatedCaller(): Runner {",
+            "  return createRunner(() => { unrelatedState.leakedWrite = 999; });",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const newExprs = await ctx.findSyntax({
+            files: ["src/lib.ts"],
+            kinds: ["NewExpression"],
+          });
+          const newRunnerCall = newExprs.find((n) =>
+            n.text.includes("new Runner(cb)"),
+          );
+          assert.ok(newRunnerCall);
+
+          const [res] = await ctx.callEffects({
+            targets: [newRunnerCall.ref],
+            followCallbacks: true,
+            includeWrites: true,
+          });
+          assert.ok(res);
+          assert.ok(
+            !res.fieldWrites.some((w) => w.propertyName === "leakedWrite"),
+            "must not leak unrelated callers of createRunner",
+          );
+          assert.equal(res.completeness, "incomplete");
+          assert.ok(
+            res.gaps.some((g) => g.kind === "dynamic-callee"),
+            "unbound callback parameter must report dynamic-callee gap",
+          );
+          assert.ok(
+            !res.gaps.some((g) => g.kind === "open-external-hierarchy"),
+            "private method this.run() on exported class must not report open-external-hierarchy",
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("completes deep diamond call DAGs in instanceCleanup without exponential blowup", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-instance-cleanup-dag",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/cleanup-dag.ts": [
+            "class Resource {",
+            "  dispose(): void {}",
+            "}",
+            "class CleanupDagRunner {",
+            "  private readonly res: Resource;",
+            "  constructor(res: Resource) {",
+            "    this.res = res;",
+            "  }",
+            "  d0(): void { this.d1a(); this.d1b(); this.d1c(); }",
+            "  d1a(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d1b(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d1c(): void { this.d2a(); this.d2b(); this.d2c(); }",
+            "  d2a(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d2b(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d2c(): void { this.d3a(); this.d3b(); this.d3c(); }",
+            "  d3a(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d3b(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d3c(): void { this.d4a(); this.d4b(); this.d4c(); }",
+            "  d4a(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d4b(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d4c(): void { this.d5a(); this.d5b(); this.d5c(); }",
+            "  d5a(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d5b(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d5c(): void { this.d6a(); this.d6b(); this.d6c(); }",
+            "  d6a(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d6b(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d6c(): void { this.d7a(); this.d7b(); this.d7c(); }",
+            "  d7a(): void { this.leaf(); }",
+            "  d7b(): void { this.leaf(); }",
+            "  d7c(): void { this.leaf(); }",
+            "  leaf(): void { this.res.dispose(); }",
+            "}",
+            "export function runCleanupDag(): void {",
+            "  const res = new Resource();",
+            "  const runner = new CleanupDagRunner(res);",
+            "  runner.d0();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: {
+            packs: [
+              defineSummaries({
+                id: "cleanup-dag-pack",
+                entries: [
+                  {
+                    match: {
+                      module: "src/cleanup-dag.ts",
+                      memberPath: ["Resource", "prototype", "dispose"],
+                    },
+                    effects: {
+                      completeness: "complete",
+                      resourceOps: [
+                        { kind: "disposes-target", target: "receiver" },
+                      ],
+                    },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/cleanup-dag.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runCleanupDag = fns.find((f) =>
+            f.text.includes("function runCleanupDag"),
+          );
+          const news = await ctx.findSyntax({
+            files: ["src/cleanup-dag.ts"],
+            kinds: ["NewExpression"],
+          });
+          const newRes = news.find((n) => n.text.includes("new Resource()"));
+          assert.ok(runCleanupDag && newRes);
+
+          const [inst] = await ctx.resolveInstances([newRes.ref]);
+          assert.ok(inst?.status === "proved" && inst.instance);
+
+          const startMs = Date.now();
+          const [cleanup] = await ctx.instanceCleanup({
+            scopes: [runCleanupDag.ref],
+            targets: [inst.instance],
+          });
+          const elapsedMs = Date.now() - startMs;
+
+          assert.ok(
+            elapsedMs < 5000,
+            `expected fast DAG instanceCleanup, took ${elapsedMs}ms`,
+          );
+          assert.equal(cleanup?.targetResults[0]?.status, "proved");
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("honors calls summary precedence over source body, emits summary evidence, and marks partial calls summaries incomplete", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-call-effects-summary-precedence",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/index.ts": [
+            "const state = { bodyWritten: 0, callbackWritten: 0, partialBodyWritten: 0 };",
+            "function overrideTarget(): void {",
+            "  state.bodyWritten = 1;",
+            "}",
+            "function partialTarget(cb: () => void): void {",
+            "  state.partialBodyWritten = 3;",
+            "  cb();",
+            "}",
+            "export function callCompleteOverride(): void {",
+            "  overrideTarget();",
+            "}",
+            "export function callPartialSummary(): void {",
+            "  partialTarget(() => {",
+            "    state.callbackWritten = 2;",
+            "  });",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          summaries: {
+            discovery: false,
+            packs: [
+              defineSummaries({
+                id: "calls-override-pack",
+                entries: [
+                  {
+                    id: "override-complete",
+                    match: {
+                      module: "src/index.ts",
+                      memberPath: ["overrideTarget"],
+                    },
+                    calls: {
+                      completeness: "complete",
+                      invokesCallbacks: [],
+                    },
+                  },
+                  {
+                    id: "override-partial",
+                    match: {
+                      module: "src/index.ts",
+                      memberPath: ["partialTarget"],
+                    },
+                    calls: {
+                      completeness: "partial",
+                      invokesCallbacks: [
+                        { callbackArgIndex: 0, timing: "synchronous" },
+                      ],
+                    },
+                  },
+                ],
+              }),
+            ],
+          },
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/index.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const completeCaller = fns.find((f) =>
+            f.text.includes("function callCompleteOverride"),
+          );
+          const partialCaller = fns.find((f) =>
+            f.text.includes("function callPartialSummary"),
+          );
+          assert.ok(completeCaller && partialCaller);
+
+          const [completeRes, partialRes] = await ctx.callEffects({
+            targets: [completeCaller.ref, partialCaller.ref],
+            followCallbacks: true,
+            includeWrites: true,
+          });
+          assert.ok(completeRes && partialRes);
+
+          assert.equal(completeRes.completeness, "complete");
+          assert.deepEqual(completeRes.fieldWrites, []);
+          assert.ok(
+            completeRes.evidence.some(
+              (ev) =>
+                ev.kind === "summary" &&
+                ev.summaryId === "calls-override-pack" &&
+                ev.summarySource === "local",
+            ),
+            "expected summary evidence for complete calls override",
+          );
+
+          assert.equal(partialRes.completeness, "incomplete");
+          assert.ok(
+            partialRes.gaps.some((g) => g.kind === "missing-behavior-summary"),
+            "expected missing-behavior-summary gap for partial calls summary",
+          );
+          assert.ok(
+            partialRes.fieldWrites.some(
+              (w) => w.propertyName === "callbackWritten",
+            ),
+            "expected callback field write to be followed from partial calls summary",
+          );
+          assert.ok(
+            !partialRes.fieldWrites.some(
+              (w) => w.propertyName === "partialBodyWritten",
+            ),
+            "expected partial calls summary to take precedence over callee body",
+          );
+          assert.ok(
+            partialRes.evidence.some(
+              (ev) =>
+                ev.kind === "summary" &&
+                ev.summaryId === "calls-override-pack" &&
+                ev.summarySource === "local",
+            ),
+            "expected summary evidence for partial calls summary",
           );
         } finally {
           await session.close();

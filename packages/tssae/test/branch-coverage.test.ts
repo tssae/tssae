@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { withTempHost } from "@tssae/test-hosts";
+import { writeHostFiles, withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
+  evidenceOf,
   openProject,
   type BranchEdgeInfo,
   type BranchRef,
@@ -102,9 +103,10 @@ void describe("tssae branchCoverage", () => {
               status: item.status,
               evidenceCount: item.evidence.length,
             });
-            if (item.status === "bypass") {
+            if (item.status === "disproved") {
               assert.equal(executeCalls[0]!.location.line, 16);
               assert.ok(item.evidence.length >= 1);
+              assert.ok(item.counterexamplePath.steps.length >= 1);
             }
           }
         }
@@ -113,8 +115,8 @@ void describe("tssae branchCoverage", () => {
       }
 
       assert.deepEqual(observed, [
-        { fn: "guardedEarlyReturn", status: "covered", evidenceCount: 1 },
-        { fn: "bypassPossible", status: "bypass", evidenceCount: 2 },
+        { fn: "guardedEarlyReturn", status: "proved", evidenceCount: 1 },
+        { fn: "bypassPossible", status: "disproved", evidenceCount: 2 },
       ]);
     });
   });
@@ -263,14 +265,14 @@ void describe("tssae branchCoverage", () => {
         }
 
         assert.deepEqual(results, {
-          "multiAuthIfElse:onlyApi": "bypass",
-          "multiAuthIfElse:onlySession": "bypass",
-          "multiAuthIfElse:both": "covered",
-          "switchWithDefault:onlyBearer": "bypass",
-          "switchWithDefault:bothCases": "covered",
-          "switchFallthrough:onlyBearer": "bypass",
-          "switchFallthrough:bothCases": "covered",
-          "switchNoDefault:onlyBearer": "bypass",
+          "multiAuthIfElse:onlyApi": "disproved",
+          "multiAuthIfElse:onlySession": "disproved",
+          "multiAuthIfElse:both": "proved",
+          "switchWithDefault:onlyBearer": "disproved",
+          "switchWithDefault:bothCases": "proved",
+          "switchFallthrough:onlyBearer": "disproved",
+          "switchFallthrough:bothCases": "proved",
+          "switchNoDefault:onlyBearer": "disproved",
         });
         assert.ok(
           witnessMessages["multiAuthIfElse:onlyApi"].some((msg) =>
@@ -354,24 +356,25 @@ void describe("tssae branchCoverage", () => {
 
         assert.equal(conditionTypeText, "boolean");
         assert.deepEqual(statuses, {
-          call_0: "covered",
-          call_1: "covered",
-          call_2: "covered",
-          call_3: "covered",
-          call_4: "covered",
-          method_wrong_branch: "bypass",
+          call_0: "proved",
+          call_1: "proved",
+          call_2: "proved",
+          call_3: "proved",
+          call_4: "proved",
+          method_wrong_branch: "disproved",
         });
       },
     );
   });
 
-  void it("returns unreachable for dead targets and unknown with Gaps for unmodeled control flow", async () => {
+  void it("distinguishes unreachable targets (proved with targetReachable=false) and inconclusive critical-path gaps", async () => {
     await withTempHost(
       { host: "sdk-queries/branch-unreachable-unknown" },
       async (host) => {
         await host.typecheck();
 
         const statuses: Record<string, string> = {};
+        const reachability: Record<string, boolean> = {};
         const gapKinds: Record<string, readonly string[]> = {};
         const allGaps: Array<{
           readonly at?: unknown;
@@ -419,39 +422,72 @@ void describe("tssae branchCoverage", () => {
               targets: [executeCall.ref],
             });
             statuses[label] = res!.status;
-            allGaps.push(...res!.gaps);
+            reachability[label] = res!.targetReachable;
+            if (res!.status === "inconclusive") {
+              allGaps.push(...res!.gaps);
+            }
           }
 
           const tryCase = findFn("function tryCatchHandler(");
           tryBranchCount = tryCase.group.branches.length;
-          const [tryRes] = await ctx.branchCoverage({
+          // With guard branches selected, `if (isAuthorized(req))` still dominates `execute(req)`
+          const [tryGuardedRes] = await ctx.branchCoverage({
             function: tryCase.fn.ref,
             branches: tryCase.group.branches.map((b) => b.ref),
             targets: [tryCase.executeCall.ref],
           });
+          statuses["tryCatchGuarded"] = tryGuardedRes!.status;
+          reachability["tryCatchGuarded"] = tryGuardedRes!.targetReachable;
+
+          // Without guard branches selected, the bypass path goes through `try/catch`
+          const [tryRes] = await ctx.branchCoverage({
+            function: tryCase.fn.ref,
+            branches: [],
+            targets: [tryCase.executeCall.ref],
+          });
           statuses["tryCatch"] = tryRes!.status;
-          gapKinds["tryCatch"] = tryRes!.gaps.map((g) => g.kind);
-          allGaps.push(...tryRes!.gaps);
+          if (tryRes!.status === "inconclusive") {
+            gapKinds["tryCatch"] = tryRes!.gaps.map((g) => g.kind);
+            allGaps.push(...tryRes!.gaps);
+          }
 
           const loopCase = findFn("function loopHandler(");
-          const [loopRes] = await ctx.branchCoverage({
+          const [loopGuardedRes] = await ctx.branchCoverage({
             function: loopCase.fn.ref,
             branches: loopCase.group.branches.map((b) => b.ref),
             targets: [loopCase.executeCall.ref],
           });
+          statuses["loopGuarded"] = loopGuardedRes!.status;
+
+          const [loopRes] = await ctx.branchCoverage({
+            function: loopCase.fn.ref,
+            branches: [],
+            targets: [loopCase.executeCall.ref],
+          });
           statuses["loop"] = loopRes!.status;
-          gapKinds["loop"] = loopRes!.gaps.map((g) => g.kind);
-          allGaps.push(...loopRes!.gaps);
+          if (loopRes!.status === "inconclusive") {
+            gapKinds["loop"] = loopRes!.gaps.map((g) => g.kind);
+            allGaps.push(...loopRes!.gaps);
+          }
 
           const genCase = findFn("function* generatorHandler(");
-          const [genRes] = await ctx.branchCoverage({
+          const [genGuardedRes] = await ctx.branchCoverage({
             function: genCase.fn.ref,
             branches: genCase.group.branches.map((b) => b.ref),
             targets: [genCase.executeCall.ref],
           });
+          statuses["generatorGuarded"] = genGuardedRes!.status;
+
+          const [genRes] = await ctx.branchCoverage({
+            function: genCase.fn.ref,
+            branches: [],
+            targets: [genCase.executeCall.ref],
+          });
           statuses["generator"] = genRes!.status;
-          gapKinds["generator"] = genRes!.gaps.map((g) => g.kind);
-          allGaps.push(...genRes!.gaps);
+          if (genRes!.status === "inconclusive") {
+            gapKinds["generator"] = genRes!.gaps.map((g) => g.kind);
+            allGaps.push(...genRes!.gaps);
+          }
 
           // Outer function querying target inside nested closure must not confuse scopes
           const outerCase = findFn("function outerWithClosure(");
@@ -461,8 +497,10 @@ void describe("tssae branchCoverage", () => {
             targets: [outerCase.executeCall.ref],
           });
           statuses["outerForInnerTarget"] = outerRes!.status;
-          gapKinds["outerForInnerTarget"] = outerRes!.gaps.map((g) => g.kind);
-          allGaps.push(...outerRes!.gaps);
+          if (outerRes!.status === "inconclusive") {
+            gapKinds["outerForInnerTarget"] = outerRes!.gaps.map((g) => g.kind);
+            allGaps.push(...outerRes!.gaps);
+          }
 
           // Querying the inner arrow function directly works
           const innerArrow = fns.find(
@@ -481,22 +519,28 @@ void describe("tssae branchCoverage", () => {
 
         assert.equal(tryBranchCount, 2);
         assert.deepEqual(statuses, {
-          deadAfterReturn: "unreachable",
-          deadIfFalse: "unreachable",
-          deadAfterSwitch: "unreachable",
-          tryCatch: "unknown",
-          loop: "unknown",
-          generator: "unknown",
-          outerForInnerTarget: "unknown",
-          innerDirect: "bypass",
+          deadAfterReturn: "proved",
+          deadIfFalse: "proved",
+          deadAfterSwitch: "proved",
+          tryCatchGuarded: "proved",
+          tryCatch: "disproved",
+          loopGuarded: "proved",
+          loop: "disproved",
+          generatorGuarded: "proved",
+          generator: "disproved",
+          outerForInnerTarget: "inconclusive",
+          innerDirect: "disproved",
+        });
+        assert.deepEqual(reachability, {
+          deadAfterReturn: false,
+          deadIfFalse: false,
+          deadAfterSwitch: false,
+          tryCatchGuarded: true,
         });
         assert.deepEqual(gapKinds, {
-          tryCatch: ["unmodeled-try-catch"],
-          loop: ["unmodeled-loop"],
-          generator: ["unmodeled-generator"],
           outerForInnerTarget: ["target-outside-cfg"],
         });
-        assert.ok(allGaps.length >= 4);
+        assert.equal(allGaps.length, 1);
         assert.ok(
           allGaps.every(
             (gap) => gap.at !== undefined && gap.message.length > 0,
@@ -538,8 +582,9 @@ void describe("tssae branchCoverage", () => {
           targets: [secondExecute.ref],
         });
         foreignResultStatus = res!.status;
+        assert.equal(res!.status, "inconclusive");
         foreignGapKind = res!.gaps[0]?.kind;
-        assert.equal(foreignResultStatus, "unknown");
+        assert.equal(foreignResultStatus, "inconclusive");
         assert.equal(foreignGapKind, "foreign-branch-reference");
       } finally {
         await session1.close();
@@ -647,27 +692,962 @@ void describe("tssae branchCoverage", () => {
             });
             localStatuses[fnName] = localCov!.status;
             localGapCounts[fnName] =
-              localBranches!.gaps.length + localCov!.gaps.length;
+              localBranches!.gaps.length +
+              (localCov!.status === "inconclusive" ? localCov!.gaps.length : 0);
           }
         } finally {
           await session.close();
         }
 
         assert.deepEqual(wholeFnStatuses, {
-          loopWithBypass: "unknown",
-          tryLoopWithGuard: "unknown",
-          loopWithContinueGuard: "unknown",
+          loopWithBypass: "disproved",
+          tryLoopWithGuard: "disproved",
+          loopWithContinueGuard: "disproved",
         });
         assert.deepEqual(localStatuses, {
-          loopWithBypass: "bypass",
-          tryLoopWithGuard: "covered",
-          loopWithContinueGuard: "covered",
+          loopWithBypass: "disproved",
+          tryLoopWithGuard: "proved",
+          loopWithContinueGuard: "proved",
         });
         assert.deepEqual(localGapCounts, {
           loopWithBypass: 0,
           tryLoopWithGuard: 0,
           loopWithContinueGuard: 0,
         });
+      },
+    );
+  });
+
+  void it("excludes unrelated unknown constructs from gaps, proves guarded targets despite off-path unknowns, and reports known bypasses over parallel unknowns", async () => {
+    await withTempHost({}, async (host) => {
+      writeHostFiles(host.rootDir, {
+        "package.json": JSON.stringify(
+          { name: "ir-unrelated-gaps", private: true, type: "module" },
+          null,
+          2,
+        ),
+        "tsconfig.json": JSON.stringify(
+          {
+            compilerOptions: {
+              strict: true,
+              allowJs: true,
+              checkJs: false,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts", "src/**/*.cjs"],
+          },
+          null,
+          2,
+        ),
+        "src/legacy-with.cjs": `function unrelatedUnknownAroundGuard(req, debug) {
+  if (debug) {
+    with ({}) {}
+    return;
+  }
+  if (!isAuthorized(req)) {
+    return;
+  }
+  execute(req);
+  with ({}) {}
+}
+
+function knownBypassWithParallelUnknown(req, useWith) {
+  if (useWith) {
+    with ({}) {}
+  } else if (isAuthorized(req)) {
+    log(req);
+  }
+  execute(req);
+}
+
+function criticalVsOffPathUnknown(req, debug) {
+  if (debug) {
+    try {
+      log(req);
+    } catch {
+      log("err");
+    }
+    return;
+  }
+  if (isAuthorized(req)) {
+    with ({}) {}
+  } else {
+    return;
+  }
+  execute(req);
+}
+`,
+        "src/cases.ts": `declare function isAuthorized(req: string): boolean;
+declare function log(msg: string): void;
+declare function execute(req: string): void;
+
+export function optionalChainShortCircuit(
+  cfg: { readonly run?: (req: string) => void } | undefined,
+  req: string,
+): void {
+  cfg?.run?.(req);
+}
+`,
+      });
+      await host.typecheck();
+
+      const session = await openProject({
+        cwd: host.rootDir,
+        tsconfig: "tsconfig.json",
+      });
+      try {
+        const ctx = session.project();
+        const fns = await ctx.findSyntax({
+          files: ["src/legacy-with.cjs", "src/cases.ts"],
+          kinds: ["FunctionDeclaration"],
+        });
+        const calls = await ctx.findSyntax({
+          files: ["src/legacy-with.cjs", "src/cases.ts"],
+          kinds: ["CallExpression"],
+        });
+        const branchGroups = await ctx.listBranches(fns.map((f) => f.ref));
+
+        const findCase = (name: string) => {
+          const idx = fns.findIndex((f) =>
+            f.text.includes(`function ${name}(`),
+          );
+          assert.ok(idx >= 0, `expected ${name}`);
+          const fn = fns[idx]!;
+          const target = calls.find(
+            (c) =>
+              c.text.startsWith("execute(") &&
+              insideSpan(c.location, fn.location),
+          );
+          return { fn, branches: branchGroups[idx]!.branches, target };
+        };
+
+        // 1. Unrelated unknown in returning branch + unknown after target do NOT degrade proved
+        {
+          const c = findCase("unrelatedUnknownAroundGuard");
+          const authFalse = c.branches.find(
+            (b) =>
+              b.conditionText === "!isAuthorized(req)" &&
+              b.direction === "false",
+          )!;
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [authFalse.ref],
+            targets: [c.target!.ref],
+          });
+          assert.equal(res!.status, "proved");
+          assert.equal(res!.targetReachable, true);
+        }
+
+        // 2. Known explicit bypass alongside parallel unknown yields "disproved" with counterexamplePath
+        {
+          const c = findCase("knownBypassWithParallelUnknown");
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [],
+            targets: [c.target!.ref],
+          });
+          assert.ok(res);
+          assert.equal(res.status, "disproved");
+          if (res.status === "disproved") {
+            assert.ok(res.counterexamplePath.steps.length >= 2);
+            assert.ok(res.counterexamplePath.evidence.length >= 2);
+          }
+        }
+
+        // 3. Critical-path unknown yields "inconclusive" with ONLY critical-path unmodeled gaps
+        {
+          const c = findCase("criticalVsOffPathUnknown");
+          const authFalse = c.branches.find(
+            (b) =>
+              b.conditionText === "isAuthorized(req)" &&
+              b.direction === "false",
+          );
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: authFalse ? [authFalse.ref] : [],
+            targets: [c.target!.ref],
+          });
+          assert.ok(res);
+          assert.equal(res.status, "inconclusive");
+          if (res.status === "inconclusive") {
+            assert.ok(res.gaps.length >= 1);
+            assert.ok(res.gaps.every((g) => g.kind === "with-statement"));
+            assert.ok(res.gaps.every((g) => insideSpan(g.at!, c.fn.location)));
+          }
+        }
+
+        // 4. Optional chaining `?.` exposes optionalChain continue/shortCircuit branches
+        {
+          const c = findCase("optionalChainShortCircuit");
+          const optBranches = c.branches.filter(
+            (b) => b.kind === "optionalChain",
+          );
+          assert.ok(
+            optBranches.some((b) => b.direction === "continue") &&
+              optBranches.some((b) => b.direction === "shortCircuit"),
+          );
+        }
+      } finally {
+        await session.close();
+      }
+    });
+  });
+
+  void it("models loops, labeled jumps, try/catch/finally, yield/await, explicit throw, and implicit mayThrow conclusions", async () => {
+    await withTempHost({}, async (host) => {
+      writeHostFiles(host.rootDir, {
+        "package.json": JSON.stringify(
+          { name: "ir-control-flow-ticket-04", private: true, type: "module" },
+          null,
+          2,
+        ),
+        "tsconfig.json": JSON.stringify(
+          {
+            compilerOptions: {
+              strict: true,
+              allowJs: true,
+              checkJs: false,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts", "src/**/*.cjs"],
+          },
+          null,
+          2,
+        ),
+        "src/control-flow.ts": `declare function execute(tag: string): void;
+declare function risky(): void;
+declare function mightThrow(): void;
+declare function cleanup(): void;
+declare function asyncStream(): AsyncIterable<string>;
+
+export function collatzGuarded(n: number, ok: boolean): void {
+  while (n !== 1) {
+    if (n % 2 === 0) {
+      n = n / 2;
+    } else {
+      n = 3 * n + 1;
+    }
+  }
+  if (!ok) {
+    return;
+  }
+  execute("collatz");
+}
+
+export function explicitThrowIntoCatch(ok: boolean): void {
+  try {
+    if (!ok) {
+      throw "explicit";
+    }
+    return;
+  } catch {
+    execute("caught-explicit");
+  }
+}
+
+export function explicitThrowSwallowedBypass(ok: boolean): void {
+  try {
+    if (!ok) {
+      throw "swallowed";
+    }
+    return;
+  } catch {
+    // swallowed
+  }
+  execute("after-explicit-catch");
+}
+
+export function implicitThrowToCatchOnly(): void {
+  try {
+    risky();
+  } catch {
+    execute("caught-implicit");
+  }
+}
+
+export function implicitThrowBeforeGuard(ok: boolean): void {
+  try {
+    mightThrow();
+    if (!ok) {
+      return;
+    }
+  } catch {
+    execute("catch-bypass");
+  }
+}
+
+export function guardedImplicitThrowInTryBeforeTarget(ok: boolean): void {
+  try {
+    if (!ok) {
+      mightThrow();
+      return;
+    }
+  } catch {}
+  execute("after-try-implicit");
+}
+
+export function guardedBeforeTryImplicitThrow(ok: boolean): void {
+  if (!ok) {
+    return;
+  }
+  try {
+    mightThrow();
+  } catch {}
+  execute("safe-after-try");
+}
+
+export function tryFinallyReturnRouting(ok: boolean): void {
+  try {
+    if (!ok) {
+      return;
+    }
+  } finally {
+    cleanup();
+  }
+  execute("after-finally");
+}
+
+export function tryFinallyOverrideReturn(ok: boolean): void {
+  try {
+    if (!ok) {
+      return;
+    }
+  } finally {
+    return;
+  }
+  // oxlint-disable-next-line no-unreachable
+  execute("unreachable-after-finally-return");
+}
+
+export function labeledBreakWithFinally(ok: boolean): void {
+  outer: for (let i = 0; i < 2; i++) {
+    try {
+      if (!ok) {
+        break outer;
+      }
+    } finally {
+      cleanup();
+    }
+    execute("inside-outer");
+  }
+}
+
+export function labeledContinueOuterLoop(ok: boolean): void {
+  outer: for (let i = 0; i < 2; i++) {
+    let j = 0;
+    do {
+      if (ok) {
+        continue outer;
+      }
+      j += 1;
+    } while (j < 2);
+    execute("after-inner-loop");
+  }
+}
+
+export function labeledBlockBreak(ok: boolean): void {
+  blockExit: {
+    if (!ok) {
+      break blockExit;
+    }
+    execute("inside-labeled-block");
+  }
+}
+
+export async function awaitRejectionBypass(p: Promise<void>): Promise<void> {
+  try {
+    await p;
+  } catch {
+    execute("caught-await");
+  }
+}
+
+export function* generatorYieldVariants(
+  other: Generator<number>,
+  ok: boolean,
+): Generator<number> {
+  yield 1;
+  try {
+    yield* other;
+  } catch {
+    execute("caught-yield-star");
+  }
+  if (!ok) {
+    return;
+  }
+  execute("after-yield");
+}
+
+export async function forAwaitAndDoWhile(items: Record<string, number>): Promise<void> {
+  let count = 0;
+  do {
+    count += 1;
+  } while (count < 2);
+  for (const key in items) {
+    if (key === "skip") {
+      continue;
+    }
+  }
+  for await (const item of asyncStream()) {
+    if (item === "ok") {
+      execute("for-await");
+    }
+  }
+}
+`,
+        "src/with-bypass.cjs": `function implicitBypassThroughUnknown(flag) {
+  try {
+    if (flag) {
+      with ({}) {}
+      risky();
+    }
+  } catch {
+    execute("caught-unknown-implicit");
+  }
+}
+`,
+      });
+      await host.typecheck();
+
+      const session = await openProject({
+        cwd: host.rootDir,
+        tsconfig: "tsconfig.json",
+      });
+      try {
+        const ctx = session.project();
+        const fns = await ctx.findSyntax({
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
+          kinds: ["FunctionDeclaration"],
+        });
+        const calls = await ctx.findSyntax({
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
+          kinds: ["CallExpression"],
+        });
+        const exprStmts = await ctx.findSyntax({
+          files: ["src/control-flow.ts", "src/with-bypass.cjs"],
+          kinds: ["ExpressionStatement"],
+        });
+        const branchGroups = await ctx.listBranches(fns.map((f) => f.ref));
+
+        const getCase = (name: string) => {
+          const idx = fns.findIndex(
+            (f) =>
+              f.text.includes(`function ${name}(`) ||
+              f.text.includes(`function* ${name}(`),
+          );
+          assert.ok(idx >= 0, `expected function ${name}`);
+          const fn = fns[idx]!;
+          const group = branchGroups[idx]!;
+          const fnCalls = calls.filter((c) =>
+            insideSpan(c.location, fn.location),
+          );
+          const execCalls = fnCalls.filter((c) =>
+            c.text.startsWith("execute("),
+          );
+          return { fn, group, fnCalls, execCalls };
+        };
+
+        // 1. Collatz loop + guard -> both proved, loop branches exposed
+        {
+          const c = getCase("collatzGuarded");
+          assert.equal(c.group.gaps.length, 0);
+          assert.ok(
+            c.group.branches.some(
+              (b) => b.kind === "loop" && b.conditionText === "n !== 1",
+            ),
+          );
+          const guardFalse = c.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [guarded] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [guardFalse.ref],
+            targets: [c.execCalls[0]!.ref],
+          });
+          assert.equal(guarded!.status, "proved");
+          assert.equal(guarded!.targetReachable, true);
+          assert.equal(guarded!.implicitExceptions.status, "proved");
+
+          const [unguarded] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [],
+            targets: [c.execCalls[0]!.ref],
+          });
+          assert.equal(unguarded!.status, "disproved");
+        }
+
+        // 2. Explicit throw bypassing guard -> main status disproved with counterexamplePath
+        {
+          const c1 = getCase("explicitThrowIntoCatch");
+          const guardFalse = c1.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [res1] = await ctx.branchCoverage({
+            function: c1.fn.ref,
+            branches: [guardFalse.ref],
+            targets: [c1.execCalls[0]!.ref],
+          });
+          assert.equal(res1!.status, "disproved");
+          assert.equal(res1!.targetReachable, true);
+          assert.equal(res1!.implicitExceptions.status, "proved");
+          if (res1!.status === "disproved") {
+            assert.ok(
+              res1!.counterexamplePath.steps.some((s) =>
+                s.description.includes("Explicit throw"),
+              ),
+            );
+          }
+
+          const c2 = getCase("explicitThrowSwallowedBypass");
+          const guardFalse2 = c2.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [res2] = await ctx.branchCoverage({
+            function: c2.fn.ref,
+            branches: [guardFalse2.ref],
+            targets: [c2.execCalls[0]!.ref],
+          });
+          assert.equal(res2!.status, "disproved");
+          assert.equal(res2!.implicitExceptions.status, "proved");
+        }
+
+        // 3. Catch reachable ONLY via implicit exception -> main proved (unreachable), implicit disproved with mayThrowSites
+        {
+          const c = getCase("implicitThrowToCatchOnly");
+          const riskyCall = c.fnCalls.find((x) => x.text === "risky()")!;
+          const [res] = await ctx.branchCoverage({
+            function: c.fn.ref,
+            branches: [],
+            targets: [c.execCalls[0]!.ref],
+          });
+          assert.equal(res!.status, "proved");
+          assert.equal(res!.targetReachable, false);
+          assert.equal(res!.implicitExceptions.status, "disproved");
+          if (res!.implicitExceptions.status === "disproved") {
+            assert.ok(
+              res!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === riskyCall.location.line,
+              ),
+            );
+            assert.ok(
+              res!.implicitExceptions.evidence.some(
+                (ev) => ev.at?.line === riskyCall.location.line,
+              ),
+            );
+            assert.ok(
+              evidenceOf(res!.implicitExceptions).some(
+                (ev) => ev.at?.line === riskyCall.location.line,
+              ),
+            );
+          }
+        }
+
+        // 4. Implicit throw before guard vs guarded in try vs guarded before try
+        {
+          const cBefore = getCase("implicitThrowBeforeGuard");
+          const mightCall = cBefore.fnCalls.find(
+            (x) => x.text === "mightThrow()",
+          )!;
+          const guardFalse = cBefore.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resBefore] = await ctx.branchCoverage({
+            function: cBefore.fn.ref,
+            branches: [guardFalse.ref],
+            targets: [cBefore.execCalls[0]!.ref],
+          });
+          assert.equal(resBefore!.status, "proved");
+          assert.equal(resBefore!.targetReachable, false);
+          assert.equal(resBefore!.implicitExceptions.status, "disproved");
+          if (resBefore!.implicitExceptions.status === "disproved") {
+            assert.ok(
+              resBefore!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === mightCall.location.line,
+              ),
+            );
+          }
+
+          const cInTry = getCase("guardedImplicitThrowInTryBeforeTarget");
+          const mightInTry = cInTry.fnCalls.find(
+            (x) => x.text === "mightThrow()",
+          )!;
+          const guardInTry = cInTry.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resInTry] = await ctx.branchCoverage({
+            function: cInTry.fn.ref,
+            branches: [guardInTry.ref],
+            targets: [cInTry.execCalls[0]!.ref],
+          });
+          assert.equal(resInTry!.status, "proved");
+          assert.equal(resInTry!.targetReachable, true);
+          assert.equal(resInTry!.implicitExceptions.status, "disproved");
+          if (resInTry!.implicitExceptions.status === "disproved") {
+            assert.ok(
+              resInTry!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === mightInTry.location.line,
+              ),
+            );
+          }
+
+          const cSafe = getCase("guardedBeforeTryImplicitThrow");
+          const guardSafe = cSafe.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resSafe] = await ctx.branchCoverage({
+            function: cSafe.fn.ref,
+            branches: [guardSafe.ref],
+            targets: [cSafe.execCalls[0]!.ref],
+          });
+          assert.equal(resSafe!.status, "proved");
+          assert.equal(resSafe!.targetReachable, true);
+          assert.equal(resSafe!.implicitExceptions.status, "proved");
+        }
+
+        // 5. finally completion routing, override return, labeled break/continue, labeled block
+        {
+          const cFinally = getCase("tryFinallyReturnRouting");
+          const guardFalse = cFinally.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resFinally] = await ctx.branchCoverage({
+            function: cFinally.fn.ref,
+            branches: [guardFalse.ref],
+            targets: [cFinally.execCalls[0]!.ref],
+          });
+          assert.equal(resFinally!.status, "proved");
+          assert.equal(resFinally!.targetReachable, true);
+          assert.equal(resFinally!.implicitExceptions.status, "proved");
+
+          const cOverride = getCase("tryFinallyOverrideReturn");
+          const [resOverride] = await ctx.branchCoverage({
+            function: cOverride.fn.ref,
+            branches: [],
+            targets: [cOverride.execCalls[0]!.ref],
+          });
+          assert.equal(resOverride!.status, "proved");
+          assert.equal(resOverride!.targetReachable, false);
+
+          const cLblBreak = getCase("labeledBreakWithFinally");
+          const breakGuardFalse = cLblBreak.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resLblBreak] = await ctx.branchCoverage({
+            function: cLblBreak.fn.ref,
+            branches: [breakGuardFalse.ref],
+            targets: [cLblBreak.execCalls[0]!.ref],
+          });
+          assert.equal(resLblBreak!.status, "proved");
+          assert.equal(resLblBreak!.implicitExceptions.status, "proved");
+
+          const cLblCont = getCase("labeledContinueOuterLoop");
+          const contGuardFalse = cLblCont.group.branches.find(
+            (b) => b.conditionText === "ok" && b.direction === "false",
+          )!;
+          const [resLblCont] = await ctx.branchCoverage({
+            function: cLblCont.fn.ref,
+            branches: [contGuardFalse.ref],
+            targets: [cLblCont.execCalls[0]!.ref],
+          });
+          assert.equal(resLblCont!.status, "proved");
+
+          const cLblBlock = getCase("labeledBlockBreak");
+          const blkGuardFalse = cLblBlock.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resLblBlock] = await ctx.branchCoverage({
+            function: cLblBlock.fn.ref,
+            branches: [blkGuardFalse.ref],
+            targets: [cLblBlock.execCalls[0]!.ref],
+          });
+          assert.equal(resLblBlock!.status, "proved");
+        }
+
+        // 6. await, yield/yield*, do...while, for...in, for await...of have zero gaps and model rejections
+        {
+          const cAwait = getCase("awaitRejectionBypass");
+          assert.equal(cAwait.group.gaps.length, 0);
+          const awaitStmt = exprStmts.find(
+            (s) =>
+              s.text.startsWith("await ") &&
+              insideSpan(s.location, cAwait.fn.location),
+          )!;
+          const [resAwait] = await ctx.branchCoverage({
+            function: cAwait.fn.ref,
+            branches: [],
+            targets: [cAwait.execCalls[0]!.ref],
+          });
+          assert.equal(resAwait!.status, "proved");
+          assert.equal(resAwait!.targetReachable, false);
+          assert.equal(resAwait!.implicitExceptions.status, "disproved");
+          if (resAwait!.implicitExceptions.status === "disproved") {
+            assert.ok(
+              resAwait!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === awaitStmt.location.line,
+              ),
+            );
+          }
+
+          const cGen = getCase("generatorYieldVariants");
+          assert.equal(cGen.group.gaps.length, 0);
+          const yieldStarStmt = exprStmts.find(
+            (s) =>
+              s.text.startsWith("yield*") &&
+              insideSpan(s.location, cGen.fn.location),
+          )!;
+          const genGuardFalse = cGen.group.branches.find(
+            (b) => b.conditionText === "!ok" && b.direction === "false",
+          )!;
+          const [resCaughtYield, resAfterYield] = await ctx.branchCoverage({
+            function: cGen.fn.ref,
+            branches: [genGuardFalse.ref],
+            targets: [cGen.execCalls[0]!.ref, cGen.execCalls[1]!.ref],
+          });
+          assert.equal(resCaughtYield!.status, "proved");
+          assert.equal(resCaughtYield!.targetReachable, false);
+          assert.equal(resCaughtYield!.implicitExceptions.status, "disproved");
+          if (resCaughtYield!.implicitExceptions.status === "disproved") {
+            assert.ok(
+              resCaughtYield!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === yieldStarStmt.location.line,
+              ),
+            );
+          }
+          assert.equal(resAfterYield!.status, "proved");
+          assert.equal(resAfterYield!.targetReachable, true);
+          assert.equal(resAfterYield!.implicitExceptions.status, "proved");
+
+          const cForAwait = getCase("forAwaitAndDoWhile");
+          assert.equal(cForAwait.group.gaps.length, 0);
+          const itemOkBranch = cForAwait.group.branches.find(
+            (b) =>
+              b.conditionText === 'item === "ok"' && b.direction === "true",
+          )!;
+          const [resForAwait] = await ctx.branchCoverage({
+            function: cForAwait.fn.ref,
+            branches: [itemOkBranch.ref],
+            targets: [cForAwait.execCalls[0]!.ref],
+          });
+          assert.equal(resForAwait!.status, "proved");
+          assert.equal(resForAwait!.targetReachable, true);
+        }
+
+        // 7. Implicit exception path passing through Unknown -> inconclusive with gaps + mayThrowSites
+        {
+          const cUnk = getCase("implicitBypassThroughUnknown");
+          const riskyCall = cUnk.fnCalls.find((x) => x.text === "risky()")!;
+          const [resUnk] = await ctx.branchCoverage({
+            function: cUnk.fn.ref,
+            branches: [],
+            targets: [cUnk.execCalls[0]!.ref],
+          });
+          assert.equal(resUnk!.status, "proved");
+          assert.equal(resUnk!.targetReachable, false);
+          assert.equal(resUnk!.implicitExceptions.status, "inconclusive");
+          if (resUnk!.implicitExceptions.status === "inconclusive") {
+            assert.ok(resUnk!.implicitExceptions.gaps.length >= 1);
+            assert.ok(
+              resUnk!.implicitExceptions.gaps.every(
+                (g) => g.kind === "with-statement",
+              ),
+            );
+            assert.ok(
+              resUnk!.implicitExceptions.mayThrowSites.some(
+                (loc) => loc.line === riskyCall.location.line,
+              ),
+            );
+          }
+        }
+      } finally {
+        await session.close();
+      }
+    });
+  });
+
+  void it("short-circuits left-associative && and || value chains directly without infeasible join paths", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/chains.ts": [
+            "interface Pair {",
+            "  firstPart: string;",
+            "  chordPart: string;",
+            "}",
+            "function equals(a: string, b: string): boolean {",
+            "  return a === b;",
+            "}",
+            "function eq1(a: Pair, b: Pair): boolean {",
+            "  return equals(a.firstPart, b.firstPart);",
+            "}",
+            "function eq2(a: Pair, b: Pair): boolean {",
+            "  return equals(a.chordPart, b.chordPart);",
+            "}",
+            "export function samePair(a: Pair | undefined, b: Pair | undefined): boolean {",
+            "  return !!a && !!b && eq1(a, b) && eq2(a, b);",
+            "}",
+            "function fallbackA(): string { return 'a'; }",
+            "function fallbackB(): string { return 'b'; }",
+            "export function firstTruthy(a: string, b: string, c: string): string {",
+            "  return a || b || c || fallbackA() || fallbackB();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/chains.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const calls = await ctx.findSyntax({
+            files: ["src/chains.ts"],
+            kinds: ["CallExpression"],
+          });
+          const branchGroups = await ctx.listBranches(fns.map((fn) => fn.ref));
+
+          const samePairIdx = fns.findIndex((f) =>
+            f.text.includes("function samePair("),
+          );
+          assert.ok(samePairIdx >= 0);
+          const samePairFn = fns[samePairIdx]!;
+          const samePairBranches = branchGroups[samePairIdx]!.branches;
+          const eq1Call = calls.find(
+            (c) =>
+              c.text.startsWith("eq1(") &&
+              insideSpan(c.location, samePairFn.location),
+          )!;
+          const eq2Call = calls.find(
+            (c) =>
+              c.text.startsWith("eq2(") &&
+              insideSpan(c.location, samePairFn.location),
+          )!;
+
+          const andContA = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a",
+          )!;
+          const andContAB = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a && !!b",
+          )!;
+          const andContABC = samePairBranches.find(
+            (b) =>
+              b.kind === "logicalAnd" &&
+              b.direction === "continue" &&
+              b.conditionText === "!!a && !!b && eq1(a, b)",
+          )!;
+
+          for (const branch of [andContA, andContAB]) {
+            const [resEq1, resEq2] = await ctx.branchCoverage({
+              function: samePairFn.ref,
+              branches: [branch.ref],
+              targets: [eq1Call.ref, eq2Call.ref],
+            });
+            assert.equal(resEq1!.status, "proved");
+            assert.equal(resEq1!.targetReachable, true);
+            assert.equal(resEq2!.status, "proved");
+            assert.equal(resEq2!.targetReachable, true);
+          }
+
+          const [resAndABC] = await ctx.branchCoverage({
+            function: samePairFn.ref,
+            branches: [andContABC.ref],
+            targets: [eq2Call.ref],
+          });
+          assert.equal(resAndABC!.status, "proved");
+          assert.equal(resAndABC!.targetReachable, true);
+
+          const firstTruthyIdx = fns.findIndex((f) =>
+            f.text.includes("function firstTruthy("),
+          );
+          assert.ok(firstTruthyIdx >= 0);
+          const firstTruthyFn = fns[firstTruthyIdx]!;
+          const firstTruthyBranches = branchGroups[firstTruthyIdx]!.branches;
+          const fallbackACall = calls.find(
+            (c) =>
+              c.text === "fallbackA()" &&
+              insideSpan(c.location, firstTruthyFn.location),
+          )!;
+          const fallbackBCall = calls.find(
+            (c) =>
+              c.text === "fallbackB()" &&
+              insideSpan(c.location, firstTruthyFn.location),
+          )!;
+
+          const orContA = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a",
+          )!;
+          const orContAB = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b",
+          )!;
+          const orContABC = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b || c",
+          )!;
+          const orContABCD = firstTruthyBranches.find(
+            (b) =>
+              b.kind === "logicalOr" &&
+              b.direction === "continue" &&
+              b.conditionText === "a || b || c || fallbackA()",
+          )!;
+
+          for (const branch of [orContA, orContAB, orContABC]) {
+            const [resFallbackA, resFallbackB] = await ctx.branchCoverage({
+              function: firstTruthyFn.ref,
+              branches: [branch.ref],
+              targets: [fallbackACall.ref, fallbackBCall.ref],
+            });
+            assert.equal(resFallbackA!.status, "proved");
+            assert.equal(resFallbackA!.targetReachable, true);
+            assert.equal(resFallbackB!.status, "proved");
+            assert.equal(resFallbackB!.targetReachable, true);
+          }
+
+          const [resOrABCD] = await ctx.branchCoverage({
+            function: firstTruthyFn.ref,
+            branches: [orContABCD.ref],
+            targets: [fallbackBCall.ref],
+          });
+          assert.equal(resOrABCD!.status, "proved");
+          assert.equal(resOrABCD!.targetReachable, true);
+        } finally {
+          await session.close();
+        }
       },
     );
   });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { withAcceptanceHost } from "@tssae/acceptance";
+import { linkNodeModulesPackage } from "@tssae/test-hosts";
 
 const fixtureTsconfig = JSON.stringify(
   {
@@ -27,6 +28,7 @@ const jsxAmbientSource = `declare namespace JSX {
 `;
 
 const sourcesTs = `import { createExternalResource } from "decl-only-ext";
+import { dtsOnlyWorkspaceOp } from "@ws/dts-only";
 
 export type RowPayload = {
   readonly id: number;
@@ -60,6 +62,10 @@ export function createConnection(label: string): LocalConnection {
 
 export function createWrappedExternal(name: string) {
   return createExternalResource(name);
+}
+
+export function callWorkspaceDtsOnly(value: string): string {
+  return dtsOnlyWorkspaceOp(value);
 }
 `;
 
@@ -150,7 +156,7 @@ const consumerSource = `import assert from "node:assert/strict";
 
 import {
   TssaeError,
-  defineModel,
+  defineSummaries,
   evidenceOf,
   extractBasisEvidence,
   isSameInstance,
@@ -169,20 +175,23 @@ import {
   type SyntaxRef,
 } from "tssae";
 
-const resourceModel = defineModel({
-  id: "acceptance-connection-model",
+const resourceSummaries = defineSummaries({
+  id: "acceptance-connection-summaries",
   description: "Local connections must be closed on all paths.",
-  instanceBehaviors: [
+  entries: [
     {
-      kind: "allocates-fresh-instance",
-      match: { symbol: "createConnection" },
+      match: { memberPath: ["createConnection"] },
+      instances: {
+        completeness: "complete",
+        outcome: { kind: "allocates-fresh-instance" },
+      },
     },
-  ],
-  cleanupOperations: [
     {
-      kind: "disposes-target",
-      match: { container: "LocalConnection", member: "close" },
-      target: "receiver",
+      match: { memberPath: ["LocalConnection", "prototype", "close"] },
+      effects: {
+        completeness: "complete",
+        resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+      },
     },
   ],
 });
@@ -191,7 +200,7 @@ const openMetrics: EngineCallIoMetrics[] = [];
 const session = await openProject({
   cwd: process.cwd(),
   tsconfig: "tsconfig.json",
-  models: [resourceModel],
+  summaries: { packs: [resourceSummaries] },
   observe: "summary",
   onRpcMetrics: (m) => openMetrics.push(m),
 });
@@ -233,6 +242,7 @@ try {
   const connACallSyn = appCalls.find((c) => c.text === 'createConnection("A")');
   const connBCallSyn = appCalls.find((c) => c.text === 'createConnection("B")');
   const extCallSyn = sourceCalls.find((c) => c.text.startsWith("createExternalResource("));
+  const wsDtsCallSyn = sourceCalls.find((c) => c.text.startsWith("dtsOnlyWorkspaceOp("));
   const loadRowDeclSyn = sourceDecls.find((d) => d.text.includes("function loadRow"));
   const uncalledDeclSyn = sourceDecls.find((d) => d.text.includes("function uncalledHelper"));
   const acceptRowCallSyn = appCalls.find((c) => c.text.startsWith("acceptPublicRow("));
@@ -245,6 +255,7 @@ try {
       connACallSyn &&
       connBCallSyn &&
       extCallSyn &&
+      wsDtsCallSyn &&
       loadRowDeclSyn &&
       uncalledDeclSyn &&
       acceptRowCallSyn &&
@@ -260,8 +271,11 @@ try {
   const [loadRowResolved, acceptRowResolved, connAResolved] = resolvedAppCalls;
   assert.ok(loadRowResolved?.call && acceptRowResolved?.call && connAResolved?.call);
 
-  const [extCallResolved] = await ctx.resolveCalls([extCallSyn.ref]);
-  assert.ok(extCallResolved?.call);
+  const [extCallResolved, wsDtsCallResolved] = await ctx.resolveCalls([
+    extCallSyn.ref,
+    wsDtsCallSyn.ref,
+  ]);
+  assert.ok(extCallResolved?.call && wsDtsCallResolved?.call);
 
   // Chain CallRef -> calleesOf -> DeclarationRef -> callersOf
   const [loadRowCallees] = await ctx.calleesOf([loadRowResolved.call]);
@@ -325,9 +339,19 @@ try {
       targets: [deadSinkCallSyn.ref],
     }),
   ]);
-  assert.equal(covPositive[0]?.status, "covered");
-  assert.equal(covNegative[0]?.status, "bypass");
-  assert.equal(covDead[0]?.status, "unreachable");
+  assert.equal(covPositive[0]?.status, "proved");
+  assert.equal(covPositive[0]?.targetReachable, true);
+  assert.equal(covPositive[0]?.implicitExceptions.status, "proved");
+  assert.equal(covNegative[0]?.status, "disproved");
+  assert.equal(covNegative[0]?.targetReachable, true);
+  assert.equal(covNegative[0]?.implicitExceptions.status, "proved");
+  assert.ok(
+    covNegative[0]?.status === "disproved" &&
+      covNegative[0].counterexamplePath.steps.length > 0,
+  );
+  assert.equal(covDead[0]?.status, "proved");
+  assert.equal(covDead[0]?.targetReachable, false);
+  assert.equal(covDead[0]?.implicitExceptions.status, "proved");
 
   // 3. Value propagation + retained object fields (positive & negative)
   const appVars = await ctx.findSyntax({
@@ -344,11 +368,11 @@ try {
     to: [acceptRowResolved.arguments[0], unrelatedVar.initializer],
   });
   const [propPositive, propNegative] = propResult.results;
-  assert.equal(propPositive?.reachable, true);
-  assert.equal(propNegative?.reachable, false);
+  assert.equal(propPositive?.status, "proved");
+  assert.equal(propNegative?.status, "disproved");
 
-  const propPath = propPositive?.paths[0];
-  assert.ok(propPath);
+  assert.ok(propPositive?.status === "proved");
+  const propPath = propPositive.paths[0];
   const retained = resolveRetainedObjectFields(
     { fields: ["id", "name", "secret"] },
     propPath,
@@ -365,7 +389,14 @@ try {
     aliasAVar.initializer,
     connBCallSyn.ref,
   ]);
-  assert.ok(instA?.instance && instAliasA?.instance && instB?.instance);
+  assert.ok(
+    instA?.status === "proved" &&
+      instA.instance !== null &&
+      instAliasA?.status === "proved" &&
+      instAliasA.instance !== null &&
+      instB?.status === "proved" &&
+      instB.instance !== null,
+  );
   assert.equal(isSameInstance(instA.instance, instAliasA.instance), true);
   assert.equal(isSameInstance(instA.instance, instB.instance), false);
 
@@ -374,12 +405,13 @@ try {
       instanceKey: true,
       originKind: true,
       allocationLocation: true,
-      modelId: true,
+      summaryId: true,
       evidence: true,
     },
   });
-  assert.equal(projectedInstA?.originKind, "allocation");
-  assert.equal(projectedInstA?.allocationLocation?.file, "src/sources.ts");
+  assert.equal(projectedInstA?.originKind, "summary-allocation");
+  assert.equal(projectedInstA?.summaryId, "acceptance-connection-summaries");
+  assert.equal(projectedInstA?.allocationLocation?.file, "src/app.ts");
 
   const [cleanupScope] = await ctx.instanceCleanup({
     scopes: [processOrderFn.ref],
@@ -392,12 +424,12 @@ try {
   const cleanupB = cleanupScope.targetResults.find((tr) =>
     isSameInstance(tr.instance, instB.instance),
   );
-  assert.equal(cleanupA?.cleanedOnAllPaths, true);
-  assert.equal(cleanupB?.cleanedOnAllPaths, false);
+  assert.equal(cleanupA?.status, "proved");
+  assert.equal(cleanupB?.status, "disproved");
 
   // 5. Evidence traceability & external declaration-only gap handling
   const basis: readonly DiagnosticBasis[] = [
-    resourceModel,
+    resourceSummaries,
     loadRowTarget,
     propPath,
     loadRowCallSyn,
@@ -406,7 +438,7 @@ try {
   assert.ok(evidenceOf(propPath).length > 0);
   assert.ok(
     combinedEvidence.some(
-      (ev) => ev.kind === "model" && ev.modelId === "acceptance-connection-model",
+      (ev) => ev.kind === "summary" && ev.summaryId === "acceptance-connection-summaries",
     ),
   );
   const originMap = new Map(
@@ -426,12 +458,16 @@ try {
   const implResults = await ctx.resolveImplementations([
     extCallResolved.call,
     connAResolved.call,
+    wsDtsCallResolved.call,
   ]);
-  const [extImpl, localImpl] = implResults;
-  assert.equal(extImpl?.status, "declaration-only");
-  assert.ok((extImpl?.gaps.length ?? 0) > 0);
-  assert.equal(localImpl?.status, "source");
-  assert.deepEqual(localImpl?.gaps, []);
+  const [extImpl, localImpl, wsDtsImpl] = implResults;
+  assert.equal(extImpl?.status, "external");
+  assert.equal(extImpl?.packageName, "decl-only-ext");
+  assert.equal(localImpl?.status, "resolved");
+  assert.equal(localImpl?.implementation.resolutionSource, "current-project");
+  assert.equal(localImpl?.implementation.file, "src/sources.ts");
+  assert.equal(wsDtsImpl?.status, "inconclusive");
+  assert.ok((wsDtsImpl?.gaps.length ?? 0) > 0);
   assert.ok(observedGaps.length > 0);
   assert.ok(observedQueries.some((q) => q.op === "resolveImplementations"));
   assert.ok(observedRpc.some((m) => m.isQueryBatch && m.engineMetrics !== undefined));
@@ -490,7 +526,9 @@ try {
         isSameInstance(instA.instance, instB.instance),
       ],
       extImplStatus: extImpl?.status,
-      extGapKinds: extImpl?.gaps.map((g) => g.kind),
+      wsDtsImplStatus: wsDtsImpl?.status,
+      wsDtsGapKinds: wsDtsImpl?.gaps.map((g) => g.kind),
+      wsDtsGapMessages: wsDtsImpl?.gaps.map((g) => g.message),
       scannedDirectiveRules: directives.map((d) => d.ruleId),
     }) + "\\n",
   );
@@ -547,6 +585,27 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
         "node_modules/decl-only-ext/index.d.ts",
         "export declare function createExternalResource(name: string): { readonly name: string };\n",
       );
+      host.writeText(
+        "packages/ws-dts/package.json",
+        JSON.stringify(
+          {
+            name: "@ws/dts-only",
+            version: "1.0.0",
+            types: "./dist/index.d.ts",
+          },
+          null,
+          2,
+        ),
+      );
+      host.writeText(
+        "packages/ws-dts/dist/index.d.ts",
+        "export declare function dtsOnlyWorkspaceOp(value: string): string;\n",
+      );
+      linkNodeModulesPackage(
+        host.hostDir,
+        "@ws/dts-only",
+        host.resolvePath("packages/ws-dts"),
+      );
 
       const tscFixture = await host.runTsc("tsconfig.json");
       assert.equal(
@@ -578,20 +637,26 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
         readonly propRetained: readonly string[];
         readonly sameInstance: readonly boolean[];
         readonly extImplStatus: string;
-        readonly extGapKinds: readonly string[];
+        readonly wsDtsImplStatus: string;
+        readonly wsDtsGapKinds: readonly string[];
+        readonly wsDtsGapMessages: readonly string[];
         readonly scannedDirectiveRules: readonly string[];
       };
 
       assert.equal(summary.callersFound, 1);
       assert.deepEqual(summary.branchStatuses, [
-        "covered",
-        "bypass",
-        "unreachable",
+        "proved",
+        "disproved",
+        "proved",
       ]);
       assert.deepEqual(summary.propRetained, ["id", "name"]);
       assert.deepEqual(summary.sameInstance, [true, false]);
-      assert.equal(summary.extImplStatus, "declaration-only");
-      assert.ok(summary.extGapKinds.length > 0);
+      assert.equal(summary.extImplStatus, "external");
+      assert.equal(summary.wsDtsImplStatus, "inconclusive");
+      assert.ok(summary.wsDtsGapKinds.includes("missing-source-file"));
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /project references/i);
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /customConditions/);
+      assert.match(summary.wsDtsGapMessages[0] ?? "", /declarationMap/);
       assert.deepEqual(summary.scannedDirectiveRules, [
         "demo/guarded",
         "demo/block",

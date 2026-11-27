@@ -4,14 +4,12 @@ import { describe, it } from "node:test";
 import { withTempHost } from "@tssae/test-hosts";
 import {
   TssaeError,
-  defineAdapter,
-  defineFactProvider,
-  defineFactType,
-  defineModel,
+  defineSummaries,
   openProject,
   type BranchRef,
   type CallRef,
   type DeclarationRef,
+  type EngineCallIoMetrics,
   type InstanceRef,
   type SignatureRef,
   type SyntaxRef,
@@ -65,49 +63,30 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
         },
       },
       async (host) => {
-        const model = defineModel({
-          id: "resource-model",
-          instanceBehaviors: [
+        const resourceSummaries = defineSummaries({
+          id: "resource-summaries",
+          entries: [
             {
-              kind: "allocates-fresh-instance",
-              match: { symbol: "createClient" },
+              match: { memberPath: ["createClient"] },
+              instances: {
+                completeness: "complete",
+                outcome: { kind: "allocates-fresh-instance" },
+              },
             },
-          ],
-          cleanupOperations: [
             {
-              kind: "disposes-target",
-              match: { member: "dispose" },
-              target: "receiver",
+              match: { memberPath: ["dispose"] },
+              effects: {
+                completeness: "complete",
+                resourceOps: [{ kind: "disposes-target", target: "receiver" }],
+              },
             },
-          ],
-        });
-
-        const CallTagFact = defineFactType<"call", undefined, string>({
-          id: "test.call-tag",
-          subjectKind: "call",
-        });
-
-        const callTagAdapter = defineAdapter({
-          id: "call-tag-adapter",
-          provides: [
-            defineFactProvider(CallTagFact, async (ctx) => {
-              const calls = await ctx.findSyntax({ kinds: ["CallExpression"] });
-              const resolved = await ctx.resolveCalls(calls.map((c) => c.ref));
-              return resolved
-                .filter(
-                  (row): row is typeof row & { call: CallRef } =>
-                    row.call !== null,
-                )
-                .map((row) => ({ subject: row.call, value: "tagged" }));
-            }),
           ],
         });
 
         const session = await openProject({
           cwd: host.rootDir,
           tsconfig: "tsconfig.json",
-          models: [model],
-          adapters: [callTagAdapter],
+          summaries: { packs: [resourceSummaries] },
         });
 
         try {
@@ -153,7 +132,10 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
           const [instResolution] = await ctx1.resolveInstances([
             createSyntax.ref,
           ]);
-          const instanceRef = instResolution?.instance;
+          const instanceRef =
+            instResolution?.status === "proved"
+              ? instResolution.instance
+              : null;
           assert.ok(instanceRef);
 
           const staleSyntaxRef: SyntaxRef = pickSyntax.ref;
@@ -297,10 +279,6 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
                 scopes: [],
                 targets: [staleInstanceRef],
               }),
-            () =>
-              ctx2.facts(CallTagFact, {
-                targets: [staleCallRef],
-              }),
           ];
 
           for (const check of staleChecks) {
@@ -310,6 +288,128 @@ void describe("tssae snapshot updates and stale reference invalidation", () => {
                 err instanceof TssaeError && err.code === "STALE_REFERENCE",
             );
           }
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("reuses unchanged file IR caches and invalidates only edited files on session.update()", async () => {
+    await withTempHost(
+      {
+        files: {
+          "package.json": JSON.stringify({
+            name: "ir-cache-invalidation-host",
+            private: true,
+            type: "module",
+          }),
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2024",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/unchanged.ts": [
+            "export function keepCached(flag: boolean): number {",
+            "  if (flag) {",
+            "    return 1;",
+            "  }",
+            "  return 2;",
+            "}",
+            "",
+          ].join("\n"),
+          "src/mutable.ts": [
+            "export function willChange(flag: boolean): number {",
+            "  if (flag) {",
+            "    return 10;",
+            "  }",
+            "  return 20;",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        const openMetrics: EngineCallIoMetrics[] = [];
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+          observe: "summary",
+          onRpcMetrics: (m) => openMetrics.push(m),
+        });
+
+        try {
+          assert.equal(openMetrics.length, 1);
+          assert.equal(
+            openMetrics[0]?.engineMetrics?.lowering?.functionsLowered,
+            0,
+          );
+
+          const queryMetrics1: EngineCallIoMetrics[] = [];
+          const ctx1 = session.project(undefined, {
+            observer: {
+              observe: "summary",
+              onRpcMetrics: (m) => queryMetrics1.push(m),
+            },
+          });
+          const fns1 = await ctx1.findSyntax({
+            kinds: ["FunctionDeclaration"],
+          });
+          const keep1 = fns1.find((f) => f.text.includes("keepCached"));
+          const change1 = fns1.find((f) => f.text.includes("willChange"));
+          assert.ok(keep1 && change1);
+
+          await ctx1.listBranches([keep1.ref]);
+          await ctx1.listBranches([change1.ref]);
+
+          host.replaceText("src/mutable.ts", "return 10;", "return 99;");
+          const updateMetrics: EngineCallIoMetrics[] = [];
+          await session.update({
+            changed: ["src/mutable.ts"],
+            observe: "summary",
+            onRpcMetrics: (m) => updateMetrics.push(m),
+          });
+          assert.equal(updateMetrics.length, 1);
+          assert.equal(
+            updateMetrics[0]?.engineMetrics?.irCache?.filesReused,
+            1,
+          );
+          assert.equal(
+            updateMetrics[0]?.engineMetrics?.irCache?.filesInvalidated,
+            1,
+          );
+
+          const queryMetrics2: EngineCallIoMetrics[] = [];
+          const ctx2 = session.project(undefined, {
+            observer: {
+              observe: "summary",
+              onRpcMetrics: (m) => queryMetrics2.push(m),
+            },
+          });
+          const fns2 = await ctx2.findSyntax({
+            kinds: ["FunctionDeclaration"],
+          });
+          const keep2 = fns2.find((f) => f.text.includes("keepCached"));
+          const change2 = fns2.find((f) => f.text.includes("willChange"));
+          assert.ok(keep2 && change2);
+
+          queryMetrics2.length = 0;
+          await ctx2.listBranches([keep2.ref]);
+          const keepMetric = queryMetrics2.at(-1)?.engineMetrics;
+          assert.equal(keepMetric?.irCache?.functionHits, 1);
+          assert.equal(keepMetric?.irCache?.functionMisses, 0);
+          assert.equal(keepMetric?.lowering?.functionsLowered, 0);
+
+          queryMetrics2.length = 0;
+          await ctx2.listBranches([change2.ref]);
+          const changeMetric = queryMetrics2.at(-1)?.engineMetrics;
+          assert.equal(changeMetric?.irCache?.functionHits, 0);
+          assert.equal(changeMetric?.irCache?.functionMisses, 1);
+          assert.equal(changeMetric?.lowering?.functionsLowered, 1);
         } finally {
           await session.close();
         }

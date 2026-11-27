@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
+import type { ControlFlowPathStep } from "./branch-coverage.ts";
 import type { EngineClient, RpcRequestOptions } from "./engine-client.ts";
 import { recordSyntaxLocation, registerProvenance } from "./evidence.ts";
-import type { InstanceModelMatch } from "./instance-identity.ts";
 import { normalizeLookupFiles } from "./lookup-files.ts";
 import { validateProgramRefs } from "./projection.ts";
+import type { SummaryDiscoverySource } from "./summaries.ts";
 import {
   TssaeError,
   makeProgramRef,
@@ -17,42 +17,8 @@ import {
   type Gap,
   type InstanceRef,
   type LookupFilesOptions,
-  type Model,
   type SyntaxRef,
 } from "./types.ts";
-
-export type CleanupModelOperationKind =
-  | "disposes-target"
-  | "replaces-previous-value"
-  | "registers-into-container"
-  | "detaches-from-container";
-
-export type CleanupModelTarget =
-  | "receiver"
-  | { readonly argumentIndex: number };
-
-/**
- * Declares how a method call or property assignment disposes, replaces, registers, or detaches resource instances.
- */
-export type CleanupModelOperation = {
-  readonly kind: CleanupModelOperationKind;
-  readonly match: InstanceModelMatch;
-  readonly target?: CleanupModelTarget;
-  readonly containerTarget?: CleanupModelTarget;
-  readonly description?: string;
-};
-
-/**
- * Declares an API whose callback argument executes at the end of a resource/child lifecycle.
- */
-export type LifecycleEventBehavior = {
-  readonly kind: "lifecycle-end-callback";
-  readonly match: InstanceModelMatch;
-  /** 0-based argument index of the lifecycle-end callback. Defaults to `0`. */
-  readonly callbackArgumentIndex?: number;
-  readonly eventName?: string;
-  readonly description?: string;
-};
 
 export type CleanupScopeRef = SyntaxRef | CallRef | DeclarationRef;
 
@@ -63,36 +29,72 @@ export type InstanceCleanupOptions = LookupFilesOptions & {
   readonly targets?: readonly InstanceRef[];
 };
 
-export type CleanupCoverageStatus =
-  | "covered"
-  | "partial"
-  | "not-cleaned"
-  | "unknown";
+export type CleanupCoverageStatus = "proved" | "disproved" | "inconclusive";
 
 export type CleanupSiteInfo = {
   readonly instance: InstanceRef;
   readonly instanceKey: string;
   readonly allocationLocation: DiagnosticLocation | null;
-  readonly operationKind: CleanupModelOperationKind | (string & {});
+  readonly operationKind:
+    | "disposes-target"
+    | "replaces-previous-value"
+    | "registers-into-container"
+    | "detaches-from-container"
+    | (string & {});
   readonly syntax: SyntaxRef;
   readonly location: DiagnosticLocation;
   readonly viaCall: CallRef | null;
   readonly viaCallLocation: DiagnosticLocation | null;
-  readonly modelId: string;
+  readonly summaryId: string | null;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly evidence: readonly Evidence[];
 };
+
+/** Tri-state outcome evaluating implicit `mayThrow` exception paths during cleanup. */
+export type ImplicitExceptionCleanupOutcome =
+  | {
+      readonly status: "proved";
+      readonly cleanupSites: readonly CleanupSiteInfo[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly mayThrowSites: readonly DiagnosticLocation[];
+      readonly counterexamplePath: readonly ControlFlowPathStep[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly mayThrowSites: readonly DiagnosticLocation[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    };
 
 export type TargetInstanceCleanupResult = {
   readonly instance: InstanceRef;
   readonly instanceKey: string;
   readonly allocationLocation: DiagnosticLocation | null;
-  readonly status: CleanupCoverageStatus;
-  readonly cleanedOnAllPaths: boolean;
-  readonly cleanedOnAnyPath: boolean;
-  readonly cleanupSites: readonly CleanupSiteInfo[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+  readonly implicitExceptions: ImplicitExceptionCleanupOutcome;
+} & (
+  | {
+      readonly status: "proved";
+      readonly cleanupSites: readonly [CleanupSiteInfo, ...CleanupSiteInfo[]];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly cleanedOnAnyPath: boolean;
+      readonly cleanupSites: readonly CleanupSiteInfo[];
+      readonly uncleanedPath: readonly ControlFlowPathStep[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly cleanupSites: readonly CleanupSiteInfo[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 export type InstanceCleanupScopeResult = {
   readonly scope: CleanupScopeRef;
@@ -199,8 +201,15 @@ export type CallEffectsResult = {
   readonly callbackInvocations: readonly CallbackInvocationInfo[];
   readonly calls: readonly CallRef[];
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type RawCleanupSite = {
   readonly instance: string;
@@ -211,21 +220,55 @@ type RawCleanupSite = {
   readonly location: DiagnosticLocation;
   readonly viaCall: string | null;
   readonly viaCallLocation: DiagnosticLocation | null;
-  readonly modelId: string;
+  readonly summaryId: string | null;
+  readonly summarySource?: SummaryDiscoverySource;
   readonly evidence: readonly Evidence[];
 };
+
+type RawImplicitExceptionCleanupOutcome =
+  | {
+      readonly status: "proved";
+      readonly cleanupSites: readonly RawCleanupSite[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly mayThrowSites: readonly DiagnosticLocation[];
+      readonly counterexamplePath: readonly ControlFlowPathStep[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly mayThrowSites: readonly DiagnosticLocation[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    };
 
 type RawTargetCleanupRow = {
   readonly instance: string;
   readonly instanceKey: string;
   readonly allocationLocation: DiagnosticLocation | null;
-  readonly status: CleanupCoverageStatus;
-  readonly cleanedOnAllPaths: boolean;
-  readonly cleanedOnAnyPath: boolean;
-  readonly cleanupSites: readonly RawCleanupSite[];
-  readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+  readonly implicitExceptions: RawImplicitExceptionCleanupOutcome;
+} & (
+  | {
+      readonly status: "proved";
+      readonly cleanupSites: readonly RawCleanupSite[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "disproved";
+      readonly cleanedOnAnyPath: boolean;
+      readonly cleanupSites: readonly RawCleanupSite[];
+      readonly uncleanedPath: readonly ControlFlowPathStep[];
+      readonly evidence: readonly Evidence[];
+    }
+  | {
+      readonly status: "inconclusive";
+      readonly cleanupSites: readonly RawCleanupSite[];
+      readonly gaps: readonly Gap[];
+      readonly evidence: readonly Evidence[];
+    }
+);
 
 type RawInstanceCleanupRow = {
   readonly scope: string;
@@ -291,208 +334,21 @@ type RawCallEffectsRow = {
   readonly callbackInvocations: readonly RawCallbackInvocation[];
   readonly calls: readonly string[];
   readonly evidence: readonly Evidence[];
-  readonly gaps: readonly Gap[];
-};
+} & (
+  | {
+      readonly completeness: "complete";
+    }
+  | {
+      readonly completeness: "incomplete";
+      readonly gaps: readonly Gap[];
+    }
+);
 
 type EngineBatchResult = {
   readonly results: readonly {
     readonly items: readonly unknown[];
   }[];
 };
-
-function assertNonEmptyOptionalString(
-  value: unknown,
-  field: string,
-  modelId: string,
-  section: string,
-): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.${field} must be a non-empty string when provided.`,
-    );
-  }
-  return value;
-}
-
-function validateMatchObject(
-  modelId: string,
-  section: string,
-  match: unknown,
-): void {
-  if (typeof match !== "object" || match === null) {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.match must be an object.`,
-    );
-  }
-  const m = match as Record<string, unknown>;
-  const symbol = assertNonEmptyOptionalString(
-    m.symbol,
-    "match.symbol",
-    modelId,
-    section,
-  );
-  const container = assertNonEmptyOptionalString(
-    m.container,
-    "match.container",
-    modelId,
-    section,
-  );
-  const member = assertNonEmptyOptionalString(
-    m.member,
-    "match.member",
-    modelId,
-    section,
-  );
-  assertNonEmptyOptionalString(m.module, "match.module", modelId, section);
-
-  if (symbol === undefined && container === undefined && member === undefined) {
-    throw new TssaeError(
-      "INVALID_CONFIG",
-      `Model "${modelId}" ${section}.match must specify at least one of symbol, container, or member.`,
-    );
-  }
-}
-
-function validateModelTargetSpec(
-  modelId: string,
-  section: string,
-  field: string,
-  target: unknown,
-): void {
-  if (target === undefined || target === "receiver") return;
-  if (
-    typeof target === "object" &&
-    target !== null &&
-    "argumentIndex" in target
-  ) {
-    const idx = (target as { readonly argumentIndex: unknown }).argumentIndex;
-    if (typeof idx === "number" && Number.isInteger(idx) && idx >= 0) {
-      return;
-    }
-  }
-  throw new TssaeError(
-    "INVALID_CONFIG",
-    `Model "${modelId}" ${section}.${field} must be "receiver" or { argumentIndex: <non-negative integer> }.`,
-  );
-}
-
-/** Validates `cleanupOperations` and `lifecycleEvents` declared on a `Model`. */
-export function validateCleanupAndLifecycleModels(
-  modelId: string,
-  cleanupOperations: readonly CleanupModelOperation[] | undefined,
-  lifecycleEvents: readonly LifecycleEventBehavior[] | undefined,
-): void {
-  if (cleanupOperations !== undefined) {
-    if (!Array.isArray(cleanupOperations)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Model "${modelId}" cleanupOperations must be an array when provided.`,
-      );
-    }
-    for (const [index, op] of cleanupOperations.entries()) {
-      const section = `cleanupOperations[${String(index)}]`;
-      if (
-        typeof op !== "object" ||
-        op === null ||
-        (op.kind !== "disposes-target" &&
-          op.kind !== "replaces-previous-value" &&
-          op.kind !== "registers-into-container" &&
-          op.kind !== "detaches-from-container")
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section} has invalid kind.`,
-        );
-      }
-      validateMatchObject(modelId, section, op.match);
-      validateModelTargetSpec(modelId, section, "target", op.target);
-      validateModelTargetSpec(
-        modelId,
-        section,
-        "containerTarget",
-        op.containerTarget,
-      );
-      if (op.description !== undefined && typeof op.description !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.description must be a string.`,
-        );
-      }
-    }
-  }
-
-  if (lifecycleEvents !== undefined) {
-    if (!Array.isArray(lifecycleEvents)) {
-      throw new TssaeError(
-        "INVALID_CONFIG",
-        `Model "${modelId}" lifecycleEvents must be an array when provided.`,
-      );
-    }
-    for (const [index, ev] of lifecycleEvents.entries()) {
-      const section = `lifecycleEvents[${String(index)}]`;
-      if (
-        typeof ev !== "object" ||
-        ev === null ||
-        ev.kind !== "lifecycle-end-callback"
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section} has invalid kind.`,
-        );
-      }
-      validateMatchObject(modelId, section, ev.match);
-      if (
-        ev.callbackArgumentIndex !== undefined &&
-        (!Number.isInteger(ev.callbackArgumentIndex) ||
-          ev.callbackArgumentIndex < 0)
-      ) {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.callbackArgumentIndex must be a non-negative integer.`,
-        );
-      }
-      if (ev.eventName !== undefined && typeof ev.eventName !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.eventName must be a string.`,
-        );
-      }
-      if (ev.description !== undefined && typeof ev.description !== "string") {
-        throw new TssaeError(
-          "INVALID_CONFIG",
-          `Model "${modelId}" ${section}.description must be a string.`,
-        );
-      }
-    }
-  }
-}
-
-function serializeEffectsModels(models: readonly Model[]) {
-  const payload: Record<string, unknown>[] = [];
-  for (const model of models) {
-    const hasInstance =
-      model.instanceBehaviors !== undefined &&
-      model.instanceBehaviors.length > 0;
-    const hasCleanup =
-      model.cleanupOperations !== undefined &&
-      model.cleanupOperations.length > 0;
-    const hasLifecycle =
-      model.lifecycleEvents !== undefined && model.lifecycleEvents.length > 0;
-    if (!hasInstance && !hasCleanup && !hasLifecycle) {
-      continue;
-    }
-    payload.push({
-      id: model.id,
-      ...(hasInstance ? { instanceBehaviors: model.instanceBehaviors } : {}),
-      ...(hasCleanup ? { cleanupOperations: model.cleanupOperations } : {}),
-      ...(hasLifecycle ? { lifecycleEvents: model.lifecycleEvents } : {}),
-    });
-  }
-  return payload;
-}
 
 function mapCleanupSite(
   raw: RawCleanupSite,
@@ -535,7 +391,57 @@ function mapCleanupSite(
             )
           : null,
       viaCallLocation: raw.viaCallLocation,
-      modelId: raw.modelId,
+      summaryId: raw.summaryId,
+      ...(raw.summarySource !== undefined
+        ? { summarySource: raw.summarySource }
+        : {}),
+      evidence: raw.evidence,
+    },
+    raw.evidence,
+  );
+}
+
+function mapImplicitExceptionCleanup(
+  raw: RawImplicitExceptionCleanupOutcome,
+  sessionToken: symbol,
+  projectId: string,
+  snapshotId: number,
+  syntaxLocations?: WeakMap<SyntaxRef, DiagnosticLocation>,
+): ImplicitExceptionCleanupOutcome {
+  if (raw.status === "proved") {
+    return registerProvenance(
+      {
+        status: "proved",
+        cleanupSites: raw.cleanupSites.map((site) =>
+          mapCleanupSite(
+            site,
+            sessionToken,
+            projectId,
+            snapshotId,
+            syntaxLocations,
+          ),
+        ),
+        evidence: raw.evidence,
+      },
+      raw.evidence,
+    );
+  }
+  if (raw.status === "disproved") {
+    return registerProvenance(
+      {
+        status: "disproved",
+        mayThrowSites: raw.mayThrowSites,
+        counterexamplePath: raw.counterexamplePath,
+        evidence: raw.evidence,
+      },
+      raw.evidence,
+    );
+  }
+  return registerProvenance(
+    {
+      status: "inconclusive",
+      mayThrowSites: raw.mayThrowSites,
+      gaps: raw.gaps,
       evidence: raw.evidence,
     },
     raw.evidence,
@@ -777,11 +683,10 @@ export function createCallEffectsCache(): CallEffectsCache {
   };
 }
 
-/** Creates `callEffects` and `instanceCleanup` query methods bound to the active snapshot, project, and models. */
+/** Creates `callEffects` and `instanceCleanup` query methods bound to the active snapshot and project. */
 export function createCallEffectsQueries(deps: {
   readonly client: EngineClient;
   readonly cache: CallEffectsCache;
-  readonly models: readonly Model[];
   readonly sessionToken: symbol;
   readonly snapshotId: number;
   readonly projectId: string;
@@ -808,7 +713,6 @@ export function createCallEffectsQueries(deps: {
   const {
     client,
     cache,
-    models,
     sessionToken,
     snapshotId,
     projectId,
@@ -822,12 +726,6 @@ export function createCallEffectsQueries(deps: {
     getRpcOptions,
     onQueryCompleted,
   } = deps;
-
-  const engineModels = serializeEffectsModels(models);
-  const modelsDigest = createHash("sha256")
-    .update(JSON.stringify(engineModels))
-    .digest("hex")
-    .slice(0, 16);
 
   return {
     instanceCleanup: async (
@@ -852,7 +750,6 @@ export function createCallEffectsQueries(deps: {
       const cacheKey = JSON.stringify([
         snapshotId,
         projectId,
-        modelsDigest,
         lookupFiles ?? null,
         options.scopes.map((s) => s.handleId),
         targets.map((t) => t.handleId),
@@ -879,7 +776,6 @@ export function createCallEffectsQueries(deps: {
                   op: "instanceCleanup",
                   scopes: options.scopes.map((s) => s.handleId),
                   targets: targets.map((t) => t.handleId),
-                  models: engineModels,
                   ...(lookupFiles !== undefined ? { lookupFiles } : {}),
                 },
               ],
@@ -899,33 +795,75 @@ export function createCallEffectsQueries(deps: {
               }
               const targetResults: TargetInstanceCleanupResult[] =
                 raw.targetResults.map((tr) => {
+                  const instance =
+                    targetByHandle.get(tr.instance) ??
+                    makeProgramRef(
+                      "instance",
+                      sessionToken,
+                      projectId,
+                      snapshotId,
+                      tr.instance,
+                    );
+                  const implicitExceptions = mapImplicitExceptionCleanup(
+                    tr.implicitExceptions,
+                    sessionToken,
+                    projectId,
+                    snapshotId,
+                    syntaxLocations,
+                  );
+                  const cleanupSites = tr.cleanupSites.map((site) =>
+                    mapCleanupSite(
+                      site,
+                      sessionToken,
+                      projectId,
+                      snapshotId,
+                      syntaxLocations,
+                    ),
+                  );
+                  if (tr.status === "proved") {
+                    const provedSites = cleanupSites as [
+                      CleanupSiteInfo,
+                      ...CleanupSiteInfo[],
+                    ];
+                    return registerProvenance(
+                      {
+                        instance,
+                        instanceKey: tr.instanceKey,
+                        allocationLocation: tr.allocationLocation,
+                        implicitExceptions,
+                        status: "proved",
+                        cleanupSites: provedSites,
+                        evidence: tr.evidence,
+                      },
+                      tr.evidence,
+                    );
+                  }
+                  if (tr.status === "disproved") {
+                    return registerProvenance(
+                      {
+                        instance,
+                        instanceKey: tr.instanceKey,
+                        allocationLocation: tr.allocationLocation,
+                        implicitExceptions,
+                        status: "disproved",
+                        cleanedOnAnyPath: tr.cleanedOnAnyPath,
+                        cleanupSites,
+                        uncleanedPath: tr.uncleanedPath,
+                        evidence: tr.evidence,
+                      },
+                      tr.evidence,
+                    );
+                  }
                   return registerProvenance(
                     {
-                      instance:
-                        targetByHandle.get(tr.instance) ??
-                        makeProgramRef(
-                          "instance",
-                          sessionToken,
-                          projectId,
-                          snapshotId,
-                          tr.instance,
-                        ),
+                      instance,
                       instanceKey: tr.instanceKey,
                       allocationLocation: tr.allocationLocation,
-                      status: tr.status,
-                      cleanedOnAllPaths: tr.cleanedOnAllPaths,
-                      cleanedOnAnyPath: tr.cleanedOnAnyPath,
-                      cleanupSites: tr.cleanupSites.map((site) =>
-                        mapCleanupSite(
-                          site,
-                          sessionToken,
-                          projectId,
-                          snapshotId,
-                          syntaxLocations,
-                        ),
-                      ),
-                      evidence: tr.evidence,
+                      implicitExceptions,
+                      status: "inconclusive",
+                      cleanupSites,
                       gaps: tr.gaps,
+                      evidence: tr.evidence,
                     },
                     tr.evidence,
                   );
@@ -982,14 +920,19 @@ export function createCallEffectsQueries(deps: {
       for (const scopeResult of results) {
         recordGaps(scopeResult.gaps);
         for (const tr of scopeResult.targetResults) {
-          recordGaps(tr.gaps);
+          if (tr.status === "inconclusive") {
+            recordGaps(tr.gaps);
+          }
+          if (tr.implicitExceptions.status === "inconclusive") {
+            recordGaps(tr.implicitExceptions.gaps);
+          }
         }
       }
       if (onCleanupCovered) {
         for (const scopeResult of results) {
           const scopeLoc = resolveSyntaxLocation?.(scopeResult.scope);
           for (const tr of scopeResult.targetResults) {
-            if (!tr.cleanedOnAllPaths || tr.cleanupSites.length === 0) {
+            if (tr.status !== "proved" || tr.cleanupSites.length === 0) {
               continue;
             }
             const cleanupLocations: DiagnosticLocation[] = [];
@@ -1007,8 +950,12 @@ export function createCallEffectsQueries(deps: {
               }
             }
             const resolvedScopeLoc = scopeLoc ?? cleanupLocations[0]!;
-            const modelIds = [
-              ...new Set(tr.cleanupSites.map((s) => s.modelId)),
+            const summaryIds = [
+              ...new Set(
+                tr.cleanupSites
+                  .map((s) => s.summaryId)
+                  .filter((id): id is string => id !== null),
+              ),
             ].toSorted();
             const targetLocations: DiagnosticLocation[] = [
               resolvedScopeLoc,
@@ -1024,7 +971,7 @@ export function createCallEffectsQueries(deps: {
                 : {}),
               scopeLocation: resolvedScopeLoc,
               cleanupLocations,
-              modelIds,
+              summaryIds,
               summary: `Instance ${tr.instanceKey} is cleaned on all paths (${cleanupLocations.length} site(s))`,
               evidence: tr.evidence,
             };
@@ -1063,7 +1010,6 @@ export function createCallEffectsQueries(deps: {
       const cacheKey = JSON.stringify([
         snapshotId,
         projectId,
-        modelsDigest,
         followCallbacks,
         includeReads,
         includeWrites,
@@ -1097,7 +1043,6 @@ export function createCallEffectsQueries(deps: {
                   ...(options.maxDepth !== undefined
                     ? { maxDepth: options.maxDepth }
                     : {}),
-                  models: engineModels,
                 },
               ],
             },
@@ -1114,7 +1059,7 @@ export function createCallEffectsQueries(deps: {
                   `Engine omitted callEffects result for "${targetRef.handleId}".`,
                 );
               }
-              return {
+              const base = {
                 target: targetRef,
                 fieldReads: raw.fieldReads.map((e) =>
                   mapFieldEffect(
@@ -1162,8 +1107,17 @@ export function createCallEffectsQueries(deps: {
                   ),
                 ),
                 evidence: raw.evidence,
-                gaps: raw.gaps,
               };
+              return raw.completeness === "incomplete"
+                ? {
+                    ...base,
+                    completeness: "incomplete" as const,
+                    gaps: raw.gaps,
+                  }
+                : {
+                    ...base,
+                    completeness: "complete" as const,
+                  };
             });
           });
         cache.effectsCache.set(cacheKey, promise);
@@ -1171,7 +1125,9 @@ export function createCallEffectsQueries(deps: {
 
       const results = await promise;
       for (const row of results) {
-        recordGaps(row.gaps);
+        if (row.completeness === "incomplete") {
+          recordGaps(row.gaps);
+        }
       }
       if (onQueryCompleted) {
         const count = results.reduce((sum, row) => sum + row.effects.length, 0);

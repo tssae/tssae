@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tssae_common::SummaryLookupStats;
 
 /// Engine-side observation verbosity level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -51,12 +52,43 @@ pub struct EngineStepMetrics {
     pub details: Option<Vec<EngineStepDetail>>,
 }
 
-/// Built-in engine fact provider extraction counters for one RPC call.
-#[derive(Clone, Debug, Default, Serialize)]
+/// Engine-side IR lowering summary counters for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EngineProviderExtractionStats {
-    pub extractions: usize,
-    pub candidates: usize,
+pub struct EngineLoweringMetrics {
+    pub functions_lowered: usize,
+    pub vertices_created: usize,
+    pub duration_ms: f64,
+}
+
+/// Engine-side IR cache hit/miss and cross-snapshot file reuse/invalidation counters.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineIrCacheMetrics {
+    pub function_hits: usize,
+    pub function_misses: usize,
+    pub files_reused: usize,
+    pub files_invalidated: usize,
+}
+
+/// Per-source behavior summary hit counts for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSummarySourceHits {
+    pub local: usize,
+    pub package: usize,
+    pub community: usize,
+    pub builtin: usize,
+}
+
+/// Engine-side behavior summary lookup counters for one RPC call.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSummaryLookupMetrics {
+    pub lookups: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub hits_by_source: EngineSummarySourceHits,
 }
 
 /// Engine-side metrics attached to an RPC response only when observation is enabled.
@@ -69,8 +101,9 @@ pub struct EngineRpcMetrics {
     pub dropped_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<EngineStepMetrics>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
+    pub lowering: EngineLoweringMetrics,
+    pub ir_cache: EngineIrCacheMetrics,
+    pub summary_lookup: EngineSummaryLookupMetrics,
 }
 
 /// Tracks engine-side timing, candidate counts, and bounded detail records for one RPC call.
@@ -85,7 +118,9 @@ pub struct ObserveCollector {
     truncated: bool,
     dropped_count: usize,
     steps: Vec<EngineStepMetrics>,
-    provider_extractions: BTreeMap<String, EngineProviderExtractionStats>,
+    lowering: EngineLoweringMetrics,
+    ir_cache: EngineIrCacheMetrics,
+    summary_lookup: EngineSummaryLookupMetrics,
 }
 
 impl ObserveCollector {
@@ -108,7 +143,9 @@ impl ObserveCollector {
             truncated: false,
             dropped_count: 0,
             steps: Vec::new(),
-            provider_extractions: BTreeMap::new(),
+            lowering: EngineLoweringMetrics::default(),
+            ir_cache: EngineIrCacheMetrics::default(),
+            summary_lookup: EngineSummaryLookupMetrics::default(),
         }
     }
 
@@ -137,6 +174,48 @@ impl ObserveCollector {
         }
     }
 
+    pub const fn record_ir_cache_hit(&mut self) {
+        if self.is_active() {
+            self.ir_cache.function_hits += 1;
+        }
+    }
+
+    pub fn record_ir_lowering(
+        &mut self,
+        vertices_created: usize,
+        duration_ms: f64,
+        succeeded: bool,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        self.ir_cache.function_misses += 1;
+        if succeeded {
+            self.lowering.functions_lowered += 1;
+            self.lowering.vertices_created += vertices_created;
+        }
+        self.lowering.duration_ms += duration_ms;
+    }
+
+    pub const fn record_ir_file_reuse(&mut self, files_reused: usize, files_invalidated: usize) {
+        if self.is_active() {
+            self.ir_cache.files_reused += files_reused;
+            self.ir_cache.files_invalidated += files_invalidated;
+        }
+    }
+
+    pub const fn record_summary_lookup_stats(&mut self, stats: &SummaryLookupStats) {
+        if self.is_active() {
+            self.summary_lookup.lookups += stats.lookups;
+            self.summary_lookup.hits += stats.hits;
+            self.summary_lookup.misses += stats.misses;
+            self.summary_lookup.hits_by_source.local += stats.local_hits;
+            self.summary_lookup.hits_by_source.package += stats.package_hits;
+            self.summary_lookup.hits_by_source.community += stats.community_hits;
+            self.summary_lookup.hits_by_source.builtin += stats.builtin_hits;
+        }
+    }
+
     pub fn record_step(
         &mut self,
         op: &'static str,
@@ -148,41 +227,6 @@ impl ObserveCollector {
             op,
             "engine",
             "computed",
-            step_start,
-            candidate_count,
-            raw_details,
-        );
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Observation recording takes step identity, cache status, timing, and detail items."
-    )]
-    pub fn record_provider_step_with_cache(
-        &mut self,
-        op: &'static str,
-        provider: &str,
-        engine_provider_id: &str,
-        cache_status: &'static str,
-        step_start: Option<Instant>,
-        candidate_count: usize,
-        raw_details: Vec<EngineStepDetail>,
-    ) {
-        if !self.is_active() {
-            return;
-        }
-        if cache_status == "computed" {
-            let stats = self
-                .provider_extractions
-                .entry(engine_provider_id.to_string())
-                .or_default();
-            stats.extractions += 1;
-            stats.candidates += candidate_count;
-        }
-        self.push_step_metrics(
-            op,
-            provider,
-            cache_status,
             step_start,
             candidate_count,
             raw_details,
@@ -258,7 +302,9 @@ impl ObserveCollector {
             truncated: self.truncated,
             dropped_count: self.dropped_count,
             steps: self.steps,
-            provider_extractions: self.provider_extractions,
+            lowering: self.lowering,
+            ir_cache: self.ir_cache,
+            summary_lookup: self.summary_lookup,
         })
     }
 }

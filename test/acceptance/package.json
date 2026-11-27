@@ -20,6 +20,8 @@
     "format:write": "oxfmt --write .",
     "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules .",
     "lint:fix": "oxlint --format=unix . --fix",
+    "perf": "node --conditions=source scripts/perf.ts",
+    "perf:gate": "node --conditions=source scripts/perf.ts --profile medium",
     "test": "node --conditions=source --test --test-reporter=spec 'test/unit/**/*.test.ts'",
     "test:e2e": "node --test --test-reporter=spec 'test/e2e/**/*.test.ts'",
     "typecheck": "tsc -p tsconfig.node.json --noEmit --pretty false"
@@ -28,11 +30,9 @@
     "@tssae/test-hosts": "workspace:*"
   },
   "devDependencies": {
-    "@tssae/adapter-api": "workspace:*",
-    "@tssae/adapter-fixture": "workspace:*",
-    "@tssae/adapter-fixture-complement": "workspace:*",
-    "@tssae/adapters": "workspace:*",
+    "@tssae/drizzle": "workspace:*",
     "@tssae/tooling-config": "workspace:*",
+    "@tssae/zod": "workspace:*",
     "@types/node": "catalog:",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",

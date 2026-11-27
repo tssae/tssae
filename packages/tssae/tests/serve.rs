@@ -325,7 +325,8 @@ fn serves_list_branches_and_branch_coverage_statuses() {
                     { "op": "branchCoverage", "function": body_fns[0], "branches": [joint_true_branches[0]], "targets": [sink_calls[0]] },
                     { "op": "branchCoverage", "function": body_fns[0], "branches": joint_true_branches, "targets": [sink_calls[0]] },
                     { "op": "branchCoverage", "function": body_fns[1], "branches": collect_all_refs(1), "targets": [sink_calls[1]] },
-                    { "op": "branchCoverage", "function": body_fns[2], "branches": collect_all_refs(2), "targets": [sink_calls[2]] }
+                    { "op": "branchCoverage", "function": body_fns[2], "branches": collect_all_refs(2), "targets": [sink_calls[2]] },
+                    { "op": "branchCoverage", "function": body_fns[2], "branches": [], "targets": [sink_calls[2]] }
                 ]
             }
         }),
@@ -336,13 +337,33 @@ fn serves_list_branches_and_branch_coverage_statuses() {
         "branchCoverage failed: {cov_resp}"
     );
     let results = cov_resp["result"]["results"].as_array().expect("results");
-    assert_eq!(results[0]["items"][0]["status"], json!("bypass"));
-    assert_eq!(results[1]["items"][0]["status"], json!("covered"));
-    assert_eq!(results[2]["items"][0]["status"], json!("unreachable"));
-    assert_eq!(results[3]["items"][0]["status"], json!("unknown"));
+    assert_eq!(results[0]["items"][0]["status"], json!("disproved"));
+    assert_eq!(results[0]["items"][0]["targetReachable"], json!(true));
+    assert!(
+        results[0]["items"][0]["counterexamplePath"]["steps"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(results[1]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[1]["items"][0]["targetReachable"], json!(true));
+    assert_eq!(results[2]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[2]["items"][0]["targetReachable"], json!(false));
+    assert_eq!(results[3]["items"][0]["status"], json!("proved"));
+    assert_eq!(results[3]["items"][0]["targetReachable"], json!(true));
     assert_eq!(
-        results[3]["items"][0]["gaps"][0]["kind"],
-        json!("unmodeled-try-catch")
+        results[3]["items"][0]["implicitExceptions"]["status"],
+        json!("proved")
+    );
+    assert_eq!(results[4]["items"][0]["status"], json!("disproved"));
+    assert_eq!(results[4]["items"][0]["targetReachable"], json!(true));
+    assert!(
+        results[4]["items"][0]["counterexamplePath"]["steps"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(
+        results[4]["items"][0]["implicitExceptions"]["status"],
+        json!("proved")
     );
 
     finish_engine(child, stdin);
@@ -835,6 +856,345 @@ fn scans_standalone_comments_across_blocks_jsx_crlf_and_excludes_jsdoc_and_strin
     assert_eq!(
         filtered_resp["result"]["comments"].as_array().map(Vec::len),
         Some(1)
+    );
+
+    finish_engine(child, stdin);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Exercises snapshot open, lazy per-function lowering, hit, update invalidation, and reuse."
+)]
+fn tracks_lazy_ir_lowering_and_file_cache_invalidation_across_updates() {
+    let temp = TempDirGuard::new("verule-engine-ir-cache");
+    let src_dir = temp.path().join("src");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::write(
+        temp.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"target":"ES2024","module":"NodeNext","moduleResolution":"NodeNext","noEmit":true},"include":["src/**/*.ts"]}"#,
+    )
+    .expect("write tsconfig");
+    fs::write(
+        src_dir.join("alpha.ts"),
+        r"
+export function fnA(flag: boolean): number {
+  if (flag) {
+    return 1;
+  }
+  return 2;
+}
+
+export function fnB(flag: boolean): number {
+  if (flag) {
+    return 10;
+  }
+  return 20;
+}
+",
+    )
+    .expect("write alpha.ts");
+    fs::write(
+        src_dir.join("beta.ts"),
+        r"
+export function fnC(flag: boolean): number {
+  if (flag) {
+    return 100;
+  }
+  return 200;
+}
+",
+    )
+    .expect("write beta.ts");
+
+    let cwd_str = normalized(temp.path());
+    let tsconfig_str = normalized(&temp.path().join("tsconfig.json"));
+    let (child, mut stdin, mut reader) = spawn_engine_stdio();
+
+    let open_resp = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 1,
+            "method": "snapshot.open",
+            "params": { "cwd": cwd_str, "entries": [tsconfig_str] },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(open_resp["ok"], json!(true), "open failed: {open_resp}");
+    assert_eq!(
+        open_resp["metrics"]["lowering"]["functionsLowered"],
+        json!(0)
+    );
+    assert_eq!(open_resp["metrics"]["irCache"]["functionHits"], json!(0));
+    assert_eq!(open_resp["metrics"]["irCache"]["functionMisses"], json!(0));
+    let snapshot_id = open_resp["result"]["snapshotId"]
+        .as_u64()
+        .expect("snapshotId");
+    let project_id = open_resp["result"]["projects"][0]["projectId"]
+        .as_str()
+        .expect("projectId")
+        .to_string();
+
+    let syn_resp = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 2,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": snapshot_id,
+                "projectId": project_id,
+                "steps": [
+                    { "op": "findSyntax", "kinds": ["FunctionDeclaration"] },
+                    { "op": "findSyntax", "kinds": ["ReturnStatement"] }
+                ]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(syn_resp["ok"], json!(true));
+    assert_eq!(
+        syn_resp["metrics"]["lowering"]["functionsLowered"],
+        json!(0)
+    );
+
+    let fns = syn_resp["result"]["results"][0]["items"]
+        .as_array()
+        .expect("fns");
+    let rets = syn_resp["result"]["results"][1]["items"]
+        .as_array()
+        .expect("rets");
+    let fn_a = fns
+        .iter()
+        .find(|f| f["text"].as_str().unwrap_or("").contains("function fnA"))
+        .expect("fnA")["ref"]
+        .as_str()
+        .expect("fnA ref")
+        .to_string();
+    let fn_b = fns
+        .iter()
+        .find(|f| f["text"].as_str().unwrap_or("").contains("function fnB"))
+        .expect("fnB")["ref"]
+        .as_str()
+        .expect("fnB ref")
+        .to_string();
+    let fn_c = fns
+        .iter()
+        .find(|f| f["text"].as_str().unwrap_or("").contains("function fnC"))
+        .expect("fnC")["ref"]
+        .as_str()
+        .expect("fnC ref")
+        .to_string();
+    let ret_a = rets
+        .iter()
+        .find(|r| r["text"].as_str().unwrap_or("") == "return 1;")
+        .expect("return 1")["ref"]
+        .as_str()
+        .expect("retA ref")
+        .to_string();
+
+    // Query only fnA -> lazy single-function lowering (1 miss, 1 lowered).
+    let list_a = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 3,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": snapshot_id,
+                "projectId": project_id,
+                "steps": [{ "op": "listBranches", "targets": [fn_a] }]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(list_a["ok"], json!(true));
+    assert_eq!(list_a["metrics"]["lowering"]["functionsLowered"], json!(1));
+    assert_eq!(list_a["metrics"]["irCache"]["functionMisses"], json!(1));
+    assert_eq!(list_a["metrics"]["irCache"]["functionHits"], json!(0));
+    assert!(
+        list_a["metrics"]["lowering"]["verticesCreated"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+
+    // Re-query fnA via branchCoverage -> hits function IR cache cleanly.
+    let branch_a = list_a["result"]["results"][0]["items"][0]["branches"][0]["ref"]
+        .as_str()
+        .expect("branchA ref")
+        .to_string();
+    let cov_a = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 4,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": snapshot_id,
+                "projectId": project_id,
+                "steps": [{
+                    "op": "branchCoverage",
+                    "function": fn_a,
+                    "branches": [branch_a],
+                    "targets": [ret_a]
+                }]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(cov_a["ok"], json!(true));
+    assert_eq!(cov_a["metrics"]["lowering"]["functionsLowered"], json!(0));
+    assert_eq!(cov_a["metrics"]["irCache"]["functionHits"], json!(1));
+    assert_eq!(cov_a["metrics"]["irCache"]["functionMisses"], json!(0));
+
+    // Query fnB in the same file -> was NOT lowered eagerly when fnA ran.
+    let list_b = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 5,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": snapshot_id,
+                "projectId": project_id,
+                "steps": [{ "op": "listBranches", "targets": [fn_b] }]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(list_b["ok"], json!(true));
+    assert_eq!(list_b["metrics"]["lowering"]["functionsLowered"], json!(1));
+    assert_eq!(list_b["metrics"]["irCache"]["functionMisses"], json!(1));
+
+    // Warm fnC in src/beta.ts so both files are cached before snapshot.update.
+    let list_c = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 6,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": snapshot_id,
+                "projectId": project_id,
+                "steps": [{ "op": "listBranches", "targets": [fn_c] }]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(list_c["ok"], json!(true));
+    assert_eq!(list_c["metrics"]["lowering"]["functionsLowered"], json!(1));
+
+    // Edit only src/alpha.ts, then snapshot.update -> beta.ts reused, alpha.ts invalidated.
+    fs::write(
+        src_dir.join("alpha.ts"),
+        r"
+export function fnA(flag: boolean): number {
+  if (flag) {
+    return 42;
+  }
+  return 2;
+}
+
+export function fnB(flag: boolean): number {
+  if (flag) {
+    return 10;
+  }
+  return 20;
+}
+",
+    )
+    .expect("update alpha.ts");
+
+    let update_resp = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 7,
+            "method": "snapshot.update",
+            "params": {
+                "snapshotId": snapshot_id,
+                "changed": ["src/alpha.ts"]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(
+        update_resp["ok"],
+        json!(true),
+        "update failed: {update_resp}"
+    );
+    assert_eq!(update_resp["metrics"]["irCache"]["filesReused"], json!(1));
+    assert_eq!(
+        update_resp["metrics"]["irCache"]["filesInvalidated"],
+        json!(1)
+    );
+    let updated_snapshot_id = update_resp["result"]["snapshotId"]
+        .as_u64()
+        .expect("updated snapshotId");
+
+    let updated_syntax_resp = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 8,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": updated_snapshot_id,
+                "projectId": project_id,
+                "steps": [{ "op": "findSyntax", "kinds": ["FunctionDeclaration"] }]
+            }
+        }),
+    );
+    let updated_fns = updated_syntax_resp["result"]["results"][0]["items"]
+        .as_array()
+        .expect("updated fns");
+    let updated_fn_a = updated_fns
+        .iter()
+        .find(|f| f["text"].as_str().unwrap_or("").contains("function fnA"))
+        .expect("updated fnA")["ref"]
+        .as_str()
+        .expect("updated fnA ref")
+        .to_string();
+    let updated_fn_c = updated_fns
+        .iter()
+        .find(|f| f["text"].as_str().unwrap_or("").contains("function fnC"))
+        .expect("updated fnC")["ref"]
+        .as_str()
+        .expect("updated fnC ref")
+        .to_string();
+
+    // Unchanged src/beta.ts (fnC) hits cross-snapshot reused IR cache; edited src/alpha.ts (fnA) misses.
+    let list_after_update = rpc_call(
+        &mut stdin,
+        &mut reader,
+        &json!({
+            "id": 9,
+            "method": "query.batch",
+            "params": {
+                "snapshotId": updated_snapshot_id,
+                "projectId": project_id,
+                "steps": [
+                    { "op": "listBranches", "targets": [updated_fn_c] },
+                    { "op": "listBranches", "targets": [updated_fn_a] }
+                ]
+            },
+            "observe": { "mode": "summary" }
+        }),
+    );
+    assert_eq!(list_after_update["ok"], json!(true));
+    assert_eq!(
+        list_after_update["metrics"]["irCache"]["functionHits"],
+        json!(1)
+    );
+    assert_eq!(
+        list_after_update["metrics"]["irCache"]["functionMisses"],
+        json!(1)
+    );
+    assert_eq!(
+        list_after_update["metrics"]["lowering"]["functionsLowered"],
+        json!(1)
     );
 
     finish_engine(child, stdin);

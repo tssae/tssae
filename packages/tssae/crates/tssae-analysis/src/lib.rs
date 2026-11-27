@@ -1,0 +1,22 @@
+//! Semantic analysis engine crate.
+//!
+//! This crate operates solely on `tssae_common` opaque handles, pure IR structures,
+//! and abstract boundary traits, with zero dependency on any `tsrs_*` crate.
+
+pub mod branch_coverage;
+pub mod call_effects;
+pub mod call_resolution;
+pub mod class_overrides;
+pub mod instance_cleanup;
+pub mod instance_identity;
+pub mod ir;
+pub mod summaries;
+pub mod value_propagation;
+pub mod var_writes;
+
+pub use ir::IrProvider;
+pub use tssae_common::{
+    BranchId, ConclusionStatus, DiagnosticLocation, EvidenceItem, FileId, FunctionIrId, GapItem,
+    LocalBindingId, LocalSyntaxId, SemanticModel, SignatureId, SymbolId, SyntaxCatalog, SyntaxId,
+    TriStateOutcome, TypeId, UnknownReason, ValueId, VertexId,
+};

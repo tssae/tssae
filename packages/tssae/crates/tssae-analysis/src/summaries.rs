@@ -48,6 +48,10 @@ impl LeafMatcherPrefilter {
         }
         if let Some(leaf) = matcher.member_path.last() {
             self.leaf_names.insert(leaf.clone());
+            if leaf == "constructor" && matcher.member_path.len() >= 2 {
+                self.leaf_names
+                    .insert(matcher.member_path[matcher.member_path.len() - 2].clone());
+            }
         } else {
             self.has_empty_member_path = true;
         }
@@ -163,7 +167,14 @@ impl BehaviorSummaryIndex {
             }
             if matches!(
                 d.kind.as_deref(),
-                Some("ClassDeclaration" | "ClassExpression" | "Constructor" | "ConstructSignature")
+                Some(
+                    "ClassDeclaration"
+                        | "ClassExpression"
+                        | "Constructor"
+                        | "ConstructSignature"
+                        | "VariableDeclaration"
+                        | "InterfaceDeclaration"
+                )
             ) && self.calls_prefilter.leaf_names.contains("constructor")
             {
                 return true;
@@ -1700,5 +1711,31 @@ mod tests {
             .unwrap();
         assert_eq!(cached_match.entry_id, fresh_match.entry_id);
         assert_eq!(cached_match.aspect, fresh_match.aspect);
+    }
+
+    #[test]
+    fn promise_constructor_passes_calls_prefilter_for_var_and_interface_decls() {
+        let index = BehaviorSummaryIndex::with_builtins_only();
+        assert!(index.may_match_calls_leaf("Promise"));
+        for kind in ["VariableDeclaration", "InterfaceDeclaration"] {
+            let decl = DeclarationSummaryData {
+                symbol: None,
+                name: Some("Promise".to_string()),
+                container_name: None,
+                kind: Some(kind.to_string()),
+                location: None,
+                primary_syntax: None,
+                callable_syntax: None,
+                initializer_syntax: None,
+                is_external: true,
+                is_default_library: true,
+                has_body: false,
+                is_signature_only: false,
+            };
+            assert!(
+                index.may_match_calls_decl(Some(&decl), None),
+                "expected may_match_calls_decl to pass for {kind} Promise"
+            );
+        }
     }
 }

@@ -1481,4 +1481,220 @@ void describe("tssae first-party implementation resolution", () => {
       },
     );
   });
+
+  void it("resolves new Promise executor via builtin stdlib summary in calleesOf and callEffects", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/promise-exec.ts": [
+            "const state = { count: 0 };",
+            "function helper(): void {",
+            "  state.count += 1;",
+            "}",
+            "export function runPromise(): Promise<number> {",
+            "  return new Promise((resolve) => {",
+            "    helper();",
+            "    resolve(1);",
+            "  });",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const newExprs = await ctx.findSyntax({
+            files: ["src/promise-exec.ts"],
+            kinds: ["NewExpression"],
+          });
+          const newPromiseSyn = newExprs.find((n) =>
+            n.text.startsWith("new Promise("),
+          );
+          assert.ok(newPromiseSyn);
+
+          const [resolvedCall] = await ctx.resolveCalls([newPromiseSyn.ref]);
+          assert.ok(resolvedCall?.call);
+
+          const [callees] = await ctx.calleesOf([resolvedCall.call]);
+          assert.ok(callees);
+          assert.equal(
+            callees.completeness,
+            "complete",
+            `expected complete calleesOf for new Promise(...), got ${JSON.stringify(callees)}`,
+          );
+          assert.ok(
+            callees.resolvedTargets.some(
+              (t) => t.location?.file === "src/promise-exec.ts",
+            ),
+            `expected executor callback target in resolvedTargets, got ${JSON.stringify(callees.resolvedTargets)}`,
+          );
+
+          const fns = await ctx.findSyntax({
+            files: ["src/promise-exec.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const runFn = fns.find((f) =>
+            f.text.includes("function runPromise("),
+          );
+          assert.ok(runFn);
+
+          const [effects] = await ctx.callEffects({
+            targets: [runFn.ref],
+            followCallbacks: true,
+            includeWrites: true,
+          });
+          assert.ok(effects);
+          assert.ok(
+            effects.fieldWrites.some((w) => w.propertyName === "count"),
+            `expected callEffects to observe write to 'count' inside Promise executor, got ${JSON.stringify(effects.fieldWrites)}`,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("marks overloaded local function escaping via IIFE object return as incomplete in callersOf", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/overload-escape.ts": [
+            "export const { getWindowById } = (function () {",
+            "  function getWindowById(id: number): number;",
+            "  function getWindowById(id?: number): number {",
+            "    return id ?? 0;",
+            "  }",
+            "  return { getWindowById };",
+            "})();",
+            "export function invokeDynamic(cb: (id?: number) => number): number {",
+            "  return cb();",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/overload-escape.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const implFn = fns.find((f) => f.text.includes("return id ?? 0"));
+          assert.ok(implFn);
+
+          const [declRow] = await ctx.resolveDeclarations([implFn.ref]);
+          assert.ok(declRow?.declaration);
+
+          const [callers] = await ctx.callersOf([declRow.declaration]);
+          assert.ok(callers);
+          assert.equal(
+            callers.completeness,
+            "incomplete",
+            `expected incomplete callersOf for escaped overloaded local function, got ${JSON.stringify(callers)}`,
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
+
+  void it("completes static self-recursive function traversal in callEffects without hitting max depth", async () => {
+    await withTempHost(
+      {
+        files: {
+          "tsconfig.json": JSON.stringify({
+            compilerOptions: {
+              strict: true,
+              target: "ES2022",
+              module: "NodeNext",
+              moduleResolution: "NodeNext",
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          }),
+          "src/static-rec.ts": [
+            "const state = { count: 0 };",
+            "export function deepClone(node: { next?: any } | undefined): any {",
+            "  state.count += 1;",
+            "  return node ? deepClone(node.next) : undefined;",
+            "}",
+            "export function entry(n: any) {",
+            "  return deepClone(n);",
+            "}",
+            "",
+          ].join("\n"),
+        },
+      },
+      async (host) => {
+        await host.typecheck();
+
+        const session = await openProject({
+          cwd: host.rootDir,
+          tsconfig: "tsconfig.json",
+        });
+        try {
+          const ctx = session.project();
+          const fns = await ctx.findSyntax({
+            files: ["src/static-rec.ts"],
+            kinds: ["FunctionDeclaration"],
+          });
+          const entryFn = fns.find((f) => f.text.includes("function entry("));
+          assert.ok(entryFn);
+
+          const [effects] = await ctx.callEffects({
+            targets: [entryFn.ref],
+            includeWrites: true,
+            maxDepth: 4,
+          });
+          assert.ok(effects);
+          assert.equal(
+            effects.completeness,
+            "complete",
+            `expected complete callEffects for static self-recursion, got ${JSON.stringify(effects)}`,
+          );
+          assert.ok(
+            effects.fieldWrites.some((w) => w.propertyName === "count"),
+          );
+        } finally {
+          await session.close();
+        }
+      },
+    );
+  });
 });

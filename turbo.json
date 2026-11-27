@@ -27,6 +27,11 @@
       "cache": false,
       "tags": ["work:on-demand"]
     },
+    "//#semantic-diff": {
+      "dependsOn": ["@tssae/acceptance#semantic-diff"],
+      "cache": false,
+      "tags": ["work:on-demand"]
+    },
     "//#format:check": {
       "outputs": [],
       "tags": ["quality:light"]

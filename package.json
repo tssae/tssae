@@ -13,6 +13,7 @@
     "check:full": "node --conditions=source scripts/task-gates.ts check:full",
     "fix": "node --conditions=source scripts/task-gates.ts fix",
     "perf": "TSSAE_PERF_CWD=\"${INIT_CWD:-$PWD}\" turbo run @tssae/acceptance#perf --",
+    "semantic-diff": "TSSAE_SEMANTIC_DIFF_CWD=\"${INIT_CWD:-$PWD}\" turbo run @tssae/acceptance#semantic-diff --",
     "boundaries": "turbo boundaries",
     "toolchain:prepare": "cargo --version",
     "publication:pack": "rm -rf .changeset/packed && mkdir -p .changeset/packed && turbo run build && changeset pack --out-dir .changeset/packed",

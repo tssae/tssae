@@ -21,6 +21,7 @@ import {
   installArtifactPackages,
 } from "./host-install.ts";
 import { type IsolatedRunResult, runInIsolatedHost } from "./isolation.ts";
+import { materializeOutOfRepoNode24Runtime } from "./node-runtime.ts";
 import type { PackageManager } from "./types.ts";
 import {
   type HostResolutionAudit,
@@ -34,6 +35,7 @@ export type PrepareAcceptanceHostOptions = {
   readonly directPackages?: readonly string[];
   readonly bundle?: PackedArtifactBundle;
   readonly packageManager?: PackageManager;
+  readonly engineStrict?: boolean;
   readonly blockedPaths?: readonly string[];
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly tempRoot?: string;
@@ -85,6 +87,10 @@ export type PreparedAcceptanceHost = {
  * Prepares an isolated out-of-repo acceptance host with packed `tssae`
  * artifacts installed and verified, guaranteeing LIFO resource reclamation on
  * any mid-preparation failure or subsequent `dispose()`.
+ *
+ * Materializes the managed Node `24.0.0` runtime under `runtimeDir/bin`,
+ * defaults `engineStrict` to `true` during artifact installation, and executes
+ * `runNode` and isolated host commands against that Node `24.0.0` binary.
  */
 export async function prepareAcceptanceHost(
   options: PrepareAcceptanceHostOptions = {},
@@ -105,6 +111,7 @@ export async function prepareAcceptanceHost(
     mkdirSync(hostDir, { recursive: true });
     mkdirSync(storeDir, { recursive: true });
     mkdirSync(runtimeDir, { recursive: true });
+    const node24Runtime = materializeOutOfRepoNode24Runtime(runtimeDir);
 
     if (options.hostFixture !== undefined) {
       copyDirectory(resolveHostDir(options.hostFixture), hostDir);
@@ -155,6 +162,10 @@ export async function prepareAcceptanceHost(
       artifacts: bundle.artifacts,
       directPackages,
       storeDir,
+      nodeBinDir: node24Runtime.binDir,
+      ...(options.engineStrict === undefined
+        ? {}
+        : { engineStrict: options.engineStrict }),
       ...(options.env === undefined ? {} : { env: options.env }),
     });
     if (installation.status === "install-failed") {
@@ -212,6 +223,7 @@ export async function prepareAcceptanceHost(
         args,
         isolated: runOptions.isolated ?? true,
         pnpmStoreDir: storeDir,
+        nodeExecutable: node24Runtime.nodeBin,
         ...(options.blockedPaths === undefined
           ? {}
           : { blockedPaths: options.blockedPaths }),
@@ -245,7 +257,7 @@ export async function prepareAcceptanceHost(
           runOptions,
         ),
       runNode: (args, runOptions) =>
-        runIsolated(process.execPath, args, runOptions),
+        runIsolated(node24Runtime.nodeBin, args, runOptions),
       dispose,
       [Symbol.asyncDispose]: dispose,
     };

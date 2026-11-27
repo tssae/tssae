@@ -10,6 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { PackedArtifact } from "./artifacts.ts";
+import {
+  getSharedOutOfRepoNode24BinDir,
+  prependToPath,
+} from "./node-runtime.ts";
 import { startArtifactRegistry } from "./registry.ts";
 import type { PackageManager } from "./types.ts";
 
@@ -27,6 +31,8 @@ export type InstallArtifactPackagesOptions = {
   readonly artifacts: readonly PackedArtifact[];
   readonly directPackages?: readonly string[];
   readonly storeDir?: string;
+  readonly nodeBinDir?: string;
+  readonly engineStrict?: boolean;
   readonly env?: Readonly<Record<string, string | undefined>>;
 };
 
@@ -82,6 +88,10 @@ function runAsyncCommand(
 /**
  * Installs candidate TSSAE packages (including unscoped `tssae`) from one local
  * artifact batch into a clean host checkout via the loopback registry.
+ *
+ * Defaults `engineStrict` to `true` and prepends the managed Node `24.0.0`
+ * `bin` directory (`options.nodeBinDir` or the shared out-of-repo runtime) to
+ * `PATH` so package-manager engine checks run against Node `24.0.0`.
  */
 export async function installArtifactPackages(
   options: InstallArtifactPackagesOptions,
@@ -127,6 +137,8 @@ export async function installArtifactPackages(
       `${previousNpmrc}${separator}${npmrcLines.join("\n")}\n`,
     );
 
+    const engineStrict = options.engineStrict ?? true;
+    const nodeBinDir = options.nodeBinDir ?? getSharedOutOfRepoNode24BinDir();
     const commandArgs =
       options.packageManager === "npm"
         ? [
@@ -136,6 +148,7 @@ export async function installArtifactPackages(
             "--ignore-scripts",
             "--no-audit",
             "--no-fund",
+            ...(engineStrict ? ["--engine-strict"] : []),
             ...specs,
           ]
         : [
@@ -149,17 +162,23 @@ export async function installArtifactPackages(
               ? ["--workspace-root"]
               : []),
             "--ignore-scripts",
+            ...(engineStrict ? ["--config.engine-strict=true"] : []),
             ...specs,
           ];
     const [command, ...args] = commandArgs;
-    const env = options.env ?? process.env;
+    const baseEnv = options.env ?? process.env;
+    const envWithNode24: Record<string, string | undefined> = {
+      ...baseEnv,
+      PATH: prependToPath([nodeBinDir], baseEnv.PATH),
+      ...(isolatedCacheHome === undefined
+        ? {}
+        : { XDG_CACHE_HOME: isolatedCacheHome }),
+    };
     const commandResult = await runAsyncCommand(
       command!,
       args,
       options.checkoutDir,
-      isolatedCacheHome === undefined
-        ? env
-        : { ...env, XDG_CACHE_HOME: isolatedCacheHome },
+      envWithNode24,
     );
     if (commandResult.status !== 0) {
       return {

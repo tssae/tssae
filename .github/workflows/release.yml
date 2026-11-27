@@ -25,13 +25,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read Node version
-        id: node-runtime
-        run: echo "runtime=node@$(jq -er '.engines.node' package.json)" >> "$GITHUB_OUTPUT"
+          fetch-depth: 0
       - name: Set up pnpm and Node.js
         uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
-          runtime: ${{ steps.node-runtime.outputs.runtime }}
+          node-version-file: false
           install: false
           cache: true
       - name: Set up Rust toolchain
@@ -74,13 +72,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read Node version
-        id: node-runtime
-        run: echo "runtime=node@$(jq -er '.engines.node' package.json)" >> "$GITHUB_OUTPUT"
       - name: Set up pnpm and Node.js
         uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
-          runtime: ${{ steps.node-runtime.outputs.runtime }}
+          node-version-file: false
           install: false
           cache: false
       - name: Install dependencies

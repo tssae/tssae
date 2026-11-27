@@ -71,6 +71,22 @@
       "outputs": [],
       "tags": ["quality:light"]
     },
+    "test:dist": {
+      "dependsOn": [
+        "^build",
+        "build",
+        "//#toolchain:prepare",
+        "@tssae/test-hosts#typecheck"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "crates/**/Cargo.toml",
+        "crates/**/*.rs",
+        "!target/**"
+      ],
+      "outputs": [],
+      "tags": ["quality:heavy"]
+    },
     "typecheck": {
       "dependsOn": [
         "@tssae/tooling-config#typecheck",

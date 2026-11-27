@@ -375,7 +375,7 @@ impl<'a> SemanticFacade<'a> {
     }
 
     pub fn type_at_location(&mut self, node: P<Node>) -> FacadeTypeSummary {
-        let ty = self.checker.get_type_at_location(node);
+        let ty = get_type_at_location_safe(self.checker, node);
         let enclosing = node.parent().or(Some(node));
         let gap_at = node_location_relative(self.cwd, node);
         summarize_type(self.checker, ty, enclosing, gap_at)
@@ -1436,6 +1436,9 @@ impl<'a> SemanticModelBridge<'a> {
     }
 
     pub fn type_id_for_node(&self, node: P<Node>) -> Option<TypeId> {
+        if is_phase_import_callee_meta_property(node) {
+            return None;
+        }
         let enclosing = node.parent().or(Some(node));
         let ty = {
             let mut checker = self.checker.borrow_mut();
@@ -1623,6 +1626,9 @@ impl SemanticModel for SemanticModelBridge<'_> {
 
     fn type_at_syntax(&self, syntax: SyntaxId) -> Option<TypeSummaryData> {
         let node = self.node_for_syntax(syntax)?;
+        if is_phase_import_callee_meta_property(node) {
+            return None;
+        }
         let enclosing = node.parent().or(Some(node));
         let summary = {
             let mut checker = self.checker.borrow_mut();
@@ -1846,8 +1852,7 @@ impl SemanticModel for SemanticModelBridge<'_> {
         let base_expr = base_expr?;
         let base_sym = {
             let mut checker = self.checker.borrow_mut();
-            checker
-                .get_symbol_at_location_exported(base_expr)
+            get_symbol_at_location_safe(&mut checker, base_expr)
                 .map(|s| unwrap_aliased_symbol(&mut checker, s))
                 .filter(|&s| s != checker.get_unknown_symbol())?
         };
@@ -2047,6 +2052,38 @@ pub(crate) struct ResolvedDeclarationNodes {
     pub(crate) primary_decl: Option<P<Node>>,
     pub(crate) all_decls: Vec<P<Node>>,
     pub(crate) symbol: Option<P<Symbol>>,
+}
+
+pub(crate) fn is_phase_import_callee_meta_property(node: P<Node>) -> bool {
+    let target = tsrs_ast::get_reparsed_node_for_node(node).unwrap_or(node);
+    tsrs_ast::is_import_phase_meta_property(target)
+        && target.parent().is_some_and(|parent| {
+            tsrs_ast::is_call_expression(parent) && parent.expression() == Some(target)
+        })
+}
+
+pub(crate) fn get_type_at_location_safe(
+    checker: &mut CheckerHandle,
+    node: P<Node>,
+) -> P<tsrs_checker::Type> {
+    // tsrs_checker asserts inside check_meta_property when asked directly for the type
+    // of `import.defer` / `import.source` as the callee of a CallExpression.
+    if is_phase_import_callee_meta_property(node) {
+        return checker.get_unknown_type();
+    }
+    checker.get_type_at_location(node)
+}
+
+pub(crate) fn get_symbol_at_location_safe(
+    checker: &mut CheckerHandle,
+    node: P<Node>,
+) -> Option<P<Symbol>> {
+    // tsrs_checker::get_symbol_at_location calls check_expression on MetaProperty nodes,
+    // which hits the same phase-import assertion when `node` is `import.defer`/`import.source`.
+    if is_phase_import_callee_meta_property(node) {
+        return None;
+    }
+    checker.get_symbol_at_location_exported(node)
 }
 
 fn is_error_or_unresolved_type(ty: P<Type>) -> bool {
@@ -2300,7 +2337,7 @@ pub(crate) fn resolve_symbol_for_node(
         };
 
         let callee_sym = callee_expr
-            .and_then(|expr| checker.get_symbol_at_location_exported(expr))
+            .and_then(|expr| get_symbol_at_location_safe(checker, expr))
             .map(|s| unwrap_aliased_symbol(checker, s))
             .filter(|&s| s != checker.get_unknown_symbol());
 
@@ -2340,17 +2377,17 @@ pub(crate) fn resolve_symbol_for_node(
     let raw_sym = if node.kind() == Kind::ShorthandPropertyAssignment {
         checker
             .get_shorthand_assignment_value_symbol(Some(node))
-            .or_else(|| checker.get_symbol_at_location_exported(node))
+            .or_else(|| get_symbol_at_location_safe(checker, node))
     } else if let Some(parent) = node.parent()
         && parent.kind() == Kind::ShorthandPropertyAssignment
     {
         checker
             .get_shorthand_assignment_value_symbol(Some(parent))
-            .or_else(|| checker.get_symbol_at_location_exported(node))
+            .or_else(|| get_symbol_at_location_safe(checker, node))
     } else {
-        checker.get_symbol_at_location_exported(node).or_else(|| {
+        get_symbol_at_location_safe(checker, node).or_else(|| {
             node.name()
-                .and_then(|name_node| checker.get_symbol_at_location_exported(name_node))
+                .and_then(|name_node| get_symbol_at_location_safe(checker, name_node))
         })
     };
 

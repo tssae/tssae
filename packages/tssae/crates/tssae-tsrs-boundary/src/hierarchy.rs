@@ -167,9 +167,7 @@ impl ProgramHierarchyIndex {
             } else {
                 receiver_node
             };
-            let sym = env
-                .checker
-                .get_symbol_at_location_exported(expr)
+            let sym = crate::semantic_facade::get_symbol_at_location_safe(env.checker, expr)
                 .map(|s| unwrap_aliased_symbol(env.checker, s))
                 .filter(|&s| s != env.checker.get_unknown_symbol())?;
             return Some(self.hierarchy_from_symbols(
@@ -185,7 +183,7 @@ impl ProgramHierarchyIndex {
             ));
         }
 
-        let ty = env.checker.get_type_at_location(receiver_node);
+        let ty = crate::semantic_facade::get_type_at_location_safe(env.checker, receiver_node);
         let mut syms: Vec<P<Symbol>> = Vec::new();
         let mut has_unresolved = false;
         let is_union_or_intersection = ty.is_union() || ty.is_intersection();
@@ -699,7 +697,9 @@ fn collect_heritage_base_symbols(
                 continue;
             }
             let expr = ty_node.as_expression_with_type_arguments().expression();
-            if let Some(base_sym) = checker.get_symbol_at_location_exported(expr) {
+            if let Some(base_sym) =
+                crate::semantic_facade::get_symbol_at_location_safe(checker, expr)
+            {
                 let unwrapped = unwrap_aliased_symbol(checker, base_sym);
                 if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
                     base_symbols.push(unwrapped);

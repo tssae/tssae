@@ -16,6 +16,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json --pretty false",
+    "conformance": "node --conditions=source scripts/conformance.ts",
     "format:check": "oxfmt --list-different .",
     "format:write": "oxfmt --write .",
     "lint": "oxlint --quiet --format=unix --ignore-pattern node_modules .",

@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tsrs_ast::{
-    Kind, ModifierFlags, Node, SourceFile, Symbol, SymbolFlags, get_combined_modifier_flags,
-    get_source_file_of_node, is_function_like_declaration,
+    Kind, ModifierFlags, Node, NodeList, SourceFile, Symbol, SymbolFlags,
+    get_combined_modifier_flags, get_source_file_of_node, is_function_like_declaration,
 };
 use tsrs_checker::{Type, TypeFlags};
 use tsrs_compiler::{CheckerHandle, Program};
@@ -24,8 +24,15 @@ use crate::{
 
 /// Indexed class/interface inheritance graph collected lazily across the program's source files.
 pub struct ProgramHierarchyIndex {
-    nodes_by_symbol: FxHashMap<P<Symbol>, TypeHierarchyNodeRaw>,
     children_by_base: FxHashMap<P<Symbol>, Vec<P<Symbol>>>,
+    known_decl_nodes: FxHashMap<P<Symbol>, Vec<(P<Node>, bool)>>,
+    lazy: Mutex<HierarchyLazyState>,
+}
+
+#[derive(Default)]
+struct HierarchyLazyState {
+    nodes_by_symbol: FxHashMap<P<Symbol>, TypeHierarchyNodeRaw>,
+    exported_by_sf: FxHashMap<P<SourceFile>, FxHashSet<P<Symbol>>>,
 }
 
 #[derive(Clone)]
@@ -81,17 +88,19 @@ impl ProgramHierarchyIndex {
         workspace_programs: &[&'static Program],
         checker: &mut CheckerHandle,
     ) -> Self {
-        let mut exported_symbols: FxHashSet<P<Symbol>> = FxHashSet::default();
-        let mut nodes_by_symbol: FxHashMap<P<Symbol>, TypeHierarchyNodeRaw> = FxHashMap::default();
+        let mut children_by_base: FxHashMap<P<Symbol>, Vec<P<Symbol>>> = FxHashMap::default();
+        let mut known_decl_nodes: FxHashMap<P<Symbol>, Vec<(P<Node>, bool)>> = FxHashMap::default();
         let mut seen_sfs: FxHashSet<P<SourceFile>> = FxHashSet::default();
 
         // Collect all non-default-library source files across primary & workspace programs,
-        // plus any source files referenced directly via `program.get_source_files()`.
+        // filtering to files that contain class/interface heritage declarations.
         let mut source_files: Vec<P<SourceFile>> = Vec::new();
         for &sf in program.get_source_files() {
             if !program.is_source_file_default_library(sf.path()) && seen_sfs.insert(sf) {
                 let text = sf.text();
-                if text.contains("class") || text.contains("interface") {
+                if (text.contains("class") || text.contains("interface"))
+                    && (text.contains("extends") || text.contains("implements"))
+                {
                     source_files.push(sf);
                 }
             }
@@ -103,51 +112,34 @@ impl ProgramHierarchyIndex {
                     && seen_sfs.insert(sf)
                 {
                     let text = sf.text();
-                    if text.contains("class") || text.contains("interface") {
+                    if (text.contains("class") || text.contains("interface"))
+                        && (text.contains("extends") || text.contains("implements"))
+                    {
                         source_files.push(sf);
                     }
                 }
             }
         }
 
-        // Gather module-level exported symbols (`export { X }`, `export default X`, etc.).
-        for &sf in &source_files {
-            if let Some(sf_sym) = checker.get_symbol_at_location_exported(sf.as_node()) {
-                let exports = checker.get_exports_of_module_exported(sf_sym);
-                for exp in exports {
-                    let unwrapped = unwrap_aliased_symbol(checker, exp);
-                    if unwrapped != checker.get_unknown_symbol() {
-                        exported_symbols.insert(unwrapped);
-                    }
-                }
-            }
-            collect_export_assignments(sf.as_node(), checker, &mut exported_symbols);
-        }
-
-        // Index every ClassDeclaration, ClassExpression, and InterfaceDeclaration in the snapshot.
+        // Phase 1: walk ASTs only for ClassDeclaration/ClassExpression/InterfaceDeclaration nodes
+        // with heritage clauses to populate `children_by_base` and `known_decl_nodes` without
+        // computing exports or extracting members up front.
         for &sf in &source_files {
             let is_external_file = !is_project_source_file(program, sf)
                 && !is_first_party_workspace_path(cwd, sf.file_name());
-            index_types_in_node(
-                cwd,
+            collect_heritage_subtypes_in_node(
                 sf.as_node(),
                 is_external_file,
                 checker,
-                &exported_symbols,
-                &mut nodes_by_symbol,
+                &mut children_by_base,
+                &mut known_decl_nodes,
             );
         }
 
-        let mut children_by_base: FxHashMap<P<Symbol>, Vec<P<Symbol>>> = FxHashMap::default();
-        for (&sym, raw) in &nodes_by_symbol {
-            for &base_sym in &raw.base_symbols {
-                children_by_base.entry(base_sym).or_default().push(sym);
-            }
-        }
-
         Self {
-            nodes_by_symbol,
             children_by_base,
+            known_decl_nodes,
+            lazy: Mutex::new(HierarchyLazyState::default()),
         }
     }
 
@@ -234,12 +226,7 @@ impl ProgramHierarchyIndex {
         for (idx, &sym) in root_syms.iter().enumerate() {
             let sid = interner.intern_symbol(sym);
             receiver_symbols.push(sid);
-            let node_raw = self
-                .nodes_by_symbol
-                .get(&sym)
-                .cloned()
-                .or_else(|| synthesize_external_node(env.cwd, env.program, env.checker, sym));
-            if let Some(raw) = node_raw {
+            if let Some(raw) = self.ensure_symbol_node_loaded(env, sym) {
                 if idx == 0 {
                     receiver_kind = raw.kind;
                     receiver_name.clone_from(&raw.name);
@@ -298,8 +285,8 @@ impl ProgramHierarchyIndex {
             if let Some(children) = self.children_by_base.get(&cur) {
                 for &child in children {
                     if visited_down.insert(child) {
-                        if let Some(raw) = self.nodes_by_symbol.get(&child) {
-                            all_nodes.entry(child).or_insert_with(|| raw.clone());
+                        if let Some(raw) = self.ensure_symbol_node_loaded(env, child) {
+                            all_nodes.entry(child).or_insert(raw);
                         }
                         down_queue.push_back(child);
                     }
@@ -316,17 +303,157 @@ impl ProgramHierarchyIndex {
                 .get(&cur)
                 .map_or_default(|raw| raw.base_symbols.clone());
             for base_sym in bases {
-                if visited_up.insert(base_sym) {
-                    let node_raw = self.nodes_by_symbol.get(&base_sym).cloned().or_else(|| {
-                        synthesize_external_node(env.cwd, env.program, env.checker, base_sym)
-                    });
-                    if let Some(raw) = node_raw {
-                        all_nodes.insert(base_sym, raw);
-                        up_queue.push_back(base_sym);
-                    }
+                if visited_up.insert(base_sym)
+                    && let Some(raw) = self.ensure_symbol_node_loaded(env, base_sym)
+                {
+                    all_nodes.insert(base_sym, raw);
+                    up_queue.push_back(base_sym);
                 }
             }
         }
+    }
+
+    fn ensure_symbol_node_loaded(
+        &self,
+        env: &mut HierarchyQueryEnv<'_>,
+        sym: P<Symbol>,
+    ) -> Option<TypeHierarchyNodeRaw> {
+        {
+            if let Ok(state) = self.lazy.lock()
+                && let Some(cached) = state.nodes_by_symbol.get(&sym)
+            {
+                return Some(cached.clone());
+            }
+        }
+
+        let mut decls: Vec<(P<Node>, bool)> = Vec::new();
+        if let Some(known) = self.known_decl_nodes.get(&sym) {
+            for &(node, is_ext) in known {
+                if !decls.iter().any(|(existing, _)| *existing == node) {
+                    decls.push((node, is_ext));
+                }
+            }
+        }
+        for decl in unwrap_sym_declarations(sym) {
+            if !matches!(
+                decl.kind(),
+                Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
+            ) || decls.iter().any(|(existing, _)| *existing == decl)
+            {
+                continue;
+            }
+            let Some(sf) = get_source_file_of_node(decl) else {
+                continue;
+            };
+            let is_ext = env.program.is_source_file_default_library(sf.path())
+                || (!is_project_source_file(env.program, sf)
+                    && !is_first_party_workspace_path(env.cwd, sf.file_name()));
+            decls.push((decl, is_ext));
+        }
+
+        if decls.is_empty() {
+            return None;
+        }
+
+        let primary_idx = decls
+            .iter()
+            .position(|(d, _)| {
+                get_source_file_of_node(*d)
+                    .is_some_and(|sf| !env.program.is_source_file_default_library(sf.path()))
+            })
+            .unwrap_or(0);
+        let (primary_node, is_external) = decls[primary_idx];
+
+        let kind = if decls
+            .iter()
+            .any(|(d, _)| matches!(d.kind(), Kind::ClassDeclaration | Kind::ClassExpression))
+        {
+            ClassOrInterfaceKind::Class
+        } else {
+            ClassOrInterfaceKind::Interface
+        };
+        let is_abstract = decls
+            .iter()
+            .any(|(d, _)| get_combined_modifier_flags(*d).intersects(ModifierFlags::Abstract));
+
+        let mut is_exported = decls.iter().any(|(d, _)| {
+            (d.parent().is_some_and(|p| p.kind() == Kind::SourceFile)
+                && get_combined_modifier_flags(*d).intersects(ModifierFlags::Export))
+                || get_source_file_of_node(*d)
+                    .is_some_and(|sf| env.program.is_source_file_default_library(sf.path()))
+        });
+        if !is_exported {
+            for &(d, _) in &decls {
+                if let Some(sf) = get_source_file_of_node(d)
+                    && self.is_symbol_exported_in_sf(env, sf, sym)
+                {
+                    is_exported = true;
+                    break;
+                }
+            }
+        }
+
+        let name = primary_node
+            .name()
+            .and_then(node_text)
+            .or_else(|| Some(sym.name().to_string()).filter(|s| !s.is_empty() && s != "__class"));
+
+        let base_symbols = extract_base_symbols_for_decls(&decls, sym, env.checker);
+        let (members, constructor_node) = extract_members_for_decls(env.cwd, &decls, env.checker);
+
+        let raw = TypeHierarchyNodeRaw {
+            node: primary_node,
+            symbol: sym,
+            name,
+            kind,
+            is_exported,
+            is_abstract,
+            is_external,
+            base_symbols,
+            members,
+            constructor_node,
+        };
+
+        if let Ok(mut state) = self.lazy.lock() {
+            return Some(state.nodes_by_symbol.entry(sym).or_insert(raw).clone());
+        }
+        Some(raw)
+    }
+
+    fn is_symbol_exported_in_sf(
+        &self,
+        env: &mut HierarchyQueryEnv<'_>,
+        sf: P<SourceFile>,
+        sym: P<Symbol>,
+    ) -> bool {
+        {
+            if let Ok(state) = self.lazy.lock()
+                && let Some(exported) = state.exported_by_sf.get(&sf)
+            {
+                return exported.contains(&sym);
+            }
+        }
+
+        let mut exported: FxHashSet<P<Symbol>> = FxHashSet::default();
+        if let Some(sf_sym) = env.checker.get_symbol_at_location_exported(sf.as_node()) {
+            for exp in env.checker.get_exports_of_module_exported(sf_sym) {
+                let unwrapped = unwrap_aliased_symbol(env.checker, exp);
+                if unwrapped != env.checker.get_unknown_symbol() {
+                    exported.insert(unwrapped);
+                }
+            }
+        }
+        collect_export_assignments(sf.as_node(), env.checker, &mut exported);
+
+        let result = exported.contains(&sym);
+        if let Ok(mut state) = self.lazy.lock() {
+            return state
+                .exported_by_sf
+                .entry(sf)
+                .or_insert(exported)
+                .contains(&sym);
+        }
+        result
     }
 }
 
@@ -398,37 +525,17 @@ fn collect_export_assignments(
     });
 }
 
-fn index_types_in_node(
-    cwd: &str,
-    node: P<Node>,
-    is_external_file: bool,
-    checker: &mut CheckerHandle,
-    exported_symbols: &FxHashSet<P<Symbol>>,
-    out: &mut FxHashMap<P<Symbol>, TypeHierarchyNodeRaw>,
-) {
-    if matches!(
-        node.kind(),
-        Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
-    ) && let Some(raw) =
-        extract_hierarchy_node_raw(cwd, node, is_external_file, checker, exported_symbols)
-    {
-        out.entry(raw.symbol).or_insert(raw);
+fn heritage_clauses_of(node: P<Node>) -> Option<P<NodeList>> {
+    match node.kind() {
+        Kind::ClassDeclaration => node.as_class_declaration().heritage_clauses(),
+        Kind::ClassExpression => node.as_class_expression().heritage_clauses(),
+        Kind::InterfaceDeclaration => node.as_interface_declaration().heritage_clauses(),
+        _ => None,
     }
-
-    node.for_each_child(&mut |child| {
-        index_types_in_node(cwd, child, is_external_file, checker, exported_symbols, out);
-        false
-    });
 }
 
-fn extract_hierarchy_node_raw(
-    cwd: &str,
-    node: P<Node>,
-    is_external_file: bool,
-    checker: &mut CheckerHandle,
-    exported_symbols: &FxHashSet<P<Symbol>>,
-) -> Option<TypeHierarchyNodeRaw> {
-    let sym = checker
+fn resolve_type_decl_symbol(node: P<Node>, checker: &mut CheckerHandle) -> Option<P<Symbol>> {
+    checker
         .get_symbol_at_location_exported(node)
         .or_else(|| {
             node.name()
@@ -436,23 +543,51 @@ fn extract_hierarchy_node_raw(
         })
         .or_else(|| node.symbol())
         .map(|s| unwrap_aliased_symbol(checker, s))
-        .filter(|&s| s != checker.get_unknown_symbol())?;
+        .filter(|&s| s != checker.get_unknown_symbol())
+}
 
-    let mod_flags = get_combined_modifier_flags(node);
-    let is_exported =
-        mod_flags.intersects(ModifierFlags::Export) || exported_symbols.contains(&sym);
-    let is_abstract = mod_flags.intersects(ModifierFlags::Abstract);
-    let kind = if node.kind() == Kind::InterfaceDeclaration {
-        ClassOrInterfaceKind::Interface
-    } else {
-        ClassOrInterfaceKind::Class
-    };
+fn collect_heritage_subtypes_in_node(
+    node: P<Node>,
+    is_external_file: bool,
+    checker: &mut CheckerHandle,
+    children_by_base: &mut FxHashMap<P<Symbol>, Vec<P<Symbol>>>,
+    known_decl_nodes: &mut FxHashMap<P<Symbol>, Vec<(P<Node>, bool)>>,
+) {
+    if matches!(
+        node.kind(),
+        Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
+    ) && heritage_clauses_of(node).is_some_and(|clauses| !clauses.nodes().is_empty())
+        && let Some(sym) = resolve_type_decl_symbol(node, checker)
+    {
+        let decls = known_decl_nodes.entry(sym).or_default();
+        if !decls.iter().any(|(existing, _)| *existing == node) {
+            decls.push((node, is_external_file));
+        }
+        for base_sym in extract_base_symbols(node, sym, checker) {
+            let children = children_by_base.entry(base_sym).or_default();
+            if !children.contains(&sym) {
+                children.push(sym);
+            }
+        }
+    }
 
-    let name = node
-        .name()
-        .and_then(node_text)
-        .or_else(|| Some(sym.name().to_string()).filter(|s| !s.is_empty() && s != "__class"));
+    node.for_each_child(&mut |child| {
+        collect_heritage_subtypes_in_node(
+            child,
+            is_external_file,
+            checker,
+            children_by_base,
+            known_decl_nodes,
+        );
+        false
+    });
+}
 
+fn extract_base_symbols(
+    node: P<Node>,
+    sym: P<Symbol>,
+    checker: &mut CheckerHandle,
+) -> Vec<P<Symbol>> {
     let mut base_symbols = Vec::new();
     let declared_ty = checker.get_declared_type_of_symbol_exported(sym);
     for &base_ty in checker.get_base_types_exported(declared_ty) {
@@ -463,77 +598,94 @@ fn extract_hierarchy_node_raw(
             }
         }
     }
+    collect_heritage_base_symbols(node, checker, &mut base_symbols);
+    base_symbols
+}
 
-    let heritage = match node.kind() {
-        Kind::ClassDeclaration => node.as_class_declaration().heritage_clauses(),
-        Kind::ClassExpression => node.as_class_expression().heritage_clauses(),
-        Kind::InterfaceDeclaration => node.as_interface_declaration().heritage_clauses(),
-        _ => None,
-    };
-    if let Some(clauses) = heritage {
-        for &clause in clauses.nodes() {
-            if clause.kind() != Kind::HeritageClause {
-                continue;
-            }
-            for &ty_node in clause.as_heritage_clause().types().nodes() {
-                if ty_node.kind() != Kind::ExpressionWithTypeArguments {
-                    continue;
-                }
-                let expr = ty_node.as_expression_with_type_arguments().expression();
-                if let Some(base_sym) = checker.get_symbol_at_location_exported(expr) {
-                    let unwrapped = unwrap_aliased_symbol(checker, base_sym);
-                    if unwrapped != checker.get_unknown_symbol()
-                        && !base_symbols.contains(&unwrapped)
-                    {
-                        base_symbols.push(unwrapped);
-                    }
-                }
+fn extract_base_symbols_for_decls(
+    decls: &[(P<Node>, bool)],
+    sym: P<Symbol>,
+    checker: &mut CheckerHandle,
+) -> Vec<P<Symbol>> {
+    let mut base_symbols = Vec::new();
+    let declared_ty = checker.get_declared_type_of_symbol_exported(sym);
+    for &base_ty in checker.get_base_types_exported(declared_ty) {
+        if let Some(base_sym) = base_ty.symbol() {
+            let unwrapped = unwrap_aliased_symbol(checker, base_sym);
+            if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
+                base_symbols.push(unwrapped);
             }
         }
     }
+    for &(decl, _) in decls {
+        collect_heritage_base_symbols(decl, checker, &mut base_symbols);
+    }
+    base_symbols
+}
 
-    let raw_members: &[P<Node>] = match node.kind() {
-        Kind::ClassDeclaration => node.as_class_declaration().members().nodes(),
-        Kind::ClassExpression => node.as_class_expression().members().nodes(),
-        Kind::InterfaceDeclaration => node.as_interface_declaration().members().nodes(),
-        _ => &[],
+fn collect_heritage_base_symbols(
+    node: P<Node>,
+    checker: &mut CheckerHandle,
+    base_symbols: &mut Vec<P<Symbol>>,
+) {
+    let Some(clauses) = heritage_clauses_of(node) else {
+        return;
     };
-
-    let mut constructor_node: Option<P<Node>> = None;
-    let mut members: Vec<RawMemberFact> = Vec::new();
-    for &member in raw_members {
-        if member.kind() == Kind::Constructor {
-            if member.body().is_some() || constructor_node.is_none() {
-                constructor_node = Some(member);
-            }
+    for &clause in clauses.nodes() {
+        if clause.kind() != Kind::HeritageClause {
             continue;
         }
-        if let Some(fact) = extract_member_fact(cwd, member, checker) {
-            // If an overloaded method has both signature and implementation body, prefer bodied entry.
-            if let Some(existing) = members.iter_mut().find(|m| {
-                m.name == fact.name && m.kind == fact.kind && m.is_static == fact.is_static
-            }) {
-                if fact.has_body && !existing.has_body {
-                    *existing = fact;
+        for &ty_node in clause.as_heritage_clause().types().nodes() {
+            if ty_node.kind() != Kind::ExpressionWithTypeArguments {
+                continue;
+            }
+            let expr = ty_node.as_expression_with_type_arguments().expression();
+            if let Some(base_sym) = checker.get_symbol_at_location_exported(expr) {
+                let unwrapped = unwrap_aliased_symbol(checker, base_sym);
+                if unwrapped != checker.get_unknown_symbol() && !base_symbols.contains(&unwrapped) {
+                    base_symbols.push(unwrapped);
                 }
-            } else {
-                members.push(fact);
             }
         }
     }
+}
 
-    Some(TypeHierarchyNodeRaw {
-        node,
-        symbol: sym,
-        name,
-        kind,
-        is_exported,
-        is_abstract,
-        is_external: is_external_file,
-        base_symbols,
-        members,
-        constructor_node,
-    })
+fn extract_members_for_decls(
+    cwd: &str,
+    decls: &[(P<Node>, bool)],
+    checker: &mut CheckerHandle,
+) -> (Vec<RawMemberFact>, Option<P<Node>>) {
+    let mut constructor_node: Option<P<Node>> = None;
+    let mut members: Vec<RawMemberFact> = Vec::new();
+    for &(decl, _) in decls {
+        let raw_members: &[P<Node>] = match decl.kind() {
+            Kind::ClassDeclaration => decl.as_class_declaration().members().nodes(),
+            Kind::ClassExpression => decl.as_class_expression().members().nodes(),
+            Kind::InterfaceDeclaration => decl.as_interface_declaration().members().nodes(),
+            _ => &[],
+        };
+        for &member in raw_members {
+            if member.kind() == Kind::Constructor {
+                if member.body().is_some() || constructor_node.is_none() {
+                    constructor_node = Some(member);
+                }
+                continue;
+            }
+            if let Some(fact) = extract_member_fact(cwd, member, checker) {
+                // If an overloaded method has both signature and implementation body, prefer bodied entry.
+                if let Some(existing) = members.iter_mut().find(|m| {
+                    m.name == fact.name && m.kind == fact.kind && m.is_static == fact.is_static
+                }) {
+                    if fact.has_body && !existing.has_body {
+                        *existing = fact;
+                    }
+                } else {
+                    members.push(fact);
+                }
+            }
+        }
+    }
+    (members, constructor_node)
 }
 
 fn extract_member_fact(
@@ -621,29 +773,6 @@ fn extract_member_name(name_node: P<Node>) -> Option<String> {
     prop_key_text(name_node).or_else(|| node_text(name_node))
 }
 
-fn synthesize_external_node(
-    cwd: &str,
-    program: &'static Program,
-    checker: &mut CheckerHandle,
-    sym: P<Symbol>,
-) -> Option<TypeHierarchyNodeRaw> {
-    let decls = unwrap_sym_declarations(sym);
-    let decl = decls.into_iter().find(|&d| {
-        matches!(
-            d.kind(),
-            Kind::ClassDeclaration | Kind::ClassExpression | Kind::InterfaceDeclaration
-        )
-    })?;
-    let sf = get_source_file_of_node(decl)?;
-    let is_external = program.is_source_file_default_library(sf.path())
-        || !is_first_party_workspace_path(cwd, sf.file_name());
-    let empty_exports = FxHashSet::default();
-    let mut raw = extract_hierarchy_node_raw(cwd, decl, is_external, checker, &empty_exports)?;
-    raw.is_external = is_external;
-    raw.is_exported = true;
-    Some(raw)
-}
-
 fn collect_receiver_type_symbols(
     ty: P<Type>,
     checker: &mut CheckerHandle,
@@ -704,5 +833,20 @@ fn collect_receiver_type_symbols(
         {
             out_syms.push(unwrapped);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_hierarchy_index_is_send_and_sync_and_lazy_state_defaults_empty() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ProgramHierarchyIndex>();
+
+        let lazy = HierarchyLazyState::default();
+        assert!(lazy.nodes_by_symbol.is_empty());
+        assert!(lazy.exported_by_sf.is_empty());
     }
 }

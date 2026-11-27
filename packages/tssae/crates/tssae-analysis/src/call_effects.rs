@@ -192,8 +192,6 @@ pub fn analyze_call_effects_on_ir(
     Option<IrCallGraph>,
     Option<IrFieldWriteIndex>,
 ) {
-    let mut owned_graph = None;
-    let mut owned_field_index = None;
     let mut analyzer = CallEffectsAnalyzer {
         options,
         project_files,
@@ -202,9 +200,7 @@ pub fn analyze_call_effects_on_ir(
         ir_provider,
         summary_index,
         cached_call_graph,
-        owned_graph: &mut owned_graph,
         cached_field_index,
-        owned_field_index: &mut owned_field_index,
         conflict: None,
     };
 
@@ -221,7 +217,7 @@ pub fn analyze_call_effects_on_ir(
         conflict: analyzer.conflict.take(),
     };
     drop(analyzer);
-    (outcome, owned_graph, owned_field_index)
+    (outcome, None, None)
 }
 
 struct CallEffectsAnalyzer<'a> {
@@ -232,9 +228,7 @@ struct CallEffectsAnalyzer<'a> {
     ir_provider: &'a dyn IrProvider,
     summary_index: &'a BehaviorSummaryIndex,
     cached_call_graph: Option<&'a IrCallGraph>,
-    owned_graph: &'a mut Option<IrCallGraph>,
     cached_field_index: Option<&'a IrFieldWriteIndex>,
-    owned_field_index: &'a mut Option<IrFieldWriteIndex>,
     conflict: Option<SummaryConflictError>,
 }
 
@@ -1055,21 +1049,8 @@ impl CallEffectsAnalyzer<'_> {
         callee_val: ValueId,
         call_stack: &[EffectFrame],
     ) -> (Vec<ResolvedCalleeTarget>, Vec<GapItem>) {
-        // 1. Try local/captured value tracing (handles closures, local function vars, object literals).
-        let mut trace_gaps = Vec::new();
-        let value_targets = self.resolve_value_callables(
-            caller_ir,
-            callee_val,
-            Some(call_vertex.id),
-            call_stack,
-            None,
-            &mut trace_gaps,
-        );
-        if !value_targets.is_empty() {
-            return (value_targets, trace_gaps);
-        }
-
-        // 2. Fall back to Ticket 08's `call_resolution`.
+        // 1. Try Ticket 08's `call_resolution` first to avoid expensive value tracing
+        //    on direct function, method, and default-library calls.
         let resolution = resolve_call_targets_in_scope(
             call_syntax,
             caller_ir,
@@ -1085,7 +1066,7 @@ impl CallEffectsAnalyzer<'_> {
         }
 
         let mut targets = Vec::new();
-        for t in resolution.targets {
+        for t in &resolution.targets {
             if !t.is_external
                 && !t.is_default_library
                 && let Some(fn_syn) = t.fn_scope_syntax
@@ -1098,10 +1079,123 @@ impl CallEffectsAnalyzer<'_> {
                 });
             }
         }
+
+        if resolution.is_complete && !resolution.targets.is_empty() {
+            return (targets, resolution.gaps);
+        }
+
+        // 2. Fall back to local/captured value tracing when static resolution is empty
+        //    or incomplete (handles closures, local function vars, object literals).
+        let mut trace_gaps = Vec::new();
+        let value_targets = self.resolve_value_callables(
+            caller_ir,
+            callee_val,
+            Some(call_vertex.id),
+            call_stack,
+            None,
+            &mut trace_gaps,
+        );
+        if self.conflict.is_some() {
+            return (Vec::new(), Vec::new());
+        }
+        if !value_targets.is_empty() {
+            if targets.is_empty() {
+                return (value_targets, trace_gaps);
+            }
+            for vt in value_targets {
+                let already_present = targets.iter().any(|existing| {
+                    existing.callee_ir.id == vt.callee_ir.id
+                        && existing.captured_stack.len() == vt.captured_stack.len()
+                });
+                if !already_present {
+                    targets.push(vt);
+                }
+            }
+            return (targets, resolution.gaps);
+        }
         if targets.is_empty() && trace_gaps.iter().any(|g| g.kind == "dynamic-callee") {
             return (targets, trace_gaps);
         }
         (targets, resolution.gaps)
+    }
+
+    fn collect_value_allowed_files(
+        &self,
+        scope_ir: &FunctionIr,
+        val: ValueId,
+        vertex_hint: Option<VertexId>,
+        call_stack: &[EffectFrame],
+        expr_hint: Option<SyntaxId>,
+    ) -> FxHashSet<FileId> {
+        let mut allowed = FxHashSet::default();
+        allowed.insert(scope_ir.id.file);
+        allowed.insert(scope_ir.root_syntax.file_id());
+        for f in call_stack {
+            allowed.insert(f.caller_ir.id.file);
+            allowed.insert(f.callee_ir.id.file);
+            for cf in &f.ir_frame.closure_env {
+                allowed.insert(cf.caller_ir.id.file);
+                allowed.insert(cf.callee_ir.id.file);
+            }
+        }
+
+        let mut add_decl_files = |syn: SyntaxId| {
+            allowed.insert(syn.file_id());
+            if let Some(decl) = self.semantic.resolve_declaration(syn) {
+                if let Some(primary) = decl.primary_syntax {
+                    allowed.insert(primary.file_id());
+                }
+                if let Some(callable) = decl.callable_syntax {
+                    allowed.insert(callable.file_id());
+                }
+                if let Some(init) = decl.initializer_syntax {
+                    allowed.insert(init.file_id());
+                }
+            }
+        };
+
+        if let Some(expr_syn) = expr_hint {
+            add_decl_files(expr_syn);
+        }
+
+        let mut queue = VecDeque::new();
+        let mut seen_vals = FxHashSet::default();
+        queue.push_back((val, vertex_hint));
+        let mut steps = 0usize;
+        while let Some((cur_val, cur_hint)) = queue.pop_front() {
+            if steps >= 16 || !seen_vals.insert(cur_val) {
+                continue;
+            }
+            steps += 1;
+            let Some(v) = find_value_producer_vertex(scope_ir, cur_val, cur_hint) else {
+                continue;
+            };
+            if let Some(syn) = v.syntax {
+                add_decl_files(syn);
+            }
+            match &v.op {
+                IrOp::ValueForward { source, .. } => {
+                    queue.push_back((*source, Some(v.id)));
+                }
+                IrOp::PropRead { object, .. } => {
+                    queue.push_back((*object, Some(v.id)));
+                }
+                IrOp::ReadSymbol { ident_syntax } => {
+                    add_decl_files(*ident_syntax);
+                }
+                IrOp::ReadLocal { binding } => {
+                    if let Some(b) = scope_ir.bindings.iter().find(|b| b.id == *binding) {
+                        add_decl_files(b.syntax);
+                    }
+                }
+                IrOp::FunctionLiteral { syntax, .. } | IrOp::ClassLiteral { syntax } => {
+                    add_decl_files(*syntax);
+                }
+                _ => {}
+            }
+        }
+
+        allowed
     }
 
     fn resolve_value_callables(
@@ -1114,18 +1208,28 @@ impl CallEffectsAnalyzer<'_> {
         gaps: &mut Vec<GapItem>,
     ) -> Vec<ResolvedCalleeTarget> {
         let ir_stack: Vec<IrCallFrame> = call_stack.iter().map(|f| f.ir_frame.clone()).collect();
+        let local_allowed =
+            self.collect_value_allowed_files(scope_ir, val, vertex_hint, call_stack, expr_hint);
+        let scoped_project_files: Vec<FileId> = self
+            .project_files
+            .iter()
+            .copied()
+            .filter(|f| local_allowed.contains(f))
+            .collect();
+        let mut local_owned_graph = None;
+        let mut local_owned_field_index = None;
         let mut resolver = IrInstanceResolver::new(
-            self.project_files,
-            None,
-            FxHashSet::default(),
+            &scoped_project_files,
+            Some(&local_allowed),
+            local_allowed.clone(),
             self.semantic,
             self.syntax,
             self.ir_provider,
             self.summary_index,
             self.cached_call_graph,
-            self.owned_graph,
+            &mut local_owned_graph,
             self.cached_field_index,
-            self.owned_field_index,
+            &mut local_owned_field_index,
             false,
         );
         let mut active: Vec<VisitKey> = Vec::new();
@@ -1724,6 +1828,8 @@ mod tests {
         texts: FxHashMap<SyntaxId, String>,
         locs: FxHashMap<SyntaxId, DiagnosticLocation>,
         decls: FxHashMap<SyntaxId, DeclarationSummaryData>,
+        scopes: FxHashMap<FileId, Vec<crate::ir::ScopeCatalogEntry>>,
+        scanned_files: std::cell::RefCell<Vec<FileId>>,
     }
 
     impl MockEnv {
@@ -1733,6 +1839,8 @@ mod tests {
                 texts: FxHashMap::default(),
                 locs: FxHashMap::default(),
                 decls: FxHashMap::default(),
+                scopes: FxHashMap::default(),
+                scanned_files: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -1837,8 +1945,9 @@ mod tests {
         fn file_scope_ir(&self, _file: FileId) -> Option<Arc<FunctionIr>> {
             None
         }
-        fn scopes_in_file(&self, _file: FileId) -> Vec<crate::ir::ScopeCatalogEntry> {
-            Vec::new()
+        fn scopes_in_file(&self, file: FileId) -> Vec<crate::ir::ScopeCatalogEntry> {
+            self.scanned_files.borrow_mut().push(file);
+            self.scopes.get(&file).cloned().unwrap_or_default()
         }
     }
 
@@ -2153,5 +2262,182 @@ mod tests {
                 panic!("expected Incomplete for dynamic job.run()")
             }
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Constructs synthetic CFG vertices inline for scoped allowed_files regression test."
+    )]
+    fn value_callable_fallback_scopes_allowed_files_away_from_unrelated_project_files() {
+        let mut env = MockEnv::new();
+        let fn_syn = syn(10);
+        let recv_syn = syn(11);
+        let method_read_syn = syn(12);
+        let call_syn = syn(13);
+
+        env.locs.insert(recv_syn, loc(2, 10, 13));
+        env.locs.insert(method_read_syn, loc(2, 10, 17));
+        env.locs.insert(call_syn, loc(2, 10, 19));
+
+        let vertices = vec![
+            CfgVertex {
+                id: VertexId(0),
+                syntax: Some(fn_syn),
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: Some(loc(1, 0, 30)),
+                value: None,
+                op: IrOp::Entry,
+                explicit_edges: vec![ExplicitEdge {
+                    target: VertexId(1),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            },
+            CfgVertex {
+                id: VertexId(1),
+                syntax: Some(recv_syn),
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: Some(loc(2, 10, 13)),
+                value: Some(ValueId(0)),
+                op: IrOp::ReadLocal {
+                    binding: LocalBindingId(0),
+                },
+                explicit_edges: vec![ExplicitEdge {
+                    target: VertexId(2),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            },
+            CfgVertex {
+                id: VertexId(2),
+                syntax: Some(method_read_syn),
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: Some(loc(2, 10, 17)),
+                value: Some(ValueId(1)),
+                op: IrOp::PropRead {
+                    object: ValueId(0),
+                    key: IrPropKey::Named("run".to_string()),
+                    is_super: false,
+                    implicit_call_kind: None,
+                },
+                explicit_edges: vec![ExplicitEdge {
+                    target: VertexId(3),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            },
+            CfgVertex {
+                id: VertexId(3),
+                syntax: Some(call_syn),
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: Some(loc(2, 10, 19)),
+                value: Some(ValueId(2)),
+                op: IrOp::Call {
+                    call_kind: IrCallKind::Explicit,
+                    callee: ValueId(1),
+                    receiver: Some(ValueId(0)),
+                    args: Vec::new(),
+                },
+                explicit_edges: vec![ExplicitEdge {
+                    target: VertexId(4),
+                    kind: ExplicitEdgeKind::Fallthrough,
+                }],
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            },
+            CfgVertex {
+                id: VertexId(4),
+                syntax: None,
+                local_syntax: None,
+                symbol: None,
+                ty: None,
+                signature: None,
+                location: None,
+                value: None,
+                op: IrOp::Exit,
+                explicit_edges: Vec::new(),
+                may_throw_edge: None,
+                enclosing_finallies: Vec::new(),
+            },
+        ];
+
+        let ir = Arc::new(FunctionIr {
+            id: FunctionIrId {
+                file: FileId(0),
+                local_scope: 1,
+            },
+            root_syntax: fn_syn,
+            scope_kind: IrScopeKind::Function,
+            scope_location: loc(1, 0, 30),
+            decl_semantics: DeclarationSemantics::default(),
+            type_guard: None,
+            parameters: vec![crate::ir::IrParameter {
+                name: "job".to_string(),
+                binding: Some(LocalBindingId(0)),
+                raw_value: None,
+                syntax: recv_syn,
+                has_default: false,
+                is_rest: false,
+            }],
+            bindings: vec![IrLocalBinding {
+                id: LocalBindingId(0),
+                name: "job".to_string(),
+                symbol: None,
+                syntax: recv_syn,
+                mutability: BindingMutability::Let,
+            }],
+            captured_bindings: Vec::new(),
+            vertices,
+            entry: VertexId(0),
+            normal_exit: VertexId(4),
+            exceptional_exit: VertexId(4),
+            exit: VertexId(4),
+            syntax_to_vertex: FxHashMap::default(),
+            expr_to_vertex: FxHashMap::default(),
+            expr_to_value: FxHashMap::default(),
+            value_sources: FxHashMap::default(),
+            branches: Vec::new(),
+            value_count: 3,
+        });
+        env.irs.insert(fn_syn, ir);
+
+        let unrelated_file = FileId(99);
+        let (batch, built_graph, built_field_index) = analyze_call_effects_on_ir(
+            &[CallEffectsTargetSpec {
+                syntax: fn_syn,
+                symbol: None,
+            }],
+            CallEffectsOptions::default(),
+            &[FileId(0), unrelated_file],
+            &env,
+            &env,
+            &env,
+            &BehaviorSummaryIndex::default(),
+            None,
+            None,
+        );
+        assert!(batch.conflict.is_none());
+        assert!(built_graph.is_none());
+        assert!(built_field_index.is_none());
+        assert!(
+            !env.scanned_files.borrow().contains(&unrelated_file),
+            "resolve_value_callables must not scan unrelated project files"
+        );
     }
 }

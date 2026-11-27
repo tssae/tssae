@@ -31,8 +31,10 @@ use crate::{
         ResolvedPackageInfo, SourceMapCache, collect_resolved_packages_for_program,
     },
     ir_lower::{
-        lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_function_node,
-        resolve_enclosing_cfg_owner, resolve_enclosing_function,
+        CfgScopeTarget, is_statement_level_cfg_scope, lower_class_default_constructor_to_ir,
+        lower_scope_to_ir_with_index, normalize_cfg_scope_node, normalize_cfg_scope_target,
+        normalize_function_node, resolve_enclosing_branch_scope, resolve_enclosing_cfg_owner,
+        resolve_enclosing_function,
     },
     semantic_facade::{
         FacadeAssignability, FacadeCallSelect, FacadeDeclarationSelect, FacadeSignatureSelect,
@@ -90,6 +92,41 @@ pub struct BoundarySnapshotData(pub(crate) Arc<SnapshotData>);
 /// Opaque mutable borrow of a `tsrs` type checker scoped to a query batch.
 pub struct BoundaryChecker<'a>(pub(crate) &'a mut CheckerHandle);
 
+/// Opaque `Copy` handle identifying a normalized CFG scope root or synthesized class default constructor.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BoundaryCfgScope {
+    /// Function, block, static block, source file, or statement scope.
+    Node(BoundaryNode),
+    /// Synthesized default constructor (`IrScopeKind::Constructor`) of a class without an explicit bodied `constructor`.
+    ClassDefaultConstructor(BoundaryNode),
+}
+
+impl BoundaryCfgScope {
+    #[must_use]
+    pub const fn anchor_node(self) -> BoundaryNode {
+        match self {
+            Self::Node(node) | Self::ClassDefaultConstructor(node) => node,
+        }
+    }
+
+    #[must_use]
+    pub fn uses_statement_ir_cache(self) -> bool {
+        match self {
+            Self::Node(node) => is_statement_level_cfg_scope(node.0),
+            Self::ClassDefaultConstructor(_) => false,
+        }
+    }
+
+    const fn from_target(target: CfgScopeTarget) -> Self {
+        match target {
+            CfgScopeTarget::Node(n) => Self::Node(BoundaryNode(n)),
+            CfgScopeTarget::ClassDefaultConstructor(cls) => {
+                Self::ClassDefaultConstructor(BoundaryNode(cls))
+            }
+        }
+    }
+}
+
 impl BoundaryNode {
     #[must_use]
     pub fn source_file(self) -> Option<BoundarySourceFile> {
@@ -99,6 +136,16 @@ impl BoundaryNode {
     #[must_use]
     pub fn normalize_cfg_scope(self) -> Option<Self> {
         normalize_cfg_scope_node(self.0).map(Self)
+    }
+
+    #[must_use]
+    pub fn normalize_cfg_scope_target(self) -> Option<BoundaryCfgScope> {
+        normalize_cfg_scope_target(self.0).map(BoundaryCfgScope::from_target)
+    }
+
+    #[must_use]
+    pub fn resolve_enclosing_branch_scope(self) -> Option<BoundaryCfgScope> {
+        resolve_enclosing_branch_scope(self.0).map(BoundaryCfgScope::from_target)
     }
 
     #[must_use]
@@ -271,6 +318,37 @@ pub fn lower_scope_to_ir_boundary(
         file_index,
     )
     .map(|ls| ls.ir)
+}
+
+/// Lowers a normalized [`BoundaryCfgScope`] (either an AST scope node or a synthesized class
+/// default constructor) into function IR using an optional prebuilt [`FileSyntaxIndex`].
+///
+/// # Errors
+/// Returns a [`GapItem`] if `scope` cannot be lowered to IR or violates invariants.
+pub fn lower_cfg_scope_to_ir_boundary(
+    cwd: &str,
+    program: BoundaryProgram,
+    checker: &mut BoundaryChecker<'_>,
+    scope: BoundaryCfgScope,
+    local_scope: u32,
+    file_index: Option<&FileSyntaxIndex>,
+) -> Result<Arc<FunctionIr>, GapItem> {
+    match scope {
+        BoundaryCfgScope::Node(scope_node) => {
+            lower_scope_to_ir_boundary(cwd, program, checker, scope_node, local_scope, file_index)
+        }
+        BoundaryCfgScope::ClassDefaultConstructor(class_node) => {
+            lower_class_default_constructor_to_ir(
+                cwd,
+                program.0,
+                checker.0,
+                class_node.0,
+                local_scope,
+                file_index,
+            )
+            .map(|ls| ls.ir)
+        }
+    }
 }
 
 /// Snapshot-scoped file catalog mapping `FileId`s to opaque `BoundarySourceFile` handles.

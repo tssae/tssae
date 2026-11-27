@@ -380,6 +380,10 @@ export async function runSoundnessReconciliationSuite(
       "val-iterator",
       "val-generator-next-value",
       "val-async-generator-array-elem",
+      "val-async-gen-yield-promise",
+      "val-async-gen-yield-promise-next",
+      "val-async-delegate-sync-gen-array",
+      "val-await-sync-gen-next-value",
     ] as const;
 
     const valueEndpoints = valueTags.map((tag) => {

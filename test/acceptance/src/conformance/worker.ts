@@ -58,6 +58,7 @@ const TOP_LEVEL_STATEMENT_KINDS = new Set([
   "ReturnStatement",
   "ThrowStatement",
   "ClassDeclaration",
+  "ExportAssignment",
 ]);
 
 const CALL_NODE_KINDS = new Set([
@@ -162,6 +163,12 @@ async function sweepContext(
 
     const fileTargets: SyntaxRef[] = [];
     const enclosingScopeSpans: DiagnosticLocation[] = [];
+    const classNodes: {
+      readonly ref: SyntaxRef;
+      readonly location: DiagnosticLocation;
+    }[] = [];
+    const nonInstanceFieldModifiers: DiagnosticLocation[] = [];
+    const computedPropertyNames: DiagnosticLocation[] = [];
 
     for (const node of nodes) {
       if (FUNCTION_BODY_KINDS.has(node.kind) && node.body !== undefined) {
@@ -170,6 +177,19 @@ async function sweepContext(
       } else if (EXTRA_SCOPE_KINDS.has(node.kind)) {
         addScope(node.ref, false);
         enclosingScopeSpans.push(node.location);
+      } else if (
+        node.kind === "ClassDeclaration" ||
+        node.kind === "ClassExpression"
+      ) {
+        classNodes.push({ ref: node.ref, location: node.location });
+      } else if (
+        node.kind === "StaticKeyword" ||
+        node.kind === "AbstractKeyword" ||
+        node.kind === "DeclareKeyword"
+      ) {
+        nonInstanceFieldModifiers.push(node.location);
+      } else if (node.kind === "ComputedPropertyName") {
+        computedPropertyNames.push(node.location);
       }
 
       if (CALL_NODE_KINDS.has(node.kind) && fileTargets.length < 4) {
@@ -184,6 +204,90 @@ async function sweepContext(
         repVarInits.length < MAX_REPRESENTATIVE_VARS_PER_BATCH
       ) {
         repVarInits.push({ ref: node.initializer, file: relFile });
+      }
+    }
+
+    if (classNodes.length > 0) {
+      const findInnermostClass = (
+        loc: DiagnosticLocation,
+      ):
+        | { readonly ref: SyntaxRef; readonly location: DiagnosticLocation }
+        | undefined => {
+        let best:
+          | { readonly ref: SyntaxRef; readonly location: DiagnosticLocation }
+          | undefined;
+        let bestSpan = Number.POSITIVE_INFINITY;
+        for (const cls of classNodes) {
+          if (loc.start > cls.location.start && loc.end <= cls.location.end) {
+            const span = cls.location.end - cls.location.start;
+            if (span < bestSpan) {
+              best = cls;
+              bestSpan = span;
+            }
+          }
+        }
+        return best;
+      };
+
+      const classesWithBodiedCtor = new Set<string>();
+      for (const node of nodes) {
+        if (node.kind === "Constructor" && node.body !== undefined) {
+          const cls = findInnermostClass(node.location);
+          if (cls !== undefined) {
+            classesWithBodiedCtor.add(cls.ref.handleId);
+          }
+        }
+      }
+
+      const seenDefaultCtorClasses = new Set<string>();
+      const spanByHandle = new Map(
+        nodes.map((n) => [n.ref.handleId, n.location]),
+      );
+
+      for (const node of nodes) {
+        if (node.kind !== "PropertyDeclaration") {
+          continue;
+        }
+        const cls = findInnermostClass(node.location);
+        if (
+          cls === undefined ||
+          classesWithBodiedCtor.has(cls.ref.handleId) ||
+          seenDefaultCtorClasses.has(cls.ref.handleId)
+        ) {
+          continue;
+        }
+        const nameLoc =
+          node.name !== undefined
+            ? spanByHandle.get(node.name.handleId)
+            : undefined;
+        const initLoc =
+          node.initializer !== undefined
+            ? spanByHandle.get(node.initializer.handleId)
+            : undefined;
+        const headerEnd = nameLoc?.start ?? initLoc?.start ?? node.location.end;
+
+        const hasNonInstanceModifier = nonInstanceFieldModifiers.some(
+          (modLoc) =>
+            modLoc.start >= node.location.start &&
+            modLoc.end <= headerEnd &&
+            findInnermostClass(modLoc)?.ref.handleId === cls.ref.handleId,
+        );
+        if (hasNonInstanceModifier) {
+          continue;
+        }
+
+        const hasComputedKey = computedPropertyNames.some(
+          (cnLoc) =>
+            isInsideSpan(cnLoc, node.location) &&
+            (initLoc === undefined || cnLoc.end <= initLoc.start) &&
+            findInnermostClass(cnLoc)?.ref.handleId === cls.ref.handleId,
+        );
+        if (node.initializer === undefined && !hasComputedKey) {
+          continue;
+        }
+
+        seenDefaultCtorClasses.add(cls.ref.handleId);
+        addScope(node.ref, false);
       }
     }
 

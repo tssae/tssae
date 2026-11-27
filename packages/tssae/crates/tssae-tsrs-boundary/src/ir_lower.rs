@@ -124,6 +124,16 @@ pub fn normalize_function_node(node: P<Node>) -> Option<P<Node>> {
     None
 }
 
+/// Normalized CFG analysis target distinguishing AST statement/callable scopes from synthesized default constructors.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CfgScopeTarget {
+    /// Function, block, static block, source file, or statement scope.
+    Node(P<Node>),
+    /// Synthesized default constructor (`IrScopeKind::Constructor`) of a `ClassDeclaration` or
+    /// `ClassExpression` that has no explicit bodied `constructor`.
+    ClassDefaultConstructor(P<Node>),
+}
+
 /// Normalizes a function-like node, block, class static block, or statement suitable as a CFG root scope.
 #[must_use]
 pub fn normalize_cfg_scope_node(node: P<Node>) -> Option<P<Node>> {
@@ -132,12 +142,105 @@ pub fn normalize_cfg_scope_node(node: P<Node>) -> Option<P<Node>> {
     }
     if matches!(
         node.kind(),
-        Kind::Block | Kind::ModuleBlock | Kind::ClassStaticBlockDeclaration | Kind::SourceFile
+        Kind::Block
+            | Kind::ModuleBlock
+            | Kind::ClassStaticBlockDeclaration
+            | Kind::SourceFile
+            | Kind::ClassExpression
     ) || tsrs_ast::is_statement(node)
     {
         return Some(node);
     }
     None
+}
+
+/// Normalizes a syntax handle into a [`CfgScopeTarget`] for `listBranches` and `branchCoverage`.
+///
+/// Passing a non-static `PropertyDeclaration` on a class without an explicit bodied `constructor`
+/// targets the class's synthesized default constructor (`IrScopeKind::Constructor`); on a class
+/// with an explicit bodied `constructor`, it targets that `Constructor` node.
+#[must_use]
+pub fn normalize_cfg_scope_target(node: P<Node>) -> Option<CfgScopeTarget> {
+    if let Some(fn_node) = normalize_function_node(node) {
+        return Some(CfgScopeTarget::Node(fn_node));
+    }
+    if node.kind() == Kind::PropertyDeclaration {
+        let cls = node.parent().filter(|&p| is_class_scope_node(p))?;
+        let sem = extract_decl_semantics(node);
+        if !sem.is_static {
+            let explicit_ctor = cls
+                .members()
+                .iter()
+                .copied()
+                .find(|m| m.kind() == Kind::Constructor && m.body().is_some());
+            return Some(explicit_ctor.map_or(
+                CfgScopeTarget::ClassDefaultConstructor(cls),
+                CfgScopeTarget::Node,
+            ));
+        }
+        return Some(CfgScopeTarget::Node(cls));
+    }
+    normalize_cfg_scope_node(node).map(CfgScopeTarget::Node)
+}
+
+/// Resolves the enclosing function or class instance-initializer constructor scope for implicit
+/// `branchCoverage` target resolution.
+#[must_use]
+pub fn resolve_enclosing_branch_scope(node: P<Node>) -> Option<CfgScopeTarget> {
+    let mut prev = node;
+    let mut cur = node.parent();
+    let mut from_param_decorator = false;
+    while let Some(p) = cur {
+        if p.kind() == Kind::Parameter && p.decorators().contains(&prev) {
+            from_param_decorator = true;
+        } else if is_function_like_declaration(Some(p)) {
+            let skip_for_param_decorator = from_param_decorator && p.parameters().contains(&prev);
+            from_param_decorator = false;
+            if !skip_for_param_decorator
+                && !p.decorators().contains(&prev)
+                && p.name() != Some(prev)
+            {
+                return Some(CfgScopeTarget::Node(p));
+            }
+        } else {
+            from_param_decorator = false;
+            if p.kind() == Kind::PropertyDeclaration {
+                let prop = p.as_property_declaration();
+                if prop.initializer() == Some(prev)
+                    && let Some(cls) = p.parent()
+                    && is_class_scope_node(cls)
+                    && !extract_decl_semantics(p).is_static
+                {
+                    let explicit_ctor = cls
+                        .members()
+                        .iter()
+                        .copied()
+                        .find(|m| m.kind() == Kind::Constructor && m.body().is_some());
+                    return Some(explicit_ctor.map_or(
+                        CfgScopeTarget::ClassDefaultConstructor(cls),
+                        CfgScopeTarget::Node,
+                    ));
+                }
+            }
+            if is_class_scope_node(p) {
+                return None;
+            }
+        }
+        prev = p;
+        cur = p.parent();
+    }
+    None
+}
+
+/// Returns `true` when `scope_node` lowers to a statement/local-block scope (`IrScopeKind::LocalBlock`)
+/// rather than a callable, static-init, or module scope.
+#[must_use]
+pub fn is_statement_level_cfg_scope(scope_node: P<Node>) -> bool {
+    normalize_function_node(scope_node).is_none()
+        && !matches!(
+            scope_node.kind(),
+            Kind::ClassStaticBlockDeclaration | Kind::SourceFile
+        )
 }
 
 /// Lowers a normalized function, block, class static block, or statement scope into a verified [`LoweredScope`].
@@ -183,7 +286,10 @@ pub fn lower_scope_to_ir_with_index(
     if normalized_fn.is_none()
         && !is_static_block
         && !is_source_file
-        && !matches!(scope_node.kind(), Kind::Block | Kind::ModuleBlock)
+        && !matches!(
+            scope_node.kind(),
+            Kind::Block | Kind::ModuleBlock | Kind::ClassExpression
+        )
         && !tsrs_ast::is_statement(scope_node)
     {
         return Err(GapItem::from_reason(
@@ -1461,7 +1567,7 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
                 self.add_edge(here, next, ExplicitEdgeKind::Fallthrough);
                 here
             }
-            Kind::ClassDeclaration => self.lower_class_stmt(node, next),
+            Kind::ClassDeclaration | Kind::ClassExpression => self.lower_class_stmt(node, next),
             Kind::ClassStaticBlockDeclaration => {
                 let block = node.as_class_static_block_declaration().body();
                 self.lower_stmt(block, next)
@@ -1523,7 +1629,6 @@ impl<'a, 'b> ScopeLowerer<'a, 'b> {
             | Kind::TemplateExpression
             | Kind::YieldExpression
             | Kind::SpreadElement
-            | Kind::ClassExpression
             | Kind::OmittedExpression
             | Kind::ExpressionWithTypeArguments
             | Kind::AsExpression

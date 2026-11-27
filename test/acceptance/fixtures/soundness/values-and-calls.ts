@@ -87,6 +87,52 @@ export async function runAsyncGeneratorContainerValue(): Promise<void> {
   }
 }
 
+async function* yieldWrappedPromise<T>(item: T): AsyncGenerator<T> {
+  yield Promise.resolve(item);
+}
+
+function* syncYieldMappedArray<T>(item: T): Generator<T[]> {
+  yield [item].map((x) => x);
+}
+
+async function* delegateSyncMappedArray<T>(item: T): AsyncGenerator<T[]> {
+  yield* syncYieldMappedArray(item);
+}
+
+function asMaybeAsyncStep<R>(step: R): R | Promise<R> {
+  return step;
+}
+
+export async function runAsyncGeneratorYieldPromiseScenarios(): Promise<void> {
+  const tokenForAwait = source("val-async-gen-yield-promise", {
+    kind: "async-gen-yield-promise",
+  });
+  for await (const val of yieldWrappedPromise(tokenForAwait)) {
+    sink("val-async-gen-yield-promise", val);
+  }
+
+  const tokenNext = source("val-async-gen-yield-promise-next", {
+    kind: "async-gen-yield-promise-next",
+  });
+  const nextItem = (await yieldWrappedPromise(tokenNext).next()).value;
+  sink("val-async-gen-yield-promise-next", nextItem);
+
+  const tokenDelegated = source("val-async-delegate-sync-gen-array", {
+    kind: "async-delegate-sync-gen-array",
+  });
+  for await (const arr of delegateSyncMappedArray(tokenDelegated)) {
+    sink("val-async-delegate-sync-gen-array", arr[0]);
+  }
+
+  const tokenAwaitSyncStep = source("val-await-sync-gen-next-value", {
+    kind: "await-sync-gen-next-value",
+  });
+  const syncStep = await asMaybeAsyncStep(
+    yieldSingle(tokenAwaitSyncStep).next(),
+  );
+  sink("val-await-sync-gen-next-value", syncStep.value);
+}
+
 export class BaseWorker {
   execute(): void {
     recordCallee("BaseWorker.execute");
@@ -151,6 +197,7 @@ export async function runValuesAndCallsScenarios(): Promise<void> {
   runIteratorValue();
   runGeneratorNextValue();
   await runAsyncGeneratorContainerValue();
+  await runAsyncGeneratorYieldPromiseScenarios();
   invokeWorker(new DerivedWorker());
   invokeReassignedClosure();
   invokeOptionalTarget({ ping: optionalPing });

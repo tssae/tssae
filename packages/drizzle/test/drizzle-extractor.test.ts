@@ -618,6 +618,22 @@ export function runQueries() {
           ]);
           assert.deepEqual(userParse.defaultedFields, ["age"]);
 
+          // Untargeted extractDrizzleZodSchemas scopes to ctx.project.sourceFiles only
+          const dbDrizzleSchemas = await extractDrizzleZodSchemas(dbCtx);
+          const appDrizzleSchemas = await extractDrizzleZodSchemas(appCtx);
+          assert.equal(dbDrizzleSchemas.length, 4);
+          assert.deepEqual(appDrizzleSchemas, []);
+
+          // Cross-package query projections still resolve when opened on appCtx
+          const appProjs = await extractDrizzleRowProjections(appCtx);
+          assert.ok(
+            appProjs.some(
+              (p) =>
+                p.queryKind === "relational" &&
+                p.at.file === "packages/db/src/drizzle-projections.ts",
+            ),
+          );
+
           // Fake local createSelectSchema emits unresolved-schema
           const appSchemas = await drizzleZodValidator.extractInputFields(
             appCtx,

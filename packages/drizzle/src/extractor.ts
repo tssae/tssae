@@ -2558,7 +2558,8 @@ export async function extractDrizzleZodSchemas(
     }
     results = matched;
   } else {
-    results = all;
+    const ownFiles = new Set(ctx.project.sourceFiles);
+    results = all.filter((item) => ownFiles.has(item.at.file));
   }
 
   const allGaps: Gap[] = [];

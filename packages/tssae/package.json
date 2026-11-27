@@ -1,6 +1,6 @@
 {
   "name": "tssae",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript and JavaScript static analysis engine with typed Node query API and bundled native binary.",
   "license": "MIT",
   "files": [

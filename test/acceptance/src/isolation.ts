@@ -1,7 +1,9 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+
+import { prependToPath } from "./node-runtime.ts";
 
 export type IsolationMode = "bwrap" | "node-permission";
 
@@ -28,6 +30,7 @@ export type RunInIsolatedHostOptions = {
   readonly args: readonly string[];
   readonly isolated?: boolean;
   readonly pnpmStoreDir?: string;
+  readonly nodeExecutable?: string;
   readonly blockedPaths?: readonly string[];
   readonly sharedReadWritePaths?: readonly string[];
   readonly allowNet?: boolean;
@@ -194,6 +197,7 @@ function buildNodePermissionOptions(options: {
   readonly checkoutRealpath: string;
   readonly isolatedTmpDir: string;
   readonly sharedReadWritePaths: readonly string[];
+  readonly nodeExecutable: string;
   readonly allowNet: boolean;
   readonly pnpmStorePath?: string;
 }): string {
@@ -201,8 +205,8 @@ function buildNodePermissionOptions(options: {
     options.checkoutRealpath,
     options.isolatedTmpDir,
     ...options.sharedReadWritePaths,
-    dirname(process.execPath),
-    dirname(realpathSync(process.execPath)),
+    dirname(options.nodeExecutable),
+    dirname(realpathSync(options.nodeExecutable)),
   ]);
   for (const systemDir of [
     "/pnpm/store",
@@ -243,6 +247,7 @@ async function runControlProbe(options: {
   readonly mode: IsolationMode;
   readonly blockedPaths: readonly string[];
   readonly checkoutRealpath: string;
+  readonly nodeExecutable: string;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly bwrapPrefixArgs: readonly string[];
 }): Promise<{ readonly blocked: boolean; readonly errorMessage: string }> {
@@ -261,13 +266,13 @@ async function runControlProbe(options: {
   const probeScript =
     "const fs = require('node:fs'); fs.statSync(process.argv[1]);";
 
-  const command = options.mode === "bwrap" ? "bwrap" : process.execPath;
+  const command = options.mode === "bwrap" ? "bwrap" : options.nodeExecutable;
   const args =
     options.mode === "bwrap"
       ? [
           ...options.bwrapPrefixArgs,
           "--",
-          process.execPath,
+          options.nodeExecutable,
           "-e",
           probeScript,
           probeFile,
@@ -310,10 +315,19 @@ export async function runInIsolatedHost(
 ): Promise<IsolatedRunResult> {
   const checkoutRealpath = realpathSync(options.checkoutDir);
   const binDir = join(checkoutRealpath, "node_modules", ".bin");
+  const nodeExecutable =
+    options.nodeExecutable !== undefined
+      ? realpathSync(options.nodeExecutable)
+      : process.execPath;
+  const nodeBinDir =
+    options.nodeExecutable !== undefined ? dirname(nodeExecutable) : undefined;
   const baseEnv = options.env ?? process.env;
   const envWithPath: Record<string, string | undefined> = {
     ...baseEnv,
-    PATH: `${binDir}${delimiter}${baseEnv.PATH ?? ""}`,
+    PATH: prependToPath(
+      [binDir, ...(nodeBinDir === undefined ? [] : [nodeBinDir])],
+      baseEnv.PATH,
+    ),
   };
   const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
 
@@ -383,6 +397,7 @@ export async function runInIsolatedHost(
             checkoutRealpath,
             isolatedTmpDir,
             sharedReadWritePaths,
+            nodeExecutable,
             allowNet: options.allowNet === true,
             ...(pnpmStorePath === undefined ? {} : { pnpmStorePath }),
           }),
@@ -393,6 +408,7 @@ export async function runInIsolatedHost(
       mode,
       blockedPaths,
       checkoutRealpath,
+      nodeExecutable,
       env: isolatedEnv,
       bwrapPrefixArgs,
     });

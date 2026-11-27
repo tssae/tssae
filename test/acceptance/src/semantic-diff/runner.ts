@@ -293,8 +293,8 @@ export async function runSemanticDiffGate(
     let candidateCwd: string;
 
     if (customEntriesProvided) {
-      baselineEntry = resolve(options.baselineEntryPath!);
-      candidateEntry = resolve(options.candidateEntryPath!);
+      baselineEntry = resolve(options.baselineEntryPath);
+      candidateEntry = resolve(options.candidateEntryPath);
       baselineCwd = projectDir;
       candidateCwd = projectDir;
     } else {
@@ -325,7 +325,11 @@ export async function runSemanticDiffGate(
       log(
         "[semantic-diff] Installing baseline and candidate packages into isolated hosts...",
       );
-      hostA = await prepareAcceptanceHost({ bundle: baselineBundle });
+      // Historical baseline commits (prior to Node 24 compat) may declare engines.node: "^26.13.1".
+      hostA = await prepareAcceptanceHost({
+        bundle: baselineBundle,
+        engineStrict: false,
+      });
       hostB = await prepareAcceptanceHost({ bundle: candidateBundle });
       baselineEntry = resolveInstalledTssaeEntry(hostA);
       candidateEntry = resolveInstalledTssaeEntry(hostB);

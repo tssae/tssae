@@ -35,8 +35,5 @@
     "tsrs": "catalog:",
     "typescript-7": "catalog:",
     "zod": "catalog:"
-  },
-  "engines": {
-    "node": "^26.13.1"
   }
 }

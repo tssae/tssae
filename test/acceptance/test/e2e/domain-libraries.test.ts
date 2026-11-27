@@ -85,6 +85,7 @@ import {
   type QueryCompletedEvent,
 } from "tssae";
 
+assert.equal(process.versions.node, "24.0.0");
 assert.equal(zodValidator.id, "zod");
 
 const openRpcMetrics: EngineCallIoMetrics[] = [];
@@ -191,6 +192,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       providerId: zodValidator.id,
       userDefaultedFields: userIn.defaultedFields,
       userGapKinds: userIn.gaps.map((g) => g.kind),
@@ -217,6 +219,7 @@ import {
   type QueryCompletedEvent,
 } from "tssae";
 
+assert.equal(process.versions.node, "24.0.0");
 assert.equal(drizzleQueryProjection.id, "drizzle");
 
 const session = await openProject({
@@ -361,6 +364,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       tableNames: tables.map((t) => t.tableName).toSorted(),
       schemasCount: schemas.length,
     }) + "\\n",
@@ -393,6 +397,7 @@ import {
   type QueryCompletedEvent,
 } from "tssae";
 
+assert.equal(process.versions.node, "24.0.0");
 assert.equal(drizzleQueryProjection.id, "drizzle");
 assert.equal(drizzleZodSchemaResolver.id, "drizzle-zod");
 assert.equal(drizzleZodValidator.id, "drizzle-zod");
@@ -605,6 +610,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       refinedRequired: refinedIn.requiredFields,
       refinedDefaulted: refinedIn.defaultedFields,
       refinedOptional: refinedIn.optionalFields,
@@ -714,9 +720,11 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
         );
         assert.equal(runRes.isolation?.controlProbeBlocked, true);
         const summary = JSON.parse(runRes.stdout.trim()) as {
+          readonly nodeVersion: string;
           readonly providerId: string;
           readonly userDefaultedFields: readonly string[];
         };
+        assert.equal(summary.nodeVersion, "24.0.0");
         assert.equal(summary.providerId, "zod");
         assert.deepEqual(summary.userDefaultedFields, ["age"]);
 
@@ -763,9 +771,11 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
         );
         assert.equal(runRes.isolation?.controlProbeBlocked, true);
         const summary = JSON.parse(runRes.stdout.trim()) as {
+          readonly nodeVersion: string;
           readonly tableNames: readonly string[];
           readonly schemasCount: number;
         };
+        assert.equal(summary.nodeVersion, "24.0.0");
         assert.equal(summary.schemasCount, 2);
         assert.equal(summary.tableNames.length, 4);
 
@@ -812,8 +822,10 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
         );
         assert.equal(runRes.isolation?.controlProbeBlocked, true);
         const summary = JSON.parse(runRes.stdout.trim()) as {
+          readonly nodeVersion: string;
           readonly retainedBriefFields: readonly string[];
         };
+        assert.equal(summary.nodeVersion, "24.0.0");
         assert.deepEqual(summary.retainedBriefFields, [
           "fullName",
           "id",

@@ -196,6 +196,8 @@ const resourceSummaries = defineSummaries({
   ],
 });
 
+assert.equal(process.versions.node, "24.0.0");
+
 const openMetrics: EngineCallIoMetrics[] = [];
 const session = await openProject({
   cwd: process.cwd(),
@@ -514,6 +516,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       callersFound: callerResults[0]?.callSites.length ?? 0,
       branchStatuses: [
         covPositive[0]?.status,
@@ -632,6 +635,7 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
       assert.equal(runResult.isolation?.controlProbeBlocked, true);
 
       const summary = JSON.parse(runResult.stdout.trim()) as {
+        readonly nodeVersion: string;
         readonly callersFound: number;
         readonly branchStatuses: readonly string[];
         readonly propRetained: readonly string[];
@@ -643,6 +647,7 @@ void test("installs candidate tssae out of repo and verifies program queries, ev
         readonly scannedDirectiveRules: readonly string[];
       };
 
+      assert.equal(summary.nodeVersion, "24.0.0");
       assert.equal(summary.callersFound, 1);
       assert.deepEqual(summary.branchStatuses, [
         "proved",

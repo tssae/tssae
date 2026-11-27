@@ -33,6 +33,8 @@ import {
   type SignatureRef,
 } from "tssae";
 
+assert.equal(process.versions.node, "24.0.0");
+
 const engineVersion = await getEngineVersion();
 assert.match(engineVersion, /^\\d+\\.\\d+\\.\\d+(?:[-+][\\w.+-]+)?$/u);
 
@@ -159,6 +161,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       engineVersion,
       textOverloadLine: textSigRow.location?.line,
       numOverloadLine: numSigRow.location?.line,
@@ -228,12 +231,14 @@ void test("installs candidate tssae out of repo, typechecks consumer .d.ts, quer
       assert.equal(runResult.isolation?.controlProbeBlocked, true);
 
       const summary = JSON.parse(runResult.stdout.trim()) as {
+        readonly nodeVersion: string;
         readonly engineVersion: string;
         readonly textOverloadLine: number;
         readonly numOverloadLine: number;
         readonly wrapStrParam0: string;
         readonly wrapNumParam0: string;
       };
+      assert.equal(summary.nodeVersion, "24.0.0");
       assert.equal(summary.textOverloadLine, 1);
       assert.equal(summary.numOverloadLine, 2);
       assert.equal(summary.wrapStrParam0, "string");

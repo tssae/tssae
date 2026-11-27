@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "format:check": "oxfmt --list-different --no-error-on-unmatched-pattern *.json pnpm-workspace.yaml pnpm-lock.yaml *.config.ts .gitignore .dockerignore Dockerfile TODO.md rust-toolchain.toml .vscode .github .changeset/config.json .devcontainer resources scripts template",
-    "format:write": "oxfmt --write --no-error-on-unmatched-pattern *.json pnpm-workspace.yaml pnpm-lock.yaml *.config.ts .gitignore .dockerignore Dockerfile TODO.md rust-toolchain.toml .vscode .github .changeset/config.json .devcontainer resources scripts template",
-    "lint": "oxlint --quiet --format=unix --no-error-on-unmatched-pattern *.config.ts scripts template",
-    "lint:fix": "oxlint --format=unix --no-error-on-unmatched-pattern *.config.ts scripts template --fix",
+    "format:check": "oxfmt --list-different --no-error-on-unmatched-pattern *.json pnpm-workspace.yaml pnpm-lock.yaml *.config.ts .gitignore rust-toolchain.toml .vscode .github .changeset/config.json .devcontainer scripts",
+    "format:write": "oxfmt --write --no-error-on-unmatched-pattern *.json pnpm-workspace.yaml pnpm-lock.yaml *.config.ts .gitignore rust-toolchain.toml .vscode .github .changeset/config.json .devcontainer scripts",
+    "lint": "oxlint --quiet --format=unix --no-error-on-unmatched-pattern *.config.ts scripts",
+    "lint:fix": "oxlint --format=unix --no-error-on-unmatched-pattern *.config.ts scripts --fix",
     "typecheck": "tsc --build --noEmit --pretty false",
     "check": "node --conditions=source scripts/task-gates.ts check",
     "check:heavy": "node --conditions=source scripts/task-gates.ts check:heavy",
@@ -30,8 +30,12 @@
     "turbo": "catalog:",
     "typescript-7": "catalog:"
   },
-  "engines": {
-    "node": "26.13.1"
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "26.13.1",
+      "onFail": "download"
+    }
   },
   "packageManager": "pnpm@12.21.0"
 }

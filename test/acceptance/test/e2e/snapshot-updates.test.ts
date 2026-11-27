@@ -208,6 +208,8 @@ function assertTssaeErrorCode(err: unknown, expected: TssaeErrorCode): boolean {
   return code === expected;
 }
 
+assert.equal(process.versions.node, "24.0.0");
+
 const session = await openProject({
   cwd: process.cwd(),
   tsconfig: "tsconfig.json",
@@ -330,6 +332,7 @@ try {
 
   process.stdout.write(
     JSON.stringify({
+      nodeVersion: process.versions.node,
       initialSnapshotId,
       updatedSnapshotId: updateResult.snapshotId,
       initialOverloadLine: initialParseCall.signatureLine,
@@ -405,6 +408,7 @@ void test("updates snapshot after editing host source, matches fresh openProject
       assert.equal(runResult.isolation?.controlProbeBlocked, true);
 
       const summary = JSON.parse(runResult.stdout.trim()) as {
+        readonly nodeVersion: string;
         readonly initialSnapshotId: number;
         readonly updatedSnapshotId: number;
         readonly initialOverloadLine: number;
@@ -413,6 +417,7 @@ void test("updates snapshot after editing host source, matches fresh openProject
         readonly updatedWrapParam0: string;
         readonly semanticParityMatched: boolean;
       };
+      assert.equal(summary.nodeVersion, "24.0.0");
       assert.notEqual(summary.updatedSnapshotId, summary.initialSnapshotId);
       assert.equal(summary.initialOverloadLine, 1);
       assert.equal(summary.updatedOverloadLine, 2);

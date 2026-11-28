@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "Pure TypeScript Drizzle ORM and drizzle-zod domain extraction built on tssae and @tssae/zod.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tssae/tssae.git",
+    "directory": "packages/drizzle"
+  },
   "files": [
     "dist"
   ],

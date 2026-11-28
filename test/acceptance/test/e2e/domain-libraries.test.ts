@@ -664,6 +664,19 @@ void test("installs candidate tssae, @tssae/zod, and @tssae/drizzle tarballs ind
     );
     assert.ok(tssaeArtifact && zodArtifact && drizzleArtifact);
 
+    const expectedRepositoryDirectories = [
+      [tssaeArtifact, "packages/tssae"],
+      [zodArtifact, "packages/zod"],
+      [drizzleArtifact, "packages/drizzle"],
+    ] as const;
+    for (const [artifact, directory] of expectedRepositoryDirectories) {
+      assert.deepEqual(artifact.manifest.repository, {
+        type: "git",
+        url: "git+https://github.com/tssae/tssae.git",
+        directory,
+      });
+    }
+
     assert.deepEqual(zodArtifact.manifest.dependencies, {
       tssae: "^0.2.0",
     });

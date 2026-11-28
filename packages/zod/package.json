@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "Pure TypeScript Zod domain extraction and shared validator contracts built on tssae.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tssae/tssae.git",
+    "directory": "packages/zod"
+  },
   "files": [
     "dist"
   ],

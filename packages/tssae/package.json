@@ -3,6 +3,11 @@
   "version": "0.2.0",
   "description": "TypeScript and JavaScript static analysis engine with typed Node query API and bundled native binary.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tssae/tssae.git",
+    "directory": "packages/tssae"
+  },
   "files": [
     "dist"
   ],

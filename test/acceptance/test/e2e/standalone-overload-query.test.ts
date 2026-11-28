@@ -208,6 +208,11 @@ void test("installs candidate tssae out of repo, typechecks consumer .d.ts, quer
     async (host) => {
       const tssaeArtifact = host.artifact("tssae");
       assert.ok(tssaeArtifact.binarySha256);
+      assert.deepEqual(tssaeArtifact.manifest.repository, {
+        type: "git",
+        url: "git+https://github.com/tssae/tssae.git",
+        directory: "packages/tssae",
+      });
       assert.equal(host.audit.tssaeVersion, tssaeArtifact.version);
       assert.equal(host.audit.engineBinarySha256, tssaeArtifact.binarySha256);
       assert.equal(host.audit.hasSourceConditionInExports, false);

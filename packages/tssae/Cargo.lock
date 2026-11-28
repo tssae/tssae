@@ -647,9 +647,9 @@ dependencies = [
 
 [[package]]
 name = "tsrs_diagnostics"
-version = "7.1.0-beta.tsrs4"
+version = "7.1.0-beta.tsrs5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "422f77c52bec8730dd82849ba5dabdd660d78e5011217258ee2036262b25e83a"
+checksum = "f066873b05720fc673f9e1e9e7cf157f3be67980bbedcb890f4f86d349f18f95"
 dependencies = [
  "rustc-hash",
 ]

@@ -18,7 +18,7 @@ catalog:
   "@changesets/cli": 3.0.3
   "@types/node": ^26.0.0
   drizzle-zod: 0.8.3
-  drizzle-orm: 0.45.3
+  drizzle-orm: 0.45.4
   oxfmt: ^0.79.0
   oxlint: 1.94.0
   tsrs: 7.1.0-beta.tsrs4

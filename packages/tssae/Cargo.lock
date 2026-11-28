@@ -610,9 +610,9 @@ dependencies = [
 
 [[package]]
 name = "tsrs_core"
-version = "7.1.0-beta.tsrs4"
+version = "7.1.0-beta.tsrs5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38ebceedbb910c2ee130841078f51259e5e5dd5d5f7aac8d4fc741328f47895"
+checksum = "40feb4e0923d97528dbc5c73ec722cb3027c4223894382a0e7d0db19c89665ee"
 dependencies = [
  "dragonbox_ecma",
  "hashbrown",
